@@ -1,9 +1,49 @@
 import uuid
-from typing import Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError
 
+from app.auth.dependencies import (
+    AuthRequiredError,
+    ForbiddenError,
+    InvalidCredentialsError,
+    InvalidTokenError,
+)
+from app.auth.rate_limit import RateLimitExceeded
+from app.auth.router import router as auth_router
 from app.config import get_settings
+
+
+def make_error_response(
+    status_code: int,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    content = {
+        "error": {
+            "code": code,
+            "message": message,
+            "details": details if details is not None else {},
+        }
+    }
+    return JSONResponse(status_code=status_code, content=content, headers=headers)
+
+
+def is_valid_uuid(val: str | None) -> bool:
+    if not val or len(val) != 36:
+        return False
+    try:
+        parsed = uuid.UUID(val)
+        return str(parsed) == val.lower()
+    except (ValueError, TypeError, AttributeError):
+        return False
 
 
 def create_app() -> FastAPI:
@@ -18,22 +58,155 @@ def create_app() -> FastAPI:
         redoc_url="/redoc" if is_docs_enabled else None,
     )
 
+    # CORS: exact APP_ORIGIN only, no wildcard
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[settings.APP_ORIGIN],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "Idempotency-Key",
+            "If-Match",
+            "X-Request-ID",
+        ],
+        expose_headers=[
+            "ETag",
+            "Location",
+            "X-Request-ID",
+            "Idempotency-Replayed",
+            "Retry-After",
+        ],
+    )
+
     @app.middleware("http")
     async def request_id_middleware(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         inbound_id = request.headers.get("X-Request-ID")
-        request_id = inbound_id if inbound_id else str(uuid.uuid4())
+        if request.url.path.startswith("/api/v1"):
+            if inbound_id and is_valid_uuid(inbound_id):
+                request_id = str(uuid.UUID(inbound_id))
+            else:
+                request_id = str(uuid.uuid4())
+        else:
+            request_id = inbound_id if inbound_id else str(uuid.uuid4())
+        request.state.request_id = request_id
+
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
         return response
 
+    # Exception Handlers mapping to Spec 4.1 Error Envelope
+
+    @app.exception_handler(AuthRequiredError)
+    async def auth_required_handler(_request: Request, exc: AuthRequiredError) -> JSONResponse:
+        return make_error_response(
+            status_code=401,
+            code="AUTH_REQUIRED",
+            message=exc.message,
+        )
+
+    @app.exception_handler(InvalidTokenError)
+    async def invalid_token_handler(_request: Request, exc: InvalidTokenError) -> JSONResponse:
+        return make_error_response(
+            status_code=401,
+            code="INVALID_TOKEN",
+            message=exc.message,
+        )
+
+    @app.exception_handler(InvalidCredentialsError)
+    async def invalid_credentials_handler(
+        _request: Request, exc: InvalidCredentialsError
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=401,
+            code="INVALID_CREDENTIALS",
+            message=exc.message,
+        )
+
+    @app.exception_handler(ForbiddenError)
+    async def forbidden_handler(_request: Request, exc: ForbiddenError) -> JSONResponse:
+        return make_error_response(
+            status_code=403,
+            code="FORBIDDEN",
+            message=exc.message,
+        )
+
+    @app.exception_handler(RateLimitExceeded)
+    async def rate_limit_handler(_request: Request, exc: RateLimitExceeded) -> JSONResponse:
+        return make_error_response(
+            status_code=429,
+            code="RATE_LIMITED",
+            message=f"Rate limit exceeded. Retry after {exc.retry_after} seconds.",
+            details={"retry_after": exc.retry_after},
+            headers={"Retry-After": str(exc.retry_after)},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(
+        _request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        sanitized_errors: list[dict[str, Any]] = []
+        for err in exc.errors():
+            # Sanitize: never echo rejected passwords or input secrets
+            sanitized_errors.append(
+                {
+                    "loc": [str(x) for x in err.get("loc", ())],
+                    "msg": str(err.get("msg", "")),
+                    "type": str(err.get("type", "")),
+                }
+            )
+        return make_error_response(
+            status_code=422,
+            code="VALIDATION_ERROR",
+            message="Request validation failed",
+            details={"errors": sanitized_errors},
+        )
+
+    @app.exception_handler(DBAPIError)
+    async def dbapi_exception_handler(_request: Request, exc: DBAPIError) -> JSONResponse:
+        orig = getattr(exc, "orig", None)
+        sqlstate = getattr(orig, "sqlstate", None)
+        if sqlstate in ("55P03", "57014"):
+            return make_error_response(
+                status_code=503,
+                code="RETRYABLE_UNAVAILABLE",
+                message="Service temporarily unavailable, please retry",
+                headers={"Retry-After": "1"},
+            )
+        return make_error_response(
+            status_code=500,
+            code="INTERNAL_ERROR",
+            message="Internal server error",
+        )
+
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(_request: Request, exc: HTTPException) -> JSONResponse:
+        return make_error_response(
+            status_code=exc.status_code,
+            code="HTTP_ERROR",
+            message=str(exc.detail),
+            headers=dict(exc.headers) if exc.headers else None,
+        )
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception_handler(_request: Request, _exc: Exception) -> JSONResponse:
+        return make_error_response(
+            status_code=500,
+            code="INTERNAL_ERROR",
+            message="Internal server error",
+        )
+
+    # Healthcheck endpoint (E35, public, un-prefixed)
     @app.get("/healthz", response_model=None)
     async def healthz() -> dict[str, str]:
         current_settings = get_settings()
         return {"status": "ok", "version": current_settings.RELEASE_SHA}
 
-    # Static frontend file mount is registered here during production packaging deployment.
+    # Auth routes under /api/v1
+    app.include_router(auth_router, prefix="/api/v1")
 
     return app
 
