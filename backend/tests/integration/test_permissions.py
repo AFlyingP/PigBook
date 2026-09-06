@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import hashlib
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -14,7 +16,7 @@ os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
 
 from app.auth.dependencies import Policy, policy_registry
-from app.auth.models import User
+from app.auth.models import RefreshToken, User
 from app.auth.passwords import hash_password
 from app.config import get_settings
 from app.db.session import get_sessionmaker
@@ -40,6 +42,30 @@ async def _cleanup_engine() -> None:
         app.db.session._engine = None
         app.db.session._sessionmaker = None
         app.db.session._engine_url = None
+
+
+async def create_refresh_token(user: User, now: datetime) -> str:
+    raw_bytes = os.urandom(32)
+    raw_refresh = base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+    token_hash = hashlib.sha256(raw_refresh.encode("utf-8")).hexdigest()
+    family_id = uuid.uuid4()
+    rt = RefreshToken(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        token_hash=token_hash,
+        family_id=family_id,
+        parent_id=None,
+        created_at=now,
+        expires_at=now + timedelta(days=7),
+        family_expires_at=now + timedelta(days=30),
+        used_at=None,
+        revoked_at=None,
+    )
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        async with session.begin():
+            session.add(rt)
+    return raw_refresh
 
 
 async def create_user(
@@ -93,12 +119,11 @@ def make_client(ip: str = "127.0.0.1") -> httpx.AsyncClient:
 
 
 def test_policy_metadata_coverage() -> None:
-    """Every registered route has policy metadata in policy_registry;
-
-    only E02, E05, E35 are registered in this ticket.
-    """
-    assert set(policy_registry.keys()) == {"E02", "E05", "E35"}
+    """Every registered route has policy metadata in policy_registry."""
+    assert set(policy_registry.keys()) == {"E02", "E03", "E04", "E05", "E35"}
     assert policy_registry["E02"] == Policy.public
+    assert policy_registry["E03"] == Policy.public
+    assert policy_registry["E04"] == Policy.public
     assert policy_registry["E05"] == Policy.authenticated
     assert policy_registry["E35"] == Policy.public
 
@@ -192,3 +217,60 @@ async def test_permission_matrix() -> None:
         assert r_e05_adm.status_code == 200
         assert r_e05_adm.json()["id"] == str(admin_user.id)
         assert r_e05_adm.json()["role"] == "admin"
+
+        # 4. E03: POST /api/v1/auth/refresh (Policy.public)
+        # Accessible to all personas; disabled user gets 401 INVALID_REFRESH
+        now = datetime.now(timezone.utc)
+        mem_rt = await create_refresh_token(member_user, now)
+        adm_rt = await create_refresh_token(admin_user, now)
+        dis_rt = await create_refresh_token(disabled_user, now)
+        anon_user = await create_user(role="member", enabled=True)
+        anon_rt = await create_refresh_token(anon_user, now)
+
+        # Anonymous caller with valid cookie and origin -> 200 TokenResponse
+        client.cookies.set("commonsbook_rt", anon_rt)
+        r_e03_anon = await client.post(
+            "/api/v1/auth/refresh",
+            headers={"Origin": "http://localhost:5173"},
+        )
+        assert r_e03_anon.status_code == 200
+        assert r_e03_anon.json()["token_type"] == "bearer"
+
+        # Member caller with valid cookie and origin -> 200 TokenResponse
+        client.cookies.set("commonsbook_rt", mem_rt)
+        r_e03_mem = await client.post(
+            "/api/v1/auth/refresh",
+            headers={"Origin": "http://localhost:5173", "Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e03_mem.status_code == 200
+        assert r_e03_mem.json()["token_type"] == "bearer"
+
+        # Admin caller with valid cookie and origin -> 200 TokenResponse
+        client.cookies.set("commonsbook_rt", adm_rt)
+        r_e03_adm = await client.post(
+            "/api/v1/auth/refresh",
+            headers={"Origin": "http://localhost:5173", "Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e03_adm.status_code == 200
+        assert r_e03_adm.json()["token_type"] == "bearer"
+
+        # Disabled caller reaches endpoint: returns 401 INVALID_REFRESH
+        client.cookies.set("commonsbook_rt", dis_rt)
+        r_e03_dis = await client.post(
+            "/api/v1/auth/refresh",
+            headers={
+                "Origin": "http://localhost:5173",
+                "Authorization": f"Bearer {disabled_token}",
+            },
+        )
+        assert r_e03_dis.status_code == 401
+        assert r_e03_dis.json()["error"]["code"] == "INVALID_REFRESH"
+
+        # 5. E04: POST /api/v1/auth/logout (Policy.public)
+        # Accessible to all personas; returns 204 No Content
+        for token_val in [None, member_token, admin_token, disabled_token]:
+            headers = {"Origin": "http://localhost:5173"}
+            if token_val:
+                headers["Authorization"] = f"Bearer {token_val}"
+            r_e04 = await client.post("/api/v1/auth/logout", headers=headers)
+            assert r_e04.status_code == 204

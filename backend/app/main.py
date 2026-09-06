@@ -12,7 +12,9 @@ from app.auth.dependencies import (
     AuthRequiredError,
     ForbiddenError,
     InvalidCredentialsError,
+    InvalidRefreshError,
     InvalidTokenError,
+    OriginRejectedError,
 )
 from app.auth.rate_limit import RateLimitExceeded
 from app.auth.router import router as auth_router
@@ -131,6 +133,22 @@ def create_app() -> FastAPI:
         return make_error_response(
             status_code=403,
             code="FORBIDDEN",
+            message=exc.message,
+        )
+
+    @app.exception_handler(InvalidRefreshError)
+    async def invalid_refresh_handler(_request: Request, exc: InvalidRefreshError) -> JSONResponse:
+        return make_error_response(
+            status_code=401,
+            code="INVALID_REFRESH",
+            message=exc.message,
+        )
+
+    @app.exception_handler(OriginRejectedError)
+    async def origin_rejected_handler(_request: Request, exc: OriginRejectedError) -> JSONResponse:
+        return make_error_response(
+            status_code=403,
+            code="ORIGIN_REJECTED",
             message=exc.message,
         )
 

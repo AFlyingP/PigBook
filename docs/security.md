@@ -58,7 +58,42 @@ Successful authentication via `POST /api/v1/auth/login` issues an opaque refresh
 - **Lifetimes**: 7 days rolling expiration, capped at 30 days maximum per family.
 - **Cache-Control**: `no-store` header sent on all token responses.
 
-Note: Refresh token rotation (`POST /api/v1/auth/refresh`) and logout revocation routes arrive in T-006.
+### Rotating Refresh and Logout
+
+Refresh token rotation is exposed via `POST /api/v1/auth/refresh` and logout via `POST /api/v1/auth/logout`.
+
+#### Concurrency and Locking Order
+To prevent race conditions between account deactivation and token issuance, as well as deadlocks across token families, refresh rotation and revocation strictly enforce the following database lock acquisition order:
+1. **Unindexed / Unlocked Resolution**: Compute SHA-256 hex digest of the raw token string and resolve it to immutable user ID and family ID with no row lock.
+2. **User Lock**: Acquire the user row `FOR SHARE` (`with_for_update(read=True)`). Reject immediately if user does not exist or has `enabled = false`.
+3. **Transaction-Scoped Advisory Family Lock**: Execute `pg_advisory_xact_lock(:key)` on the family key. The key is derived as the signed big-endian first 64 bits of `SHA-256("commonsbook-refresh:" + lowercase family UUID string)`. This serializes concurrent operations on the same refresh token family without serializing independent families.
+4. **Token Lock**: Acquire the token row `FOR UPDATE`.
+5. **Post-Lock Verification**: Re-read and re-validate all token attributes after acquiring locks. Reject if revoked, or if `expires_at <= now`, or if `family_expires_at <= now`.
+
+#### Reuse Detection Semantics
+If an already consumed token (`used_at IS NOT NULL`) is presented:
+- Automatic reuse detection triggers.
+- The entire token family is immediately revoked (`revoked_at = now`).
+- The revocation is committed in PostgreSQL prior to returning the response, ensuring persistence even across error paths.
+- The endpoint emits HTTP `401` with error code `INVALID_REFRESH`.
+- No replay grace period is permitted.
+
+#### Token Rotation and Emission
+When a valid, unrevoked, unconsumed token is rotated:
+- The consumed token is marked used (`used_at = now`).
+- Exactly one child row is atomically inserted with `parent_id` set to the consumed token ID, inheriting `family_id` and `family_expires_at`.
+- The child row's expiration is calculated as `min(now + 7 days, family_expires_at)`, preventing rotation past the 30-day family limit.
+- A new access JWT (15-minute validity) is generated.
+- The raw refresh token is set in the HTTP response cookie and is never returned in any JSON body.
+
+#### Logout Semantics
+`POST /api/v1/auth/logout` revokes the token family following the exact user -> family advisory -> token lock hierarchy. If the token is valid, all tokens in the family are revoked. The refresh cookie is cleared with `Max-Age=0` and `Path=/api/v1/auth`. The endpoint is naturally repeatable and returns HTTP `204 No Content` regardless of whether an active family was found or the cookie was omitted.
+
+#### Exact Origin Enforcement
+Both `POST /api/v1/auth/refresh` and `POST /api/v1/auth/logout` enforce exact string equality against `APP_ORIGIN` before rate limiting, cookie parsing, or database execution:
+- The `Origin` header must be present and match `APP_ORIGIN` exactly (byte-for-byte; no substring, prefix, suffix, or port variance).
+- Non-matching or absent `Origin` headers are rejected with HTTP `403 ORIGIN_REJECTED`.
+- Logout requires a valid `Origin` header even when the refresh cookie is absent.
 
 ## Rate Limiting
 
@@ -81,6 +116,8 @@ Both `JWT_SECRET` and `RATE_LIMIT_HMAC_SECRET` are strictly required across all 
 ### Configured Limits
 - **Login attempts per IP**: 10 attempts per minute (`login:ip`)
 - **Login attempts per email**: 5 attempts per minute (`login:email`)
+- **Refresh attempts per IP**: 30 attempts per minute (`refresh:ip`)
+- **Logout attempts per IP**: 30 attempts per minute (`logout:ip`)
 
 Exceeding a limit produces HTTP `429 Too Many Requests` with a `RATE_LIMITED` error code and an integer `Retry-After` response header.
 
@@ -116,7 +153,9 @@ Request identifiers are communicated exclusively via the `X-Request-ID` HTTP hea
 - `AUTH_REQUIRED` (401): Missing or malformed authentication credentials on protected routes.
 - `INVALID_TOKEN` (401): Invalid signature, expired token, wrong issuer/audience, or disabled user account.
 - `INVALID_CREDENTIALS` (401): Incorrect email or password on login; generic message emitted for both missing users and invalid passwords.
+- `INVALID_REFRESH` (401): Missing, malformed, expired, revoked, or reused refresh token.
 - `FORBIDDEN` (403): User lacks the required role for the requested resource or action.
+- `ORIGIN_REJECTED` (403): Missing or non-matching Origin header on origin-enforced routes.
 - `VALIDATION_ERROR` (422): Request schema validation failure; field inputs and rejected secrets/passwords are stripped from error details.
 - `RATE_LIMITED` (429): Rate limit exceeded; carries `Retry-After` header and integer seconds in details.
 - `RETRYABLE_UNAVAILABLE` (503): Database lock timeout or statement cancellation; carries `Retry-After: 1` header.

@@ -18,6 +18,8 @@
   "implemented_endpoints": {
     "E35": "T-001",
     "E02": "T-005",
+    "E03": "T-006",
+    "E04": "T-006",
     "E05": "T-005"
   },
   "evidence_reuse": {

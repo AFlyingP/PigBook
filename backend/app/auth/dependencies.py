@@ -38,6 +38,18 @@ class InvalidCredentialsError(Exception):
         super().__init__(message)
 
 
+class InvalidRefreshError(Exception):
+    def __init__(self, message: str = "Invalid or expired refresh token") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class OriginRejectedError(Exception):
+    def __init__(self, message: str = "Origin not allowed") -> None:
+        self.message = message
+        super().__init__(message)
+
+
 class Policy(str, Enum):
     public = "public"
     authenticated = "authenticated"
@@ -58,6 +70,8 @@ class AuthorizedScope:
 
 policy_registry: dict[str, Policy] = {
     "E02": Policy.public,
+    "E03": Policy.public,
+    "E04": Policy.public,
     "E05": Policy.authenticated,
     "E35": Policy.public,
 }
