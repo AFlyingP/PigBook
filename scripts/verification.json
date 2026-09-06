@@ -16,7 +16,9 @@
     "build"
   ],
   "implemented_endpoints": {
-    "E35": "T-001"
+    "E35": "T-001",
+    "E02": "T-005",
+    "E05": "T-005"
   },
   "evidence_reuse": {
     "activated": false,
