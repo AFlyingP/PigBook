@@ -10,11 +10,20 @@
     "bootstrap",
     "lint",
     "unit",
+    "integration",
     "regression",
     "ticket"
   ],
   "implemented_endpoints": {
     "E35": "T-001"
+  },
+  "evidence_reuse": {
+    "activated": false,
+    "activation_target": "T-011",
+    "reusable_gates": [
+      "concurrency",
+      "permissions"
+    ]
   },
   "tooling": {
     "uv_version": "0.12.10",

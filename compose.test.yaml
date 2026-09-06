@@ -1,0 +1,14 @@
+services:
+  db:
+    image: postgres:16.15
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-commonsbook_test}
+      POSTGRES_USER: ${POSTGRES_USER:-commonsbook_test}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-commonsbook_test}
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-commonsbook_test} -d ${POSTGRES_DB:-commonsbook_test}"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
