@@ -1,0 +1,32 @@
+# Python artifacts
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node and frontend artifacts
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Environment configurations and secrets
+.env
+.env.*
+!.env.example
+
+# Evidence output
+evidence/
+
+# Operating system artifacts
+.DS_Store
+Thumbs.db
+
+# Preventative safety net for private planning artifacts; not a publication mechanism.
+HANDOFF.md
+commonsbook-*-handoff/
+build-plan/
+orchestrator/
+tickets/
+defects/

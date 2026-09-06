@@ -1,0 +1,1 @@
+"""CommonsBook application package."""

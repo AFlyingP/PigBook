@@ -1,0 +1,59 @@
+[project]
+name = "commonsbook-backend"
+version = "0.1.0"
+description = "CommonsBook backend service"
+readme = "README.md"
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "sqlalchemy",
+    "asyncpg",
+    "alembic",
+    "pydantic",
+    "pydantic-settings",
+    "email-validator",
+    "argon2-cffi",
+    "pyjwt",
+    "prometheus-client",
+    "sentry-sdk",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "httpx",
+    "factory-boy",
+    "ruff",
+    "mypy",
+    "locust",
+]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true

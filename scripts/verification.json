@@ -1,0 +1,24 @@
+{
+  "ordered_targets": [
+    "lint",
+    "unit",
+    "integration",
+    "concurrency",
+    "permissions"
+  ],
+  "implemented_targets": [
+    "bootstrap",
+    "lint",
+    "unit",
+    "regression",
+    "ticket"
+  ],
+  "implemented_endpoints": {
+    "E35": "T-001"
+  },
+  "tooling": {
+    "uv_version": "0.12.10",
+    "node_major": "22",
+    "python_version": "3.12"
+  }
+}
