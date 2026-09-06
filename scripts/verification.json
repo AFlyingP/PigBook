@@ -12,7 +12,8 @@
     "unit",
     "integration",
     "regression",
-    "ticket"
+    "ticket",
+    "build"
   ],
   "implemented_endpoints": {
     "E35": "T-001"

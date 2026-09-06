@@ -1,0 +1,287 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint:
+    name: Lint and Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache backend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            backend/.venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('backend/uv.lock') }}
+
+      - name: Cache frontend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            frontend/node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Install uv
+        run: pip install uv==0.12.10
+
+      - name: Bootstrap dependencies
+        run: python scripts/verify.py bootstrap
+
+      - name: Run lint and type checks
+        run: python scripts/verify.py lint
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-lint
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  unit:
+    name: Unit Tests
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache backend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            backend/.venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('backend/uv.lock') }}
+
+      - name: Cache frontend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            frontend/node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Install uv
+        run: pip install uv==0.12.10
+
+      - name: Bootstrap dependencies
+        run: python scripts/verify.py bootstrap
+
+      - name: Run unit tests
+        run: python scripts/verify.py unit
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-unit
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  integration:
+    name: Integration Tests
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache backend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            backend/.venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('backend/uv.lock') }}
+
+      - name: Cache frontend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            frontend/node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Install uv
+        run: pip install uv==0.12.10
+
+      - name: Bootstrap dependencies
+        run: python scripts/verify.py bootstrap
+
+      - name: Run integration tests
+        run: python scripts/verify.py integration
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-integration
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  concurrency:
+    name: Concurrency Gate
+    needs: integration
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache backend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            backend/.venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('backend/uv.lock') }}
+
+      - name: Cache frontend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            frontend/node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Install uv
+        run: pip install uv==0.12.10
+
+      - name: Bootstrap dependencies
+        run: python scripts/verify.py bootstrap
+
+      - name: Verify concurrency gate registration
+        run: |
+          set +e
+          output=$(python scripts/verify.py concurrency 2>&1)
+          exit_code=$?
+          set -e
+          if [ $exit_code -ne 0 ] && echo "$output" | grep -q "not implemented"; then
+            echo "Concurrency gate is registered but not implemented (activates when the concurrency suite lands)."
+            echo "### Concurrency Gate" >> "$GITHUB_STEP_SUMMARY"
+            echo "Status: **Not Implemented** (activates when the concurrency suite lands)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Unexpected runner output or exit code: $exit_code"
+            echo "$output"
+            exit 1
+          fi
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-concurrency
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  build:
+    name: Build API Image
+    needs: concurrency
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache backend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            backend/.venv
+          key: ${{ runner.os }}-uv-${{ hashFiles('backend/uv.lock') }}
+
+      - name: Cache frontend dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            frontend/node_modules
+          key: ${{ runner.os }}-npm-${{ hashFiles('frontend/package-lock.json') }}
+
+      - name: Install uv
+        run: pip install uv==0.12.10
+
+      - name: Bootstrap dependencies
+        run: python scripts/verify.py bootstrap
+
+      - name: Build API container image
+        run: python scripts/verify.py build
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: evidence-build
+          path: evidence/
+          retention-days: 14
+          if-no-files-found: ignore

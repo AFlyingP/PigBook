@@ -1,0 +1,9 @@
+{
+  "ticket_id": "T-003",
+  "pytest_paths": [
+    "backend/tests/unit/test_ci_contract.py"
+  ],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}

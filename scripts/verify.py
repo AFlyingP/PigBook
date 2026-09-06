@@ -537,6 +537,13 @@ def run_target(
             if db_mgr:
                 db_mgr.stop(command_log)
 
+    elif target == "build":
+        docker_bin = find_tool("docker")
+        cmd = [docker_bin, "build", "-f", "infra/Dockerfile.api", "."]
+        code = run_command(cmd, evidence_dir, len(command_log) + 1)
+        command_log.append({"cmd": cmd, "exit_code": code})
+        return code
+
     elif target in central_manifest.get("implemented_targets", []):
         sys.exit(f"Error: Target '{target}' is implemented in manifest but has no runner logic")
 
