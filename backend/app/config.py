@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     APP_ENV: Literal["local", "test", "production"] = "local"
     APP_ORIGIN: str = "http://localhost:5173"
     RELEASE_SHA: str = "local-development"
+    DATABASE_URL: str = ""
 
     # Strict rejection of unknown application settings arrives with configuration tests.
     model_config = SettingsConfigDict(
