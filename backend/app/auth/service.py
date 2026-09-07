@@ -7,15 +7,34 @@ from datetime import datetime, timedelta
 
 import jwt
 from sqlalchemy import select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.admin.audit import append_audit_log
 from app.auth.dependencies import InvalidCredentialsError, InvalidRefreshError
-from app.auth.models import RefreshToken, User
-from app.auth.passwords import normalize_email, verify_dummy_password, verify_password
-from app.auth.schemas import TokenResponse
+from app.auth.models import Invitation, RefreshToken, User
+from app.auth.passwords import (
+    hash_password,
+    normalize_email,
+    verify_dummy_password,
+    verify_password,
+)
+from app.auth.schemas import Register, TokenResponse
 from app.auth.schemas import User as UserSchema
 from app.config import get_settings
 from app.db.session import get_sessionmaker
+
+
+class InvalidInvitationError(Exception):
+    def __init__(self, message: str = "Invalid or expired invitation") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class EmailExistsError(Exception):
+    def __init__(self, message: str = "A user with this email already exists") -> None:
+        self.message = message
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -170,9 +189,24 @@ async def rotate_refresh(
     if token.used_at is not None:
         await session.rollback()
         sessionmaker = get_sessionmaker()
+        reuse_req_id = uuid.uuid4()
         async with sessionmaker() as independent_session:
             async with independent_session.begin():
                 await revoke_family(independent_session, raw_token=raw_token, now=now)
+                await append_audit_log(
+                    independent_session,
+                    action="auth.refresh_reuse",
+                    target_type="refresh_family",
+                    target_id=family_id,
+                    actor_id=user_id,
+                    request_id=reuse_req_id,
+                    details={
+                        "user_id": str(user_id),
+                        "family_id": str(family_id),
+                        "event_category": "refresh_reuse",
+                    },
+                    now=now,
+                )
         raise InvalidRefreshError("Invalid or expired refresh token")
 
     # 8. Mark token used and create exactly one child row atomically
@@ -282,3 +316,87 @@ async def revoke_family(
     )
     await session.execute(rev_stmt)
     await session.flush()
+
+
+async def register(
+    session: AsyncSession,
+    *,
+    data: Register,
+    now: datetime,
+    request_id: uuid.UUID | None = None,
+) -> UserSchema:
+    """Register a new user from a valid, single-use invitation (E01)."""
+    token_hash = hashlib.sha256(data.invitation_token.encode("utf-8")).hexdigest()
+    try:
+        norm_email = normalize_email(data.email)
+    except ValueError:
+        raise InvalidInvitationError("Invalid or expired invitation")
+
+    # Lock the invitation row for update to serialize concurrent registrations
+    stmt = select(Invitation).where(Invitation.token_hash == token_hash).with_for_update()
+    res = await session.execute(stmt)
+    invitation = res.scalar_one_or_none()
+
+    if invitation is None:
+        raise InvalidInvitationError("Invalid or expired invitation")
+
+    if invitation.consumed_at is not None:
+        raise InvalidInvitationError("Invalid or expired invitation")
+
+    if invitation.expires_at <= now:
+        raise InvalidInvitationError("Invalid or expired invitation")
+
+    if invitation.email.strip().lower() != norm_email:
+        raise InvalidInvitationError("Invalid or expired invitation")
+
+    # Check if a user with this email already exists
+    user_stmt = select(User.id).where(User.email == norm_email)
+    user_res = await session.execute(user_stmt)
+    if user_res.scalar_one_or_none() is not None:
+        raise EmailExistsError("A user with this email already exists")
+
+    # The role comes ONLY from the invitation row
+    user_role = invitation.role
+    pwd_hash = hash_password(data.password)
+
+    new_user = User(
+        id=uuid.uuid4(),
+        email=norm_email,
+        password_hash=pwd_hash,
+        display_name=data.display_name.strip(),
+        role=user_role,
+        enabled=True,
+        version=1,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(new_user)
+
+    # Mark invitation consumed atomically
+    invitation.consumed_at = now
+
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        exc_str = str(exc).lower()
+        if "users_email" in exc_str or "unique constraint" in exc_str:
+            raise EmailExistsError("A user with this email already exists") from exc
+        raise InvalidInvitationError("Invalid or expired invitation") from exc
+
+    req_id = request_id or uuid.uuid4()
+    await append_audit_log(
+        session,
+        action="auth.register",
+        target_type="user",
+        target_id=new_user.id,
+        actor_id=new_user.id,
+        request_id=req_id,
+        details={
+            "email": norm_email,
+            "role": user_role,
+            "invitation_id": str(invitation.id),
+        },
+        now=now,
+    )
+
+    return UserSchema.model_validate(new_user)

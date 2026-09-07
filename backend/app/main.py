@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DBAPIError
 
+from app.admin.router import router as admin_router
 from app.auth.dependencies import (
     AuthRequiredError,
     ForbiddenError,
@@ -18,6 +19,7 @@ from app.auth.dependencies import (
 )
 from app.auth.rate_limit import RateLimitExceeded
 from app.auth.router import router as auth_router
+from app.auth.service import EmailExistsError, InvalidInvitationError
 from app.config import get_settings
 
 
@@ -152,6 +154,24 @@ def create_app() -> FastAPI:
             message=exc.message,
         )
 
+    @app.exception_handler(InvalidInvitationError)
+    async def invalid_invitation_handler(
+        _request: Request, exc: InvalidInvitationError
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=422,
+            code="INVALID_INVITATION",
+            message=exc.message,
+        )
+
+    @app.exception_handler(EmailExistsError)
+    async def email_exists_handler(_request: Request, exc: EmailExistsError) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="EMAIL_EXISTS",
+            message=exc.message,
+        )
+
     @app.exception_handler(RateLimitExceeded)
     async def rate_limit_handler(_request: Request, exc: RateLimitExceeded) -> JSONResponse:
         return make_error_response(
@@ -225,6 +245,7 @@ def create_app() -> FastAPI:
 
     # Auth routes under /api/v1
     app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(admin_router, prefix="/api/v1")
 
     return app
 

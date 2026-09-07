@@ -17,10 +17,12 @@
   ],
   "implemented_endpoints": {
     "E35": "T-001",
+    "E01": "T-007",
     "E02": "T-005",
     "E03": "T-006",
     "E04": "T-006",
-    "E05": "T-005"
+    "E05": "T-005",
+    "E29": "T-007"
   },
   "evidence_reuse": {
     "activated": false,

@@ -120,11 +120,21 @@ def make_client(ip: str = "127.0.0.1") -> httpx.AsyncClient:
 
 def test_policy_metadata_coverage() -> None:
     """Every registered route has policy metadata in policy_registry."""
-    assert set(policy_registry.keys()) == {"E02", "E03", "E04", "E05", "E35"}
+    assert set(policy_registry.keys()) == {
+        "E01",
+        "E02",
+        "E03",
+        "E04",
+        "E05",
+        "E29",
+        "E35",
+    }
+    assert policy_registry["E01"] == Policy.public
     assert policy_registry["E02"] == Policy.public
     assert policy_registry["E03"] == Policy.public
     assert policy_registry["E04"] == Policy.public
     assert policy_registry["E05"] == Policy.authenticated
+    assert policy_registry["E29"] == Policy.admin
     assert policy_registry["E35"] == Policy.public
 
 
@@ -274,3 +284,58 @@ async def test_permission_matrix() -> None:
                 headers["Authorization"] = f"Bearer {token_val}"
             r_e04 = await client.post("/api/v1/auth/logout", headers=headers)
             assert r_e04.status_code == 204
+
+        # 6. E01: POST /api/v1/auth/register (Policy.public)
+        # Accessible to all personas; invalid invitation returns 422 INVALID_INVITATION
+        dummy_register_body = {
+            "invitation_token": "non-existent-dummy-token",
+            "email": f"perm_reg_{uuid.uuid4().hex[:8]}@example.com",
+            "password": "valid-password-123",
+            "display_name": "Registered User",
+        }
+        for token_val in [None, member_token, admin_token, disabled_token]:
+            headers = {"Authorization": f"Bearer {token_val}"} if token_val else {}
+            r_e01 = await client.post(
+                "/api/v1/auth/register",
+                json=dummy_register_body,
+                headers=headers,
+            )
+            assert r_e01.status_code == 422
+            assert r_e01.json()["error"]["code"] == "INVALID_INVITATION"
+
+        # 7. E29: POST /api/v1/admin/invitations (Policy.admin)
+        # Admin allowed (201); Member denied (403); Anonymous denied (401); Disabled denied (401)
+        valid_invite_body = {
+            "email": f"perm_inv_{uuid.uuid4().hex[:8]}@example.com",
+            "role": "member",
+        }
+        r_e29_anon = await client.post("/api/v1/admin/invitations", json=valid_invite_body)
+        assert r_e29_anon.status_code == 401
+        assert r_e29_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        r_e29_dis = await client.post(
+            "/api/v1/admin/invitations",
+            json=valid_invite_body,
+            headers={"Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e29_dis.status_code == 401
+        assert r_e29_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        r_e29_mem = await client.post(
+            "/api/v1/admin/invitations",
+            json=valid_invite_body,
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e29_mem.status_code == 403
+        assert r_e29_mem.json()["error"]["code"] == "FORBIDDEN"
+
+        r_e29_adm = await client.post(
+            "/api/v1/admin/invitations",
+            json=valid_invite_body,
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e29_adm.status_code == 201
+        assert r_e29_adm.json()["email"] == valid_invite_body["email"]
+        assert r_e29_adm.json()["role"] == "member"
+        assert "invitation_url" in r_e29_adm.json()
+        assert r_e29_adm.headers.get("cache-control") == "no-store"

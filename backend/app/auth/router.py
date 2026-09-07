@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -20,12 +21,30 @@ from app.auth.rate_limit import (
     get_client_ip,
     hash_identity,
 )
-from app.auth.schemas import Login, TokenResponse, User
-from app.auth.service import login, revoke_family, rotate_refresh
+from app.auth.schemas import Login, Register, TokenResponse, User
+from app.auth.service import login, register, revoke_family, rotate_refresh
 from app.config import get_settings
 from app.db.session import get_session, transaction_dependency
 
 router = APIRouter()
+
+
+@router.post("/auth/register", response_model=User, status_code=201)
+async def register_endpoint(
+    body: Register,
+    request: Request,
+    _scope: AuthorizedScope = Depends(authorize(Policy.public)),
+    session: AsyncSession = Depends(transaction_dependency),
+) -> User:
+    now = datetime.now(timezone.utc)
+    # Rate limit: 5/IP/hour per Spec 8.2
+    await _check_ip_rate_limit(request, scope="register:ip", limit=5, window_seconds=3600, now=now)
+    req_id = (
+        uuid.UUID(request.state.request_id)
+        if hasattr(request.state, "request_id")
+        else uuid.uuid4()
+    )
+    return await register(session, data=body, now=now, request_id=req_id)
 
 
 @router.post("/auth/login", response_model=TokenResponse)
