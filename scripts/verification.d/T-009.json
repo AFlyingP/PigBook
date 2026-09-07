@@ -1,0 +1,9 @@
+{
+  "ticket_id": "T-009",
+  "pytest_paths": [
+    "backend/tests/integration/test_booking_primitive.py"
+  ],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}
