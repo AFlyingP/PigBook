@@ -21,6 +21,7 @@ from app.auth.passwords import hash_password
 from app.config import get_settings
 from app.db.session import get_sessionmaker
 from app.main import app
+from app.resources.models import Resource
 
 get_settings.cache_clear()
 
@@ -126,6 +127,9 @@ def test_policy_metadata_coverage() -> None:
         "E03",
         "E04",
         "E05",
+        "E06",
+        "E07",
+        "E08",
         "E29",
         "E35",
     }
@@ -134,6 +138,9 @@ def test_policy_metadata_coverage() -> None:
     assert policy_registry["E03"] == Policy.public
     assert policy_registry["E04"] == Policy.public
     assert policy_registry["E05"] == Policy.authenticated
+    assert policy_registry["E06"] == Policy.authenticated
+    assert policy_registry["E07"] == Policy.authenticated
+    assert policy_registry["E08"] == Policy.authenticated
     assert policy_registry["E29"] == Policy.admin
     assert policy_registry["E35"] == Policy.public
 
@@ -339,3 +346,108 @@ async def test_permission_matrix() -> None:
         assert r_e29_adm.json()["role"] == "member"
         assert "invitation_url" in r_e29_adm.json()
         assert r_e29_adm.headers.get("cache-control") == "no-store"
+
+        # 8. E06: GET /api/v1/resources (Policy.authenticated)
+        # Member and Admin allowed; Anonymous and Disabled denied
+        r_e06_anon = await client.get("/api/v1/resources?limit=10&offset=0")
+        assert r_e06_anon.status_code == 401
+        assert r_e06_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        r_e06_dis = await client.get(
+            "/api/v1/resources?limit=10&offset=0",
+            headers={"Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e06_dis.status_code == 401
+        assert r_e06_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        r_e06_mem = await client.get(
+            "/api/v1/resources?limit=10&offset=0",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e06_mem.status_code == 200
+        assert "items" in r_e06_mem.json()
+
+        r_e06_adm = await client.get(
+            "/api/v1/resources?limit=10&offset=0",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e06_adm.status_code == 200
+        assert "items" in r_e06_adm.json()
+
+        # Seed real active resource for E07 and E08 matrix cells
+        perm_res = Resource(
+            id=uuid.uuid4(),
+            name=f"PermResource_{uuid.uuid4().hex[:6]}",
+            description="For permissions matrix",
+            location="Room 101",
+            active=True,
+            version=1,
+        )
+        sessionmaker = get_sessionmaker()
+        async with sessionmaker() as session:
+            async with session.begin():
+                session.add(perm_res)
+
+        # 9. E07: GET /api/v1/resources/{id} (Policy.authenticated)
+        r_e07_anon = await client.get(f"/api/v1/resources/{perm_res.id}")
+        assert r_e07_anon.status_code == 401
+        assert r_e07_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        r_e07_dis = await client.get(
+            f"/api/v1/resources/{perm_res.id}",
+            headers={"Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e07_dis.status_code == 401
+        assert r_e07_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        r_e07_mem = await client.get(
+            f"/api/v1/resources/{perm_res.id}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e07_mem.status_code == 200
+        assert r_e07_mem.json()["id"] == str(perm_res.id)
+        assert r_e07_mem.headers.get("etag") == '"1"'
+
+        r_e07_adm = await client.get(
+            f"/api/v1/resources/{perm_res.id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e07_adm.status_code == 200
+        assert r_e07_adm.json()["id"] == str(perm_res.id)
+        assert r_e07_adm.headers.get("etag") == '"1"'
+
+        # 10. E08: GET /api/v1/resources/{id}/availability (Policy.authenticated)
+        avail_params = {
+            "starts_at": "2026-08-01T10:00:00Z",
+            "ends_at": "2026-08-01T12:00:00Z",
+        }
+        r_e08_anon = await client.get(
+            f"/api/v1/resources/{perm_res.id}/availability",
+            params=avail_params,
+        )
+        assert r_e08_anon.status_code == 401
+        assert r_e08_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        r_e08_dis = await client.get(
+            f"/api/v1/resources/{perm_res.id}/availability",
+            params=avail_params,
+            headers={"Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e08_dis.status_code == 401
+        assert r_e08_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        r_e08_mem = await client.get(
+            f"/api/v1/resources/{perm_res.id}/availability",
+            params=avail_params,
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e08_mem.status_code == 200
+        assert r_e08_mem.json()["resource_id"] == str(perm_res.id)
+
+        r_e08_adm = await client.get(
+            f"/api/v1/resources/{perm_res.id}/availability",
+            params=avail_params,
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e08_adm.status_code == 200
+        assert r_e08_adm.json()["resource_id"] == str(perm_res.id)

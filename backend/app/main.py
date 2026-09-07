@@ -21,6 +21,8 @@ from app.auth.rate_limit import RateLimitExceeded
 from app.auth.router import router as auth_router
 from app.auth.service import EmailExistsError, InvalidInvitationError
 from app.config import get_settings
+from app.resources.router import router as resources_router
+from app.resources.service import InvalidWindowError, NotFoundError
 
 
 def make_error_response(
@@ -182,6 +184,22 @@ def create_app() -> FastAPI:
             headers={"Retry-After": str(exc.retry_after)},
         )
 
+    @app.exception_handler(NotFoundError)
+    async def not_found_handler(_request: Request, exc: NotFoundError) -> JSONResponse:
+        return make_error_response(
+            status_code=404,
+            code="NOT_FOUND",
+            message=exc.message,
+        )
+
+    @app.exception_handler(InvalidWindowError)
+    async def invalid_window_handler(_request: Request, exc: InvalidWindowError) -> JSONResponse:
+        return make_error_response(
+            status_code=422,
+            code="INVALID_WINDOW",
+            message=exc.message,
+        )
+
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
         _request: Request, exc: RequestValidationError
@@ -246,6 +264,7 @@ def create_app() -> FastAPI:
     # Auth routes under /api/v1
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/api/v1")
+    app.include_router(resources_router, prefix="/api/v1")
 
     return app
 
