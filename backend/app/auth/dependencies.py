@@ -69,10 +69,12 @@ class AuthorizedScope:
 
 
 policy_registry: dict[str, Policy] = {
+    "E01": Policy.public,
     "E02": Policy.public,
     "E03": Policy.public,
     "E04": Policy.public,
     "E05": Policy.authenticated,
+    "E29": Policy.admin,
     "E35": Policy.public,
 }
 
