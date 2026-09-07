@@ -172,3 +172,37 @@ Idempotency is scoped per authenticated user (`user_id, key`). Concurrency betwe
 4. **Rate Limit Decoupling**:
    Authenticated mutation rate limits (120 requests/user/minute, or 1000 in the race profile) are checked and committed in a separate, short independent transaction before opening the domain transaction. This ensures rate bucket locks are never held concurrently with idempotency or inventory locks.
 
+---
+
+## 7. Concurrency Gate (T-011)
+
+The concurrency gate provides automated, high-contention verification of the booking invariant, transactional outbox, and atomic idempotency under real HTTP and database concurrency.
+
+### Scope and Purpose
+
+- **200-User Same-Slot Race (`test_same_slot.py`)**:
+  200 distinct authenticated member users with real credentials release simultaneous `POST /api/v1/bookings` requests across an `asyncio.Event` barrier targeting the exact same resource and time slot. Executed across three consecutive rounds on distinct resources and dates. Validates that exactly one request wins (`201 Created`), exactly 199 receive conflict (`409 Conflict` with `SLOT_CONFLICT`), exactly one booking row is persisted, exactly 200 idempotency records are completed, and exactly one outbox event is emitted.
+- **Concurrent Same-Key Execution (`test_same_key.py`)**:
+  200 identical concurrent requests using the same `Idempotency-Key` from the same user under the race rate limit (`1000/user/min`). Validates that all 200 receive `201 Created` with identical body and ID, exactly one is marked as `Idempotency-Replayed: false`, and 199 are marked `Idempotency-Replayed: true`, persisting exactly one booking and one outbox event. Also validates that conflicting payloads sent concurrently with the same key produce one `201` and one `422 IDEMPOTENCY_KEY_MISMATCH`.
+- **Configuration and Environment Defense (`test_race_configuration.py`)**:
+  Ensures `TEST_PROFILE=race` is strictly rejected in production environments, verifies rate limit profile thresholds (120 vs 1000), and validates that test token fixtures are cryptographically verified against the server.
+
+### Execution Commands
+
+```bash
+# Run concurrency gate with an isolated PostgreSQL 16 database and Uvicorn server
+python scripts/verify.py concurrency --fresh
+
+# Run centralized permissions matrix verification
+python scripts/verify.py permissions --fresh
+
+# Run full regression including concurrency and permissions gates
+python scripts/verify.py regression --fresh
+```
+
+### Limitations and Operational Boundary
+
+The concurrency gate is a **deterministic local and CI correctness gate**, not a production load, latency, or throughput benchmark:
+- Requests are dispatched over local loopback (`127.0.0.1`) against a single Uvicorn process and ephemeral Docker container.
+- It validates transactional invariants, database locking order, and GiST exclusion constraint integrity under severe concurrency contention.
+- It does not measure realistic user traffic distributions, wide-area network latency, or multi-node worker behavior. Load testing is evaluated separately via open-loop Locust suites in later tickets.

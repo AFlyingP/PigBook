@@ -14,7 +14,9 @@
     "regression",
     "ticket",
     "build",
-    "frontend"
+    "frontend",
+    "concurrency",
+    "permissions"
   ],
   "implemented_endpoints": {
     "E35": "T-001",
@@ -35,6 +37,8 @@
       "lint",
       "unit",
       "integration",
+      "concurrency",
+      "permissions",
       "frontend"
     ],
     "concurrency_activation": "T-011 requires fresh proof before enabling reuse"

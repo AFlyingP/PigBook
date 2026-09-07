@@ -1,0 +1,12 @@
+{
+  "ticket_id": "T-011",
+  "pytest_paths": [
+    "backend/tests/concurrency/test_same_slot.py",
+    "backend/tests/concurrency/test_same_key.py",
+    "backend/tests/concurrency/test_race_configuration.py",
+    "backend/tests/unit/test_verification_cache.py"
+  ],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}

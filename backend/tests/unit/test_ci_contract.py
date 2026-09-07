@@ -275,11 +275,27 @@ def test_permissions(ci_workflow: dict[str, Any], raw_ci_yaml: str) -> None:
 def test_concurrency_registration_is_honest() -> None:
     import json
 
-    manifest = json.loads((CI_WORKFLOW_PATH.parents[2] / "scripts/verification.json").read_text())
+    root = CI_WORKFLOW_PATH.parents[2]
+    manifest = json.loads((root / "scripts/verification.json").read_text(encoding="utf-8"))
+
+    # Assert registration of concurrency and permissions
     assert "concurrency" in manifest["ordered_targets"]
-    assert "concurrency" not in manifest["implemented_targets"]
-    runner = (CI_WORKFLOW_PATH.parents[2] / "scripts/verify.py").read_text()
-    assert "not implemented; no passing evidence claimed" in runner
+    assert "permissions" in manifest["ordered_targets"]
+    assert "concurrency" in manifest["implemented_targets"]
+    assert "permissions" in manifest["implemented_targets"]
+    reusable = set(manifest.get("evidence_reuse", {}).get("reusable_gates", []))
+    assert "concurrency" in reusable
+    assert "permissions" in reusable
+
+    # Assert concrete runner branches and strict 20-connection pool configuration
+    runner = (root / "scripts/verify.py").read_text(encoding="utf-8")
+    assert 'elif target == "concurrency":' in runner
+    assert 'elif target == "permissions":' in runner
+    assert "backend/tests/concurrency" in runner
+    assert "COMMONSBOOK_BASE_URL" in runner
+    assert 'TEST_PROFILE": "race"' in runner or "TEST_PROFILE=race" in runner
+    assert "pool_size=20" in runner
+    assert "max_overflow=0" in runner
 
 
 def test_cache_keys_strictly_lockfile_based(ci_workflow: dict[str, Any]) -> None:

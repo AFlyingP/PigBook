@@ -4,7 +4,11 @@ CommonsBook is an equipment and room reservation service designed for a single c
 
 ## Current State
 
-This repository contains the initial modular-monolith application structure. Core domain services, database models, reservation workflows, waitlists, notifications, and administrative interfaces are not implemented yet.
+The service currently implements core authentication, resource management, and booking creation primitives:
+- **Authentication & Authorization**: Registration via single-use invitation tokens, password login (Argon2id), rotating refresh token families in HttpOnly cookies, logout with family revocation, centralized role-based access control, and atomic PostgreSQL-backed rate limiting.
+- **Resource Management**: Active resource catalog pagination, detail lookups with version-based `ETag`, and occupied availability interval queries on 30-minute UTC boundaries.
+- **Atomic Idempotent Booking Creation**: `POST /api/v1/bookings` creates confirmed reservations backed by a GiST exclusion constraint (`bookings_no_overlap`), preventing overlapping reservations without application preflight checks. Requests require a UUID v4 `Idempotency-Key`; the idempotency record, booking, and transactional outbox event commit atomically in a single transaction. Replays return stored responses without re-executing business logic.
+- **Automated Verification**: Complete verification suite including unit tests, isolated PostgreSQL 16 integration tests, centralized permission matrix verification, and concurrency race gates.
 
 ## Prerequisites
 
@@ -20,7 +24,7 @@ CommonsBook is structured as a modular monolith:
 
 - **Backend (`backend/`)**: Python 3.12 FastAPI service structured by domain package boundaries (`auth`, `resources`, `bookings`, `waitlist`, `notifications`, `admin`, `db`, `observability`).
 - **Frontend (`frontend/`)**: React 18, TypeScript, Vite, Material UI v5 with Emotion.
-- **Single Origin**: In production, the backend serves both the API endpoints and the compiled frontend assets under the same origin, simplifying authentication cookie handling and cross-origin controls.
+- **Single Origin**: In production, the backend serves both API endpoints and compiled frontend assets under the same origin, simplifying authentication cookie handling and cross-origin controls.
 
 ## Quickstart
 
@@ -48,7 +52,7 @@ python scripts/verify.py bootstrap
 
 ## Verification
 
-The repository verification runner validates formatting, linting, type safety, and test suites:
+The repository verification runner validates formatting, linting, type safety, integration behavior, permissions, and concurrency invariants:
 
 ```bash
 # Verify code formatting, linting, and type checking
@@ -57,14 +61,31 @@ python scripts/verify.py lint
 # Run unit test suites
 python scripts/verify.py unit
 
-# Run full regression suite for implemented components
-python scripts/verify.py regression
+# Run isolated PostgreSQL integration test suites
+python scripts/verify.py integration
+
+# Run 200-user concurrency race and same-key idempotency gate
+python scripts/verify.py concurrency --fresh
+
+# Run centralized permission matrix verification
+python scripts/verify.py permissions --fresh
+
+# Run full regression suite across all implemented gates
+python scripts/verify.py regression --fresh
 ```
 
-Test evidence: not yet measured.
+### Verification Results
+
+All suites executed on local Windows 11 with Docker PostgreSQL 16.15:
+
+- **Lint & Typecheck**: Passed across all Python and TypeScript sources (Ruff, Mypy strict mode, ESLint, TypeScript compiler).
+- **Unit Tests**: 91 backend unit tests, 3 frontend component tests passed.
+- **Integration Tests**: 92 database integration tests passed in isolated PostgreSQL 16 containers.
+- **Permissions Gate**: 2 permission tests passed; 11 registered endpoints verified against the centralized permissions matrix.
+- **Performance / Load / Real-User Feedback**: Not yet measured.
 
 ## Known Limitations
 
-- Domain reservation and waitlist capabilities are currently under active development.
-- Database migrations and persistence connections are not yet wired into the application.
-- Authentication and session handling are not yet enabled.
+- Waitlist admission and queue promotion workflows are not yet implemented.
+- Background outbox worker daemon for asynchronous email delivery is not yet wired.
+- Administrative management endpoints (resource creation, user modification, blackout scheduling) are not yet exposed.

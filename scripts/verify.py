@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -574,6 +575,211 @@ def run_target(
         finally:
             db_mgr.stop(command_log)
 
+    elif target == "concurrency":
+        db_mgr = IsolatedDatabaseManager(evidence_dir=evidence_dir, run_id=run_id)
+        server_proc = None
+        server_stdout_f = None
+        server_stderr_f = None
+        try:
+            database_url = db_mgr.start(command_log)
+            # Run alembic upgrade head
+            upgrade_cmd = [
+                uv_bin,
+                "run",
+                "--project",
+                "backend",
+                "alembic",
+                "-c",
+                "backend/alembic.ini",
+                "upgrade",
+                "head",
+            ]
+            env_db = {
+                **os.environ,
+                "DATABASE_URL": database_url,
+                "TEST_RUN_ID": db_mgr.test_run_id,
+            }
+            code = run_command(upgrade_cmd, evidence_dir, len(command_log) + 1, env=env_db)
+            command_log.append({"cmd": upgrade_cmd, "exit_code": code})
+            if code != 0:
+                return code
+
+            server_port = find_free_port(18000)
+            server_url = f"http://127.0.0.1:{server_port}"
+
+            server_env = {
+                **os.environ,
+                "DATABASE_URL": database_url,
+                "TEST_RUN_ID": db_mgr.test_run_id,
+                "TEST_PROFILE": "race",
+                "APP_ENV": "local",
+                "JWT_SECRET": os.environ.get("JWT_SECRET")
+                or "test-jwt-secret-minimum-32-bytes-long-12345678",
+                "RATE_LIMIT_HMAC_SECRET": os.environ.get("RATE_LIMIT_HMAC_SECRET")
+                or "test-hmac-secret-minimum-32-bytes-long-1234",
+                "PYTHONPATH": str(REPO_ROOT / "backend"),
+            }
+            backend_python = (
+                REPO_ROOT
+                / "backend"
+                / ".venv"
+                / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            )
+            server_cmd = [
+                str(backend_python),
+                "-c",
+                (
+                    "import sys; sys.path.insert(0, 'backend'); "
+                    "import uvicorn, app.db.session; "
+                    "from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker; "
+                    "from app.config import get_settings; "
+                    "url = get_settings().DATABASE_URL; "
+                    "engine = create_async_engine("
+                    "    url, pool_size=20, max_overflow=0, pool_timeout=30.0, "
+                    "    connect_args={'server_settings': {'timezone': 'UTC', 'lock_timeout': '15s', 'statement_timeout': '30s', 'idle_in_transaction_session_timeout': '30s'}}"
+                    "); "
+                    "app.db.session._engine = engine; "
+                    "app.db.session._engine_url = url; "
+                    "app.db.session._sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False); "
+                    f"uvicorn.run('app.main:app', host='127.0.0.1', port={server_port}, log_level='warning')"
+                ),
+            ]
+            print(
+                f"Starting Uvicorn server on port {server_port} for concurrency gate..."
+            )
+            server_stdout_f = open(evidence_dir / "uvicorn_stdout.txt", "w", encoding="utf-8")
+            server_stderr_f = open(evidence_dir / "uvicorn_stderr.txt", "w", encoding="utf-8")
+            server_proc = subprocess.Popen(
+                server_cmd,
+                cwd=REPO_ROOT,
+                env=server_env,
+                stdout=server_stdout_f,
+                stderr=server_stderr_f,
+                text=True,
+            )
+            # Poll /healthz until ready
+            ready = False
+            for _ in range(60):
+                time.sleep(0.5)
+                if server_proc.poll() is not None:
+                    break
+                try:
+                    with urllib.request.urlopen(f"{server_url}/healthz", timeout=1) as resp:
+                        if resp.status == 200:
+                            ready = True
+                            break
+                except Exception:
+                    continue
+
+            if not ready:
+                server_stdout_f.flush()
+                server_stderr_f.flush()
+                err_content = (evidence_dir / "uvicorn_stderr.txt").read_text(encoding="utf-8")
+                out_content = (evidence_dir / "uvicorn_stdout.txt").read_text(encoding="utf-8")
+                raise RuntimeError(
+                    f"Uvicorn server failed to become ready on {server_url}:\n{err_content}\n{out_content}"
+                )
+
+            # Run pytest backend/tests/concurrency
+            test_env = {
+                **server_env,
+                "COMMONSBOOK_BASE_URL": server_url,
+                "EVIDENCE_DIR": str(evidence_dir),
+            }
+            cmd = [
+                uv_bin,
+                "run",
+                "--project",
+                "backend",
+                "pytest",
+                "backend/tests/concurrency",
+            ]
+            code = run_command(
+                cmd,
+                evidence_dir,
+                len(command_log) + 1,
+                env=test_env,
+                check_tool="pytest",
+            )
+            command_log.append({"cmd": cmd, "exit_code": code})
+            return code
+        finally:
+            if server_proc and server_proc.poll() is None:
+                server_proc.terminate()
+                try:
+                    server_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    server_proc.kill()
+                    server_proc.wait(timeout=2)
+            if server_stdout_f:
+                server_stdout_f.close()
+            if server_stderr_f:
+                server_stderr_f.close()
+            db_mgr.stop(command_log)
+
+    elif target == "permissions":
+        db_mgr = IsolatedDatabaseManager(evidence_dir=evidence_dir, run_id=run_id)
+        try:
+            database_url = db_mgr.start(command_log)
+            test_env = {
+                **os.environ,
+                "DATABASE_URL": database_url,
+                "TEST_RUN_ID": db_mgr.test_run_id,
+                "JWT_SECRET": os.environ.get("JWT_SECRET")
+                or "test-jwt-secret-minimum-32-bytes-long-12345678",
+                "RATE_LIMIT_HMAC_SECRET": os.environ.get("RATE_LIMIT_HMAC_SECRET")
+                or "test-hmac-secret-minimum-32-bytes-long-1234",
+            }
+            cmd = [
+                uv_bin,
+                "run",
+                "--project",
+                "backend",
+                "pytest",
+                "backend/tests/integration/test_permissions.py",
+            ]
+            code = run_command(
+                cmd,
+                evidence_dir,
+                len(command_log) + 1,
+                env=test_env,
+                check_tool="pytest",
+            )
+            command_log.append({"cmd": cmd, "exit_code": code})
+            if code != 0:
+                return code
+
+            backend_python = (
+                REPO_ROOT
+                / "backend"
+                / ".venv"
+                / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            )
+            check_matrix_cmd = [
+                str(backend_python),
+                "-c",
+                (
+                    "import re, sys; "
+                    "sys.path.insert(0, 'backend'); "
+                    "from app.auth.dependencies import policy_registry; "
+                    "content = open('backend/tests/integration/test_permissions.py', encoding='utf-8').read(); "
+                    "tested_eids = set(re.findall(r'# \\d+\\.\\s+(E\\d+):', content)); "
+                    "missing = set(policy_registry.keys()) - tested_eids; "
+                    "assert not missing, f'Policy registry endpoints missing test matrix coverage: {missing}'; "
+                    "print(f'All {len(policy_registry)} endpoints in policy_registry verified in permissions matrix: {sorted(policy_registry.keys())}')"
+                ),
+            ]
+            code = run_command(
+                check_matrix_cmd,
+                evidence_dir,
+                len(command_log) + 1,
+                env=test_env,
+            )
+            command_log.append({"cmd": check_matrix_cmd, "exit_code": code})
+            return code
+        finally:
+            db_mgr.stop(command_log)
+
     elif target == "regression":
         regression_order = central_manifest.get("ordered_targets", [])
         implemented_targets = set(central_manifest.get("implemented_targets", []))
@@ -698,7 +904,7 @@ def execute_gate(target, ticket, central, fragments, evidence_dir, run_id, fresh
             versions.pop(name, None)
     sha = get_git_sha()
     fingerprint = compute_fingerprint(target)
-    profile = os.environ.get("TEST_PROFILE", "standard")
+    profile = "race" if target == "concurrency" else os.environ.get("TEST_PROFILE", "standard")
     root = Path(os.environ.get("EVIDENCE_ROOT", str(REPO_ROOT / "evidence")))
     if (
         is_evidence_reuse_activated(central)
