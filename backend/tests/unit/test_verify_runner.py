@@ -12,7 +12,7 @@ import verify  # noqa: E402
 
 
 def test_unimplemented_target_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "argv", ["verify.py", "concurrency"])
+    monkeypatch.setattr(sys, "argv", ["verify.py", "smoke"])
     with pytest.raises(SystemExit) as exc_info:
         verify.main()
     assert exc_info.value.code != 0
@@ -274,9 +274,9 @@ def test_changed_inputs_during_run_fail(tmp_path: Path, monkeypatch: pytest.Monk
 def test_missing_implemented_suite_fails(tmp_path: Path) -> None:
     with pytest.raises(SystemExit, match="has no runner logic"):
         verify.run_target(
-            "permissions",
+            "smoke",
             None,
-            {"implemented_targets": ["permissions"]},
+            {"implemented_targets": ["smoke"]},
             {},
             tmp_path,
             [],

@@ -63,13 +63,13 @@ Run individual verification targets as follows:
   ```bash
   python scripts/verify.py regression
   ```
-  Runs all implemented gates sequentially (`lint` -> `unit` -> `integration`). Gates that are registered but not yet implemented are skipped during regression.
+  Runs all implemented gates sequentially (`lint` -> `unit` -> `integration` -> `concurrency` -> `permissions`). A missing suite or nonzero child command fails the regression.
 
 ### Evidence and Caching
 
 Every execution of `scripts/verify.py` writes a structured execution manifest and command logs to `evidence/<run-id>/`. Input fingerprinting is content-based (path, file mode, byte contents; never timestamps).
 
-Evidence reuse is currently disabled: every gate executes on every run. When it is later enabled, it will apply only to the concurrency and permissions gates, and a reused result is always recorded as reused with its original execution commit — never relabeled as a fresh run.
+Evidence reuse is enabled for the standard `lint`, `unit`, `integration`, `concurrency`, `permissions`, and `frontend` gates. Reuse requires a successful original execution with the same complete input fingerprint, runtime and configuration, plus intact hashed command artifacts. A reused result references its original execution and source SHA; it is never relabeled as a fresh run. Public CI and milestone verification use `--fresh`.
 
 The `--fresh` flag exists and forces execution, disabling reuse:
 
@@ -81,25 +81,21 @@ python scripts/verify.py concurrency --fresh
 
 Continuous integration runs on GitHub Actions on every pull request and on every push to `main`.
 
-### Concurrency and Permissions
+### Execution Model
 
-- **Permissions**: The workflow operates under strict least-privilege defaults (`contents: read`). No write permissions and no external secrets are granted.
-- **Concurrency**: Workflows are grouped by branch or pull request reference (`${{ github.workflow }}-${{ github.ref }}`). Redundant runs on pull requests cancel automatically, while runs on the `main` branch are never canceled in progress.
+The workflow operates under strict least-privilege defaults (`contents: read`) with no external secrets. Runs are grouped by branch or pull request reference; redundant pull-request runs cancel automatically, while `main` runs are never canceled in progress.
 
-### Stage Order
+One shared `Verify application` job bootstraps dependencies once and invokes the repository runner with `--fresh`. The runner selects documentation-only, frontend-only, or full regression scope from the comparison base. Full regression executes lint/type checks, unit tests, isolated PostgreSQL integration tests, the real HTTP concurrency gate, and current centralized permission coverage. The API image build runs when the selected scope requires it.
 
-CI stages execute in a strict linear sequence enforced by job dependencies (`needs`):
+The five required public status names remain lightweight compatibility jobs that depend on the shared verification result:
 
-1. **`lint` (`Lint and Typecheck`)**:
-   Runs linting, code formatting checks, and static type analysis across backend and frontend codebases.
-2. **`unit` (`Unit Tests`)**:
-   Runs fast, in-memory backend unit tests and frontend component tests. Depends on `lint`.
-3. **`integration` (`Integration Tests`)**:
-   Runs database-backed integration tests against a real PostgreSQL 16 service managed by Docker Compose. Depends on `unit`.
-4. **`concurrency` (`Concurrency Gate`)**:
-   Registered verification stage for multi-worker and concurrent state validation. Currently registered as not implemented; verifies registration honesty without blocking the pipeline. Depends on `integration`.
-5. **`build` (`Build API Image`)**:
-   Builds the API container image from `infra/Dockerfile.api` using Docker. No images are tagged for external registries or published. Depends on `concurrency`.
+1. `Lint and Typecheck`
+2. `Unit Tests`
+3. `Integration Tests`
+4. `Concurrency Gate`
+5. `Build API Image`
+
+These jobs do not repeat the suites; they preserve branch-protection names while requiring the shared job to succeed.
 
 ### Dependency Caching
 
@@ -111,7 +107,7 @@ Test outcomes, evidence manifests, and test execution artifacts are never cached
 
 ### Evidence Artifacts
 
-Each stage uploads its generated `evidence/` directory as a workflow artifact named `evidence-<stage>` upon step completion or failure (`if: always()`), retained for 14 days.
+The shared verification job uploads the generated `evidence/` directory once as the `evidence-verification` workflow artifact upon success or failure (`if: always()`), retained for 14 days.
 
 ## Required Status Checks and Branch Protection
 
@@ -161,5 +157,5 @@ Commit messages must adhere to the following format:
 
 ### Current Limitations and Status
 
-- **Concurrency Gate**: The `concurrency` gate is registered in the verification sequence and monitored in CI. It is currently not implemented and activates when the concurrency suite lands. Regression runs enumerate only gates the manifest marks implemented, and explicitly report unimplemented gates as not implemented — never reporting them as passing.
-- **Permissions Gate**: The `permissions` gate is defined in the pipeline architecture but remains unimplemented at this stage. Regression runs enumerate only gates the manifest marks implemented, and explicitly report unimplemented gates as not implemented — never reporting them as passing.
+- **Concurrency Gate**: Implemented with a real Uvicorn process, an isolated PostgreSQL 16 database, a 20-connection server pool, three 200-user same-slot rounds, and a 200-request identical-key proof. It is a correctness gate, not a production load or latency benchmark.
+- **Permissions Gate**: Implemented for every endpoint currently registered in `policy_registry`. The matrix expands as endpoints are added; the complete final endpoint/persona matrix remains future work.

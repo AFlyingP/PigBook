@@ -328,9 +328,15 @@ def test_reusable_gates_only_include_implemented_standard_gates() -> None:
     data = json.loads((SCRIPTS_DIR / "verification.json").read_text())
     gates = set(verification_cache.get_reusable_gates(data))
     assert verification_cache.is_evidence_reuse_activated(data)
-    assert gates == {"lint", "unit", "integration", "frontend"}
+    assert gates == {
+        "lint",
+        "unit",
+        "integration",
+        "concurrency",
+        "permissions",
+        "frontend",
+    }
     assert gates <= set(data["implemented_targets"])
-    assert "concurrency" not in gates
 
 
 @pytest.mark.parametrize(
@@ -397,3 +403,27 @@ def test_frontend_change_preserves_backend_fingerprint(tmp_path: Path) -> None:
     before = verification_cache.compute_fingerprint("integration", tmp_path)
     (tmp_path / "frontend/package-lock.json").write_text("changed frontend lock")
     assert before == verification_cache.compute_fingerprint("integration", tmp_path)
+
+
+def test_concurrency_gate_inputs_include_concurrency_tests(tmp_path: Path) -> None:
+    setup_test_tree(tmp_path)
+    before = verification_cache.compute_fingerprint("concurrency", tmp_path)
+    concurrency_test = tmp_path / "backend" / "tests" / "concurrency" / "test_same_slot.py"
+    concurrency_test.parent.mkdir(parents=True, exist_ok=True)
+    concurrency_test.write_text("# concurrency test change")
+    after = verification_cache.compute_fingerprint("concurrency", tmp_path)
+    assert before != after, (
+        "Changes in backend/tests/concurrency must alter the concurrency gate fingerprint"
+    )
+
+
+def test_permissions_gate_inputs_include_permissions_tests(tmp_path: Path) -> None:
+    setup_test_tree(tmp_path)
+    before = verification_cache.compute_fingerprint("permissions", tmp_path)
+    perm_test = tmp_path / "backend" / "tests" / "integration" / "test_permissions.py"
+    perm_test.parent.mkdir(parents=True, exist_ok=True)
+    perm_test.write_text("# permissions test change")
+    after = verification_cache.compute_fingerprint("permissions", tmp_path)
+    assert before != after, (
+        "Changes in test_permissions.py must alter the permissions gate fingerprint"
+    )

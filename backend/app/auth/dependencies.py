@@ -1,8 +1,8 @@
 import uuid
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable
+from typing import Any
 
 import jwt
 from fastapi import Depends, Request
@@ -66,6 +66,7 @@ class AuthorizedScope:
     object_id: uuid.UUID | None = None
     resource_id: uuid.UUID | None = None
     expected_version: int | None = None
+    assert_current: Callable[[AsyncSession], Awaitable[None]] | None = None
 
 
 policy_registry: dict[str, Policy] = {
@@ -136,9 +137,14 @@ def authorize(
 
         # Reload user enabled status and role from database on EVERY request.
         # Role inside JWT token is NOT trusted.
-        stmt = select(User.id, User.role, User.enabled).where(User.id == user_id)
-        result = await session.execute(stmt)
-        user_row = result.one_or_none()
+        try:
+            stmt = select(User.id, User.role, User.enabled).where(User.id == user_id)
+            result = await session.execute(stmt)
+            user_row = result.one_or_none()
+        finally:
+            # Release read transaction's physical connection immediately so it is not
+            # held while subsequent request lifecycle dependencies or handlers execute.
+            await session.rollback()
 
         if user_row is None:
             raise InvalidTokenError("Invalid or expired token")
@@ -154,9 +160,26 @@ def authorize(
             if db_role not in ("member", "admin"):
                 raise ForbiddenError("Insufficient permissions")
 
+        async def _assert_current(target_session: AsyncSession) -> None:
+            """In-transaction policy revalidation selecting user FOR SHARE (Spec 3.4, 5.1)."""
+            reval_stmt = (
+                select(User.id, User.role, User.enabled)
+                .where(User.id == db_id)
+                .with_for_update(read=True)
+            )
+            reval_res = await target_session.execute(reval_stmt)
+            current_row = reval_res.one_or_none()
+            if current_row is None or not current_row[2]:
+                raise InvalidTokenError("Invalid or expired token")
+            if policy == Policy.admin and current_row[1] != "admin":
+                raise ForbiddenError("Insufficient permissions")
+            if policy == Policy.authenticated and current_row[1] not in ("member", "admin"):
+                raise ForbiddenError("Insufficient permissions")
+
         return AuthorizedScope(
             principal_id=db_id,
             policy=policy,
+            assert_current=_assert_current,
         )
 
     return dependency
