@@ -71,6 +71,10 @@ async def create_booking_endpoint(
     # 2. Consume rate limits in its own short independent transaction BEFORE domain transaction
     await _check_mutation_rate_limit(scope.principal_id, now=now)
 
+    # 3. Revalidate user and acquire FOR SHARE lock inside domain session (Spec 3.4, 5.1)
+    if scope.assert_current is not None:
+        await scope.assert_current(session)
+
     async def operation() -> StoredResponse:
         # Sample database clock for window validation and persistence
         db_clock = await session.scalar(select(func.clock_timestamp()))

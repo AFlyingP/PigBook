@@ -174,7 +174,7 @@ Idempotency is scoped per authenticated user (`user_id, key`). Concurrency betwe
 
 ---
 
-## 7. Concurrency Gate (T-011)
+## 7. Concurrency Correctness Gate
 
 The concurrency gate provides automated, high-contention verification of the booking invariant, transactional outbox, and atomic idempotency under real HTTP and database concurrency.
 
@@ -205,4 +205,4 @@ python scripts/verify.py regression --fresh
 The concurrency gate is a **deterministic local and CI correctness gate**, not a production load, latency, or throughput benchmark:
 - Requests are dispatched over local loopback (`127.0.0.1`) against a single Uvicorn process and ephemeral Docker container.
 - It validates transactional invariants, database locking order, and GiST exclusion constraint integrity under severe concurrency contention.
-- It does not measure realistic user traffic distributions, wide-area network latency, or multi-node worker behavior. Load testing is evaluated separately via open-loop Locust suites in later tickets.
+- It does not measure realistic user traffic distributions, wide-area network latency, or multi-node worker behavior. Load testing is evaluated separately via open-loop Locust suites in the dedicated load testing suite.
