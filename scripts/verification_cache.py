@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import hashlib
 import json
+import os
+import re
 import stat
 from pathlib import Path
 from typing import Any
@@ -43,10 +45,11 @@ def get_gate_inputs(gate: str, root: Path) -> list[Path]:
     def add_tree(dir_path: Path) -> None:
         if not dir_path.exists():
             return
-        for p in dir_path.rglob("*"):
-            if p.is_file():
-                rel = p.relative_to(root)
-                if not should_exclude(rel):
+        for current, dirs, names in os.walk(dir_path):
+            dirs[:] = [name for name in dirs if name not in EXCLUDED_DIR_NAMES]
+            for name in names:
+                p = Path(current) / name
+                if p.is_file() and not should_exclude(p.relative_to(root)):
                     files.add(p)
 
     def add_file(f_path: Path) -> None:
@@ -65,8 +68,14 @@ def get_gate_inputs(gate: str, root: Path) -> list[Path]:
     # Core manifests and locks common to verification
     add_file(root / "backend" / "pyproject.toml")
     add_file(root / "backend" / "uv.lock")
-    add_file(root / "frontend" / "package.json")
-    add_file(root / "frontend" / "package-lock.json")
+    add_tree(root / "scripts")
+    add_tree(root / ".github")
+    add_file(root / ".env")
+    add_file(root / "docs" / "schema.sql")
+    add_file(root / "docs" / "openapi.json")
+    add_file(root / "openapi.json")
+    if gate not in ("integration", "concurrency", "permissions"):
+        add_tree(root / "frontend")
     add_file(root / "scripts" / "verification.json")
     add_tree(root / "scripts" / "verification.d")
 
@@ -88,6 +97,8 @@ def get_gate_inputs(gate: str, root: Path) -> list[Path]:
         add_file(root / "frontend" / "vite.config.ts")
         add_file(root / "frontend" / "vitest.config.ts")
     elif gate == "unit":
+        add_file(root / "backend" / "tests" / "conftest.py")
+        add_file(root / "backend" / "tests" / "factories.py")
         add_tree(root / "backend" / "app")
         add_tree(root / "backend" / "tests" / "unit")
         add_tree(root / "frontend" / "src")
@@ -165,17 +176,31 @@ def check_reuse_eligibility(
         try:
             data = json.loads(m_path.read_text(encoding="utf-8"))
         except Exception:
-            continue
+            return False, "Invalid evidence manifest; fresh execution required", None
+
+        if not isinstance(data, dict):
+            return False, "Invalid evidence manifest", None
 
         if data.get("target") != gate:
             continue
 
-        if data.get("exit_code") != 0:
-            return False, "Source run failed; cannot reuse failed execution evidence", None
+        if data.get("reused") is True:
+            continue  # Always validate the original execution, never a chain of claims.
+
+        if type(data.get("exit_code")) is not int or data["exit_code"] != 0:
+            return (
+                False,
+                "Source run failed; cannot reuse failed execution evidence",
+                None,
+            )
 
         source_fp = data.get("input_fingerprint")
         if not source_fp or source_fp != candidate_fingerprint:
-            return False, f"Fingerprint mismatch: candidate {candidate_fingerprint} != source {source_fp}", None
+            return (
+                False,
+                f"Fingerprint mismatch: candidate {candidate_fingerprint} != source {source_fp}",
+                None,
+            )
 
         source_tools = data.get("tool_versions", {})
         if source_tools != candidate_tools:
@@ -184,6 +209,38 @@ def check_reuse_eligibility(
         source_profile = data.get("test_profile", "standard")
         if source_profile != test_profile:
             return False, "Test profile mismatch", None
+
+        if data.get("evidence_version") != 2 or data.get("execution_type") != "fresh":
+            return False, "Missing validated execution provenance", None
+        if not isinstance(data.get("git_sha"), str) or not re.fullmatch(
+            r"[0-9a-f]{40}", data["git_sha"]
+        ):
+            return False, "Missing source SHA", None
+        commands = data.get("commands")
+        if not isinstance(commands, list) or not commands:
+            return False, "Missing executed commands", None
+        if not candidate_tools or any(
+            value in ("unknown", "not-found", "") for value in candidate_tools.values()
+        ):
+            return False, "Uncertain tool versions", None
+        for command in commands:
+            if not isinstance(command, dict) or command.get("exit_code") != 0:
+                return False, "Failed or invalid child command", None
+            for stream in ("stdout", "stderr"):
+                name = command.get(f"{stream}_file", "")
+                if not isinstance(name, str):
+                    return False, "Invalid command artifact path", None
+                artifact = (m_path.parent / name).resolve()
+                if (
+                    not name
+                    or not artifact.is_relative_to(m_path.parent.resolve())
+                    or not artifact.is_file()
+                ):
+                    return False, "Missing command artifact", None
+                if hashlib.sha256(artifact.read_bytes()).hexdigest() != command.get(
+                    f"{stream}_sha256"
+                ):
+                    return False, "Invalid command artifact hash", None
 
         if candidate_locks and "dependency_locks" in data:
             if data["dependency_locks"] != candidate_locks:
@@ -206,7 +263,9 @@ def create_reused_manifest(
     source_bytes = source_manifest_path.read_bytes()
     source_manifest_hash = hashlib.sha256(source_bytes).hexdigest()
 
-    source_sha = source_manifest.get("source_verified_sha") or source_manifest.get("git_sha", "unknown")
+    source_sha = source_manifest.get("source_verified_sha") or source_manifest.get(
+        "git_sha", "unknown"
+    )
 
     return {
         "timestamp": timestamp,
@@ -218,6 +277,7 @@ def create_reused_manifest(
         "source_verified_sha": source_sha,
         "candidate_sha": candidate_sha,
         "source_manifest_hash": source_manifest_hash,
+        "source_manifest_path": str(source_manifest_path.resolve()),
         "input_fingerprint": candidate_fingerprint,
         "tool_versions": source_manifest.get("tool_versions", {}),
         "test_profile": source_manifest.get("test_profile", "standard"),

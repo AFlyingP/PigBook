@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import stat
@@ -217,7 +218,9 @@ def test_invocation_with_matching_fingerprint_executes_when_reuse_not_activated(
 
     manifest_path = SCRIPTS_DIR / "verification.json"
     manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest_data.get("evidence_reuse", {}).get("activated") is False
+    manifest_data["evidence_reuse"]["activated"] = False
+    original_load = verify.load_manifests
+    monkeypatch.setattr(verify, "load_manifests", lambda: (manifest_data, original_load()[1]))
 
     target = "lint"
     candidate_fp = verification_cache.compute_fingerprint(target)
@@ -281,6 +284,25 @@ def test_reuse_eligibility_helper_reports_fingerprint_match_directly(tmp_path: P
         "tool_versions": test_tools,
         "test_profile": test_profile,
     }
+    prior_manifest.update(
+        {
+            "evidence_version": 2,
+            "execution_type": "fresh",
+            "git_sha": "a" * 40,
+            "commands": [
+                {
+                    "cmd": ["pytest", "tests"],
+                    "exit_code": 0,
+                    "stdout_file": "out.txt",
+                    "stderr_file": "err.txt",
+                    "stdout_sha256": hashlib.sha256(b"1 passed").hexdigest(),
+                    "stderr_sha256": hashlib.sha256(b"").hexdigest(),
+                }
+            ],
+        }
+    )
+    (run_dir / "out.txt").write_bytes(b"1 passed")
+    (run_dir / "err.txt").write_bytes(b"")
     manifest_file = run_dir / "manifest.json"
     manifest_file.write_text(json.dumps(prior_manifest), encoding="utf-8")
 
@@ -302,25 +324,76 @@ def test_reuse_eligibility_helper_reports_fingerprint_match_directly(tmp_path: P
     assert matched_path == manifest_file
 
 
-def test_reusable_gates_set_matches_manifest_and_excludes_standard_gates() -> None:
-    manifest_path = SCRIPTS_DIR / "verification.json"
-    manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    reuse_config = manifest_data.get("evidence_reuse", {})
+def test_reusable_gates_only_include_implemented_standard_gates() -> None:
+    data = json.loads((SCRIPTS_DIR / "verification.json").read_text())
+    gates = set(verification_cache.get_reusable_gates(data))
+    assert verification_cache.is_evidence_reuse_activated(data)
+    assert gates == {"lint", "unit", "integration", "frontend"}
+    assert gates <= set(data["implemented_targets"])
+    assert "concurrency" not in gates
 
-    assert reuse_config.get("activated") is False
-    assert reuse_config.get("activation_target") == "T-011"
 
-    reusable_gates = reuse_config.get("reusable_gates", [])
-    assert set(reusable_gates) == {"concurrency", "permissions"}
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_log",
+        "altered_log",
+        "missing_sha",
+        "failed_child",
+        "invalid_json",
+        "missing_commands",
+        "missing_version",
+    ],
+)
+def test_corrupt_evidence_cannot_be_reused(tmp_path: Path, mutation: str) -> None:
+    test_reuse_eligibility_helper_reports_fingerprint_match_directly(tmp_path)
+    root = tmp_path / "evidence"
+    manifest = root / "successful_run" / "manifest.json"
+    data = json.loads(manifest.read_text())
+    if mutation == "missing_log":
+        (manifest.parent / "out.txt").unlink()
+    elif mutation == "altered_log":
+        (manifest.parent / "out.txt").write_text("failed")
+    elif mutation == "missing_sha":
+        del data["git_sha"]
+    elif mutation == "failed_child":
+        data["commands"][0]["exit_code"] = 1
+    elif mutation == "missing_commands":
+        data["commands"] = []
+    elif mutation == "missing_version":
+        del data["evidence_version"]
+    manifest.write_text("{" if mutation == "invalid_json" else json.dumps(data))
+    ok, _, _ = verification_cache.check_reuse_eligibility(
+        "concurrency",
+        "deterministic_sha256_hash_abc123",
+        {"uv": "0.12.10", "node": "22"},
+        "standard",
+        root,
+    )
+    assert not ok
 
-    # Must NOT include lint, unit, or integration
-    assert "lint" not in reusable_gates
-    assert "unit" not in reusable_gates
-    assert "integration" not in reusable_gates
 
-    # Verification cache helper functions reflect manifest configuration
-    expected_gates = {"concurrency", "permissions"}
-    assert set(verification_cache.get_reusable_gates(manifest_data)) == expected_gates
-    assert set(verification_cache.get_reusable_gates()) == expected_gates
-    assert verification_cache.is_evidence_reuse_activated(manifest_data) is False
-    assert verification_cache.is_evidence_reuse_activated() is False
+@pytest.mark.parametrize(
+    "path",
+    [
+        "scripts/verify.py",
+        "backend/tests/conftest.py",
+        "docs/schema.sql",
+        "docs/openapi.json",
+        "backend/app/worker.py",
+    ],
+)
+def test_backend_relevant_inputs_invalidate_gate(tmp_path: Path, path: str) -> None:
+    setup_test_tree(tmp_path)
+    before = verification_cache.compute_fingerprint("integration", tmp_path)
+    p = tmp_path / path
+    p.parent.mkdir(exist_ok=True, parents=True)
+    p.write_text("changed input")
+    assert before != verification_cache.compute_fingerprint("integration", tmp_path)
+
+
+def test_frontend_change_preserves_backend_fingerprint(tmp_path: Path) -> None:
+    setup_test_tree(tmp_path)
+    before = verification_cache.compute_fingerprint("integration", tmp_path)
+    (tmp_path / "frontend/package-lock.json").write_text("changed frontend lock")
+    assert before == verification_cache.compute_fingerprint("integration", tmp_path)

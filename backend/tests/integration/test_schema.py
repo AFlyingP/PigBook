@@ -21,14 +21,6 @@ from app.bookings.models import Booking
 from app.db.base import Base
 from app.resources.models import Resource
 
-
-@pytest.fixture(autouse=True)
-async def _ensure_schema() -> None:
-    """Ensure Alembic migrations have been applied to head before running test."""
-    cfg = Config("backend/alembic.ini")
-    await asyncio.to_thread(command.upgrade, cfg, "head")
-
-
 EXPECTED_TABLES = {
     "users",
     "invitations",

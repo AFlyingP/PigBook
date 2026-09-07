@@ -4,12 +4,9 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
-from alembic.config import Config
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.exc import IntegrityError
-
-from alembic import command
 
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
@@ -33,13 +30,6 @@ from app.notifications.outbox import append_event
 from app.resources.models import Resource
 
 get_settings.cache_clear()
-
-
-@pytest.fixture(autouse=True)
-async def _ensure_schema() -> None:
-    """Ensure Alembic migrations have been applied to head before running test."""
-    cfg = Config("backend/alembic.ini")
-    await asyncio.to_thread(command.upgrade, cfg, "head")
 
 
 @pytest.fixture(autouse=True)

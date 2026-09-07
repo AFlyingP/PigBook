@@ -226,32 +226,30 @@ def test_triggers(ci_workflow: dict[str, Any]) -> None:
     assert "main" in push_config["branches"], "push trigger must include 'main' branch"
 
 
-def test_stage_order_and_dependencies(ci_workflow: dict[str, Any]) -> None:
-    """2. Stage order is exactly lint/type -> unit -> integration -> concurrency -> build."""
-    jobs = ci_workflow.get("jobs")
-    assert isinstance(jobs, dict), "Workflow must declare 'jobs' mapping"
+def test_ci_bootstraps_once_and_runs_fresh_regression(ci_workflow: dict[str, Any]) -> None:
+    jobs = ci_workflow["jobs"]
+    assert list(jobs) == ["verify", "lint", "unit", "integration", "concurrency", "build"]
+    expected = {
+        "lint": "Lint and Typecheck",
+        "unit": "Unit Tests",
+        "integration": "Integration Tests",
+        "concurrency": "Concurrency Gate",
+        "build": "Build API Image",
+    }
+    for key, name in expected.items():
+        job = jobs[key]
+        assert job["name"] == name
+        assert job["needs"] == "verify"
+        assert job["if"] == "always()"
+        assert job["steps"][0]["env"]["VERIFY_RESULT"] == "${{ needs.verify.result }}"
+        assert job["steps"][0]["run"] == 'test "$VERIFY_RESULT" = "success"'
 
-    expected_stages = ["lint", "unit", "integration", "concurrency", "build"]
-    assert list(jobs.keys()) == expected_stages, f"Job stages must be exactly {expected_stages}"
-
-    def get_needs(job_def: dict[str, Any]) -> list[str]:
-        n = job_def.get("needs")
-        if isinstance(n, str):
-            return [n]
-        if isinstance(n, list):
-            return n
-        return []
-
-    # lint has no dependencies
-    assert get_needs(jobs["lint"]) == [], "lint stage must not depend on other jobs"
-
-    # Strict linear dependency chain
-    assert get_needs(jobs["unit"]) == ["lint"], "unit stage must depend on lint"
-    assert get_needs(jobs["integration"]) == ["unit"], "integration stage must depend on unit"
-    assert get_needs(jobs["concurrency"]) == ["integration"], (
-        "concurrency stage must depend on integration"
-    )
-    assert get_needs(jobs["build"]) == ["concurrency"], "build stage must depend on concurrency"
+    scripts = "\n".join(step.get("run", "") for step in jobs["verify"]["steps"])
+    assert scripts.count("python scripts/verify.py bootstrap") == 1
+    assert "python scripts/verify.py regression --base" in scripts
+    assert "python scripts/verify.py regression --fresh" in scripts
+    assert '"build", "--fresh"' in scripts
+    assert scripts.index("bootstrap") < scripts.index("regression") < scripts.index('"build"')
 
 
 def test_permissions(ci_workflow: dict[str, Any], raw_ci_yaml: str) -> None:
@@ -274,31 +272,14 @@ def test_permissions(ci_workflow: dict[str, Any], raw_ci_yaml: str) -> None:
                 assert "write" not in str(job_perms).lower()
 
 
-def test_concurrency_gate_marked_not_implemented(ci_workflow: dict[str, Any]) -> None:
-    """4. Concurrency gate stage exists, is registered, and is visibly marked not-implemented."""
-    jobs = ci_workflow.get("jobs", {})
-    assert "concurrency" in jobs, "concurrency job must exist"
+def test_concurrency_registration_is_honest() -> None:
+    import json
 
-    concurrency_job = jobs["concurrency"]
-    steps = concurrency_job.get("steps", [])
-
-    run_scripts = [s.get("run", "") for s in steps if "run" in s]
-    combined_run_script = "\n".join(run_scripts)
-
-    # Must invoke the real verify runner
-    assert "python scripts/verify.py concurrency" in combined_run_script, (
-        "Concurrency stage must invoke real runner"
-    )
-
-    # Must NOT claim pass or success
-    assert "passed" not in combined_run_script.lower(), "Stage must not claim concurrency passed"
-    assert "success" not in combined_run_script.lower(), (
-        "Stage must not claim concurrency succeeded"
-    )
-
-    # Must honestly surface not-implemented status in job summary
-    assert "not implemented" in combined_run_script.lower()
-    assert "GITHUB_STEP_SUMMARY" in combined_run_script
+    manifest = json.loads((CI_WORKFLOW_PATH.parents[2] / "scripts/verification.json").read_text())
+    assert "concurrency" in manifest["ordered_targets"]
+    assert "concurrency" not in manifest["implemented_targets"]
+    runner = (CI_WORKFLOW_PATH.parents[2] / "scripts/verify.py").read_text()
+    assert "not implemented; no passing evidence claimed" in runner
 
 
 def test_cache_keys_strictly_lockfile_based(ci_workflow: dict[str, Any]) -> None:
@@ -346,7 +327,7 @@ def test_artifact_upload_uses_if_always(ci_workflow: dict[str, Any]) -> None:
                     f"Job {job_name} must upload evidence/ directory"
                 )
 
-    assert upload_steps_found == len(jobs), "Every stage must declare an artifact upload step"
+    assert upload_steps_found == 1, "Shared execution must upload its evidence exactly once"
 
 
 def test_no_deploy_or_publish_jobs(ci_workflow: dict[str, Any], raw_ci_yaml: str) -> None:
@@ -385,6 +366,9 @@ def test_stages_invoke_verify_runner(ci_workflow: dict[str, Any]) -> None:
     """9. The stages invoke scripts/verify.py rather than bypassing it."""
     jobs = ci_workflow.get("jobs", {})
     for job_name, job in jobs.items():
+        if job_name != "verify":
+            assert job["needs"] == "verify"
+            continue
         steps = job.get("steps", [])
         run_steps = [s.get("run", "") for s in steps if "run" in s]
 

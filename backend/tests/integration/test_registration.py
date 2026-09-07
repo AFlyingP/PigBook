@@ -10,10 +10,7 @@ from pathlib import Path
 import httpx
 import jwt
 import pytest
-from alembic.config import Config
 from sqlalchemy import func, select
-
-from alembic import command
 
 # Ensure test secrets are set before importing app components
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
@@ -27,12 +24,6 @@ from app.db.session import get_sessionmaker
 from app.main import app
 
 get_settings.cache_clear()
-
-
-@pytest.fixture(autouse=True)
-async def _ensure_schema() -> None:
-    cfg = Config("backend/alembic.ini")
-    await asyncio.to_thread(command.upgrade, cfg, "head")
 
 
 @pytest.fixture(autouse=True)
