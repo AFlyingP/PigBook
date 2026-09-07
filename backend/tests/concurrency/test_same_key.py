@@ -91,7 +91,7 @@ async def test_200_same_user_same_key_concurrent(base_url: str) -> None:
     # 3. Assert all 200 bodies have the exact same booking ID and payload
     first_body = results[0][1].json()
     booking_id = first_body["id"]
-    for _, resp in results:
+    for _, resp, _, _ in results:
         assert resp.json() == first_body
 
     # 4. Assert database persistence: exactly 1 booking, 1 key, 1 outbox
