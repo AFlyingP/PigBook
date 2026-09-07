@@ -34,7 +34,7 @@ async def register_endpoint(
     body: Register,
     request: Request,
     _scope: AuthorizedScope = Depends(authorize(Policy.public)),
-    session: AsyncSession = Depends(transaction_dependency),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
 ) -> User:
     now = datetime.now(timezone.utc)
     # Rate limit: 5/IP/hour per Spec 8.2
@@ -53,7 +53,7 @@ async def login_endpoint(
     request: Request,
     response: Response,
     _scope: AuthorizedScope = Depends(authorize(Policy.public)),
-    session: AsyncSession = Depends(transaction_dependency),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
 ) -> TokenResponse:
     now = datetime.now(timezone.utc)
     # Rate limit check runs and commits in its own short independent transaction
@@ -131,7 +131,7 @@ async def refresh_endpoint(
     request: Request,
     response: Response,
     _scope: AuthorizedScope = Depends(authorize(Policy.public)),
-    session: AsyncSession = Depends(transaction_dependency),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
 ) -> TokenResponse:
     # 1. Enforce exact Origin FIRST
     _enforce_exact_origin(request)
@@ -173,7 +173,7 @@ async def logout_endpoint(
     request: Request,
     response: Response,
     _scope: AuthorizedScope = Depends(authorize(Policy.public)),
-    session: AsyncSession = Depends(transaction_dependency),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
 ) -> Response:
     # 1. Enforce exact Origin FIRST (even when cookie is absent)
     _enforce_exact_origin(request)

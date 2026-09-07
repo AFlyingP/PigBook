@@ -19,7 +19,7 @@ async def create_invitation_endpoint(
     request: Request,
     response: Response,
     scope: AuthorizedScope = Depends(authorize(Policy.admin)),
-    session: AsyncSession = Depends(transaction_dependency),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
 ) -> InvitationResult:
     now = datetime.now(timezone.utc)
     req_id = (
