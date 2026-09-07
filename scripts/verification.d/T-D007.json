@@ -1,0 +1,9 @@
+{
+  "ticket_id": "T-D007",
+  "pytest_paths": [
+    "backend/tests/integration/test_transaction_boundary.py"
+  ],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}
