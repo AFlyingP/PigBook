@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import Range
@@ -29,6 +29,58 @@ class SlotConflict(Exception):
     ) -> None:
         self.message = message
         super().__init__(message)
+
+
+class InvalidWindowError(Exception):
+    def __init__(self, message: str = "Invalid booking window") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+def validate_booking_window(
+    starts_at: datetime,
+    ends_at: datetime,
+    now: datetime,
+) -> tuple[datetime, datetime]:
+    if starts_at.tzinfo is None or ends_at.tzinfo is None:
+        raise InvalidWindowError("Timestamps must include an explicit timezone offset")
+
+    starts_at_utc = starts_at.astimezone(timezone.utc)
+    ends_at_utc = ends_at.astimezone(timezone.utc)
+
+    if (
+        starts_at_utc.second != 0
+        or starts_at_utc.microsecond != 0
+        or starts_at_utc.minute not in (0, 30)
+    ):
+        raise InvalidWindowError(
+            "starts_at must fall on a UTC 30-minute boundary with zero seconds and microseconds"
+        )
+
+    if ends_at_utc.second != 0 or ends_at_utc.microsecond != 0 or ends_at_utc.minute not in (0, 30):
+        raise InvalidWindowError(
+            "ends_at must fall on a UTC 30-minute boundary with zero seconds and microseconds"
+        )
+
+    if ends_at_utc <= starts_at_utc:
+        raise InvalidWindowError("ends_at must be strictly greater than starts_at")
+
+    duration = ends_at_utc - starts_at_utc
+    if duration < timedelta(minutes=30) or duration > timedelta(hours=4):
+        raise InvalidWindowError(
+            "Booking duration must be between 30 minutes and 4 hours inclusive"
+        )
+
+    now_utc = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    now_utc = now_utc.astimezone(timezone.utc)
+
+    if starts_at_utc < now_utc + timedelta(minutes=15):
+        raise InvalidWindowError("starts_at must be at least 15 minutes in the future")
+
+    if starts_at_utc > now_utc + timedelta(days=90):
+        raise InvalidWindowError("starts_at must be at most 90 days in the future")
+
+    return starts_at_utc, ends_at_utc
 
 
 async def insert_confirmed(

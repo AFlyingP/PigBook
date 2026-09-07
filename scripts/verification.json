@@ -13,7 +13,8 @@
     "integration",
     "regression",
     "ticket",
-    "build"
+    "build",
+    "frontend"
   ],
   "implemented_endpoints": {
     "E35": "T-001",
@@ -25,15 +26,18 @@
     "E06": "T-008",
     "E07": "T-008",
     "E08": "T-008",
+    "E09": "T-010",
     "E29": "T-007"
   },
   "evidence_reuse": {
-    "activated": false,
-    "activation_target": "T-011",
+    "activated": true,
     "reusable_gates": [
-      "concurrency",
-      "permissions"
-    ]
+      "lint",
+      "unit",
+      "integration",
+      "frontend"
+    ],
+    "concurrency_activation": "T-011 requires fresh proof before enabling reuse"
   },
   "tooling": {
     "uv_version": "0.12.10",

@@ -1,0 +1,11 @@
+{
+  "ticket_id": "T-010",
+  "pytest_paths": [
+    "backend/tests/unit/test_request_hash.py",
+    "backend/tests/integration/test_idempotency.py",
+    "backend/tests/integration/test_permissions.py"
+  ],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}

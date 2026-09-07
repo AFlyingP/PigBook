@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import hashlib
 import os
@@ -8,13 +7,10 @@ from unittest.mock import patch
 
 import httpx
 import pytest
-from alembic.config import Config
 from fastapi.routing import APIRoute, _IncludedRouter
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm.session import SessionTransaction
-
-from alembic import command
 
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
@@ -26,12 +22,6 @@ from app.db.session import get_sessionmaker, transaction_dependency
 from app.main import app
 
 get_settings.cache_clear()
-
-
-@pytest.fixture(autouse=True)
-async def _ensure_schema() -> None:
-    cfg = Config("backend/alembic.ini")
-    await asyncio.to_thread(command.upgrade, cfg, "head")
 
 
 @pytest.fixture(autouse=True)

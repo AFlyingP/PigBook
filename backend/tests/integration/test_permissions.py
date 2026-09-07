@@ -1,4 +1,3 @@
-import asyncio
 import base64
 import hashlib
 import os
@@ -8,9 +7,6 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import jwt
 import pytest
-from alembic.config import Config
-
-from alembic import command
 
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
@@ -24,13 +20,6 @@ from app.main import app
 from app.resources.models import Resource
 
 get_settings.cache_clear()
-
-
-@pytest.fixture(autouse=True)
-async def _ensure_schema() -> None:
-    """Ensure Alembic migrations have been applied to head before running test."""
-    cfg = Config("backend/alembic.ini")
-    await asyncio.to_thread(command.upgrade, cfg, "head")
 
 
 @pytest.fixture(autouse=True)
@@ -130,6 +119,7 @@ def test_policy_metadata_coverage() -> None:
         "E06",
         "E07",
         "E08",
+        "E09",
         "E29",
         "E35",
     }
@@ -141,6 +131,7 @@ def test_policy_metadata_coverage() -> None:
     assert policy_registry["E06"] == Policy.authenticated
     assert policy_registry["E07"] == Policy.authenticated
     assert policy_registry["E08"] == Policy.authenticated
+    assert policy_registry["E09"] == Policy.authenticated
     assert policy_registry["E29"] == Policy.admin
     assert policy_registry["E35"] == Policy.public
 
@@ -451,3 +442,96 @@ async def test_permission_matrix() -> None:
         )
         assert r_e08_adm.status_code == 200
         assert r_e08_adm.json()["resource_id"] == str(perm_res.id)
+
+        # 11. E09: POST /api/v1/bookings (Policy.authenticated)
+        # Member/Admin allowed (201); Anonymous denied (401 AUTH_REQUIRED);
+        # Disabled denied (401 INVALID_TOKEN)
+        # All requests provide otherwise-VALID body and distinct valid UUID v4 Idempotency-Key
+        e09_res = Resource(
+            id=uuid.uuid4(),
+            name=f"E09Resource_{uuid.uuid4().hex[:6]}",
+            description="For E09 permissions matrix",
+            location="Room 102",
+            active=True,
+            version=1,
+        )
+        async with sessionmaker() as session:
+            async with session.begin():
+                session.add(e09_res)
+
+        slot_base = datetime.now(timezone.utc).replace(
+            minute=0, second=0, microsecond=0
+        ) + timedelta(days=2)
+
+        # Anon request
+        anon_slot_start = (slot_base + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        anon_slot_end = (slot_base + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r_e09_anon = await client.post(
+            "/api/v1/bookings",
+            json={
+                "resource_id": str(e09_res.id),
+                "starts_at": anon_slot_start,
+                "ends_at": anon_slot_end,
+            },
+            headers={"Idempotency-Key": str(uuid.uuid4())},
+        )
+        assert r_e09_anon.status_code == 401
+        assert r_e09_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        # Disabled request
+        dis_slot_start = (slot_base + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        dis_slot_end = (slot_base + timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r_e09_dis = await client.post(
+            "/api/v1/bookings",
+            json={
+                "resource_id": str(e09_res.id),
+                "starts_at": dis_slot_start,
+                "ends_at": dis_slot_end,
+            },
+            headers={
+                "Authorization": f"Bearer {disabled_token}",
+                "Idempotency-Key": str(uuid.uuid4()),
+            },
+        )
+        assert r_e09_dis.status_code == 401
+        assert r_e09_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        # Member request -> 201
+        mem_slot_start = (slot_base + timedelta(hours=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mem_slot_end = (slot_base + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r_e09_mem = await client.post(
+            "/api/v1/bookings",
+            json={
+                "resource_id": str(e09_res.id),
+                "starts_at": mem_slot_start,
+                "ends_at": mem_slot_end,
+            },
+            headers={
+                "Authorization": f"Bearer {member_token}",
+                "Idempotency-Key": str(uuid.uuid4()),
+            },
+        )
+        assert r_e09_mem.status_code == 201
+        assert r_e09_mem.json()["user_id"] == str(member_user.id)
+        assert r_e09_mem.json()["resource_id"] == str(e09_res.id)
+        assert r_e09_mem.json()["status"] == "confirmed"
+
+        # Admin request -> 201
+        adm_slot_start = (slot_base + timedelta(hours=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        adm_slot_end = (slot_base + timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        r_e09_adm = await client.post(
+            "/api/v1/bookings",
+            json={
+                "resource_id": str(e09_res.id),
+                "starts_at": adm_slot_start,
+                "ends_at": adm_slot_end,
+            },
+            headers={
+                "Authorization": f"Bearer {admin_token}",
+                "Idempotency-Key": str(uuid.uuid4()),
+            },
+        )
+        assert r_e09_adm.status_code == 201
+        assert r_e09_adm.json()["user_id"] == str(admin_user.id)
+        assert r_e09_adm.json()["resource_id"] == str(e09_res.id)
+        assert r_e09_adm.json()["status"] == "confirmed"

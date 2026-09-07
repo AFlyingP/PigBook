@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import ConfigDict, field_serializer, model_validator
+from pydantic import ConfigDict, Field, field_serializer, model_validator
 
 from app.auth.schemas import BaseSchema
 
@@ -68,3 +68,17 @@ class Booking(BaseSchema):
         else:
             dt = dt.astimezone(timezone.utc)
         return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+class BookingCreate(BaseSchema):
+    resource_id: uuid.UUID
+    starts_at: datetime
+    ends_at: datetime
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class Cancel(BaseSchema):
+    reason: str = Field(default="", max_length=500)
+
+    model_config = ConfigDict(extra="forbid")

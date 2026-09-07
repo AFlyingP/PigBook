@@ -206,3 +206,79 @@ def test_skipped_test_treated_as_failure() -> None:
     err_vitest = verify.check_no_skips(vitest_out, "vitest")
     assert err_vitest is not None
     assert "skipped in vitest" in err_vitest
+
+
+@pytest.mark.parametrize("exit_code", [1, 7])
+def test_failing_child_is_not_hidden(tmp_path: Path, exit_code: int) -> None:
+    code = verify.run_command([sys.executable, "-c", f"raise SystemExit({exit_code})"], tmp_path, 1)
+    assert code == exit_code
+    assert (tmp_path / "cmd_01_stderr.txt").is_file()
+
+
+def test_runner_exception_writes_failure_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args):
+        raise RuntimeError("child unavailable")
+
+    monkeypatch.setattr(verify, "run_target", broken)
+    monkeypatch.setattr(verify, "get_tool_versions", lambda: {"python": "3.12"})
+    code = verify.execute_gate("unit", None, {}, {}, tmp_path, "failure", True)
+    data = json.loads((tmp_path / "manifest.json").read_text())
+    assert code != 0
+    assert data["exit_code"] != 0
+    assert data["error"] == "child unavailable"
+
+
+def test_database_namespace_is_unique_even_with_same_requested_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TEST_RUN_ID", "shared-value")
+    first = verify.IsolatedDatabaseManager(tmp_path, "same-run")
+    second = verify.IsolatedDatabaseManager(tmp_path, "same-run")
+    assert first.project_name != second.project_name
+
+
+@pytest.mark.parametrize(
+    "paths,expected",
+    [
+        (["README.md", "docs/testing.md"], "docs"),
+        (["frontend/src/App.tsx"], "frontend"),
+        (["backend/app/auth/dependencies.py"], "all"),
+        (["scripts/verify.py"], "all"),
+        (["docs/schema.sql"], "all"),
+        ([], "all"),
+    ],
+)
+def test_change_scope_is_conservative(
+    monkeypatch: pytest.MonkeyPatch, paths: list[str], expected: str
+) -> None:
+    import subprocess
+
+    monkeypatch.setattr(
+        verify.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess([], 0, "\n".join(paths)),
+    )
+    assert verify.changed_scope("base") == expected
+
+
+def test_changed_inputs_during_run_fail(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    fingerprints = iter(["before", "after"])
+    monkeypatch.setattr(verify, "compute_fingerprint", lambda _: next(fingerprints))
+    monkeypatch.setattr(verify, "get_tool_versions", lambda: {"python": "3.12"})
+    monkeypatch.setattr(verify, "run_target", lambda *args: 0)
+    assert verify.execute_gate("unit", None, {}, {}, tmp_path, "changed", True) != 0
+
+
+def test_missing_implemented_suite_fails(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit, match="has no runner logic"):
+        verify.run_target(
+            "permissions",
+            None,
+            {"implemented_targets": ["permissions"]},
+            {},
+            tmp_path,
+            [],
+            "missing",
+        )

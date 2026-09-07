@@ -4,11 +4,14 @@ import datetime
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import socket
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +48,7 @@ RECOGNIZED_TARGETS = {
     "evidence",
     "demo",
     "feedback-audit",
+    "frontend",
 }
 
 
@@ -164,6 +168,7 @@ def compute_configuration_hash() -> str:
 def get_tool_versions() -> dict[str, str]:
     versions: dict[str, str] = {
         "python_launcher": sys.version.split()[0],
+        "platform": platform.platform(),
     }
     uv_bin = find_tool("uv")
     try:
@@ -186,6 +191,57 @@ def get_tool_versions() -> dict[str, str]:
     except Exception:
         versions["npm"] = "not-found"
 
+    backend_python = (
+        REPO_ROOT
+        / "backend"
+        / ".venv"
+        / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    )
+    probes = {
+        "frontend_packages": [npm_bin, "--prefix", "frontend", "ls", "--all", "--json"],
+        "backend_runtime": [
+            str(backend_python),
+            "-c",
+            "import sys,importlib.metadata as m; print(sys.version); "
+            "print(sorted((d.metadata['Name'],d.version) for d in m.distributions()))",
+        ],
+        "docker": [find_tool("docker"), "--version"],
+        "compose": [find_tool("docker"), "compose", "version"],
+        "postgres_image": [
+            find_tool("docker"),
+            "image",
+            "inspect",
+            "postgres:16.15",
+            "--format",
+            "{{.Id}}",
+        ],
+    }
+    for name, cmd in probes.items():
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            versions[name] = proc.stdout.strip() if proc.returncode == 0 else "unknown"
+            if name == "frontend_packages" and proc.returncode == 0:
+                versions[name] = hashlib.sha256(proc.stdout.encode()).hexdigest()
+        except (OSError, subprocess.TimeoutExpired):
+            versions[name] = "not-found"
+    # Record hashes, never environment values which may contain credentials.
+    relevant_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in {
+            "EVIDENCE_DIR",
+            "EVIDENCE_ROOT",
+            "TEST_RUN_ID",
+            "PWD",
+            "OLDPWD",
+            "SHLVL",
+            "_",
+        }
+    }
+    versions["environment_sha256"] = hashlib.sha256(
+        json.dumps(relevant_env, sort_keys=True).encode()
+    ).hexdigest()
     return versions
 
 
@@ -205,7 +261,7 @@ class IsolatedDatabaseManager:
 
     def __init__(self, evidence_dir: Path, run_id: str) -> None:
         self.evidence_dir = evidence_dir
-        self.test_run_id = os.environ.get("TEST_RUN_ID") or run_id
+        self.test_run_id = f"{run_id}_{uuid.uuid4().hex}"
         # Derive deterministic, sanitized project and database identifiers
         slug = hashlib.sha256(self.test_run_id.encode("utf-8")).hexdigest()[:12]
         self.project_name = f"cb_test_{slug}"
@@ -213,17 +269,20 @@ class IsolatedDatabaseManager:
         self.db_user = "commonsbook_test"
         self.db_password = "commonsbook_test"
 
-        port_offset = int(hashlib.sha256(f"port_{self.test_run_id}".encode("utf-8")).hexdigest(), 16) % 2000
+        port_offset = (
+            int(
+                hashlib.sha256(f"port_{self.test_run_id}".encode("utf-8")).hexdigest(),
+                16,
+            )
+            % 2000
+        )
         base_port = 15432 + port_offset
         self.allocated_port = find_free_port(base_port)
         self.docker_bin = find_tool("docker")
 
     def start(self, command_log: list[dict[str, Any]]) -> str:
         override_yaml = (
-            f"services:\n"
-            f"  db:\n"
-            f"    ports:\n"
-            f"      - \"127.0.0.1:{self.allocated_port}:5432\"\n"
+            f'services:\n  db:\n    ports:\n      - "127.0.0.1:{self.allocated_port}:5432"\n'
         )
         cmd = [
             self.docker_bin,
@@ -239,7 +298,10 @@ class IsolatedDatabaseManager:
             "--wait",
             "db",
         ]
-        print(f"Starting isolated test database in namespace '{self.project_name}' on port {self.allocated_port}...")
+        print(
+            f"Starting isolated test database in namespace '{self.project_name}' "
+            f"on port {self.allocated_port}..."
+        )
         proc = subprocess.run(
             cmd,
             cwd=REPO_ROOT,
@@ -254,10 +316,19 @@ class IsolatedDatabaseManager:
                 "POSTGRES_PASSWORD": self.db_password,
             },
         )
-        command_log.append({
-            "cmd": cmd + [f"(stdin: port 127.0.0.1:{self.allocated_port}:5432)"],
-            "exit_code": proc.returncode,
-        })
+        command_log.append(
+            {
+                "cmd": cmd + [f"(stdin: port 127.0.0.1:{self.allocated_port}:5432)"],
+                "exit_code": proc.returncode,
+            }
+        )
+        index = len(command_log)
+        (self.evidence_dir / f"cmd_{index:02d}_stdout.txt").write_text(
+            proc.stdout, encoding="utf-8"
+        )
+        (self.evidence_dir / f"cmd_{index:02d}_stderr.txt").write_text(
+            proc.stderr, encoding="utf-8"
+        )
         if proc.returncode != 0:
             print(proc.stderr, file=sys.stderr)
             raise RuntimeError(f"Failed to start isolated database container: {proc.stderr}")
@@ -285,6 +356,15 @@ class IsolatedDatabaseManager:
             text=True,
         )
         command_log.append({"cmd": cmd, "exit_code": proc.returncode})
+        index = len(command_log)
+        (self.evidence_dir / f"cmd_{index:02d}_stdout.txt").write_text(
+            proc.stdout, encoding="utf-8"
+        )
+        (self.evidence_dir / f"cmd_{index:02d}_stderr.txt").write_text(
+            proc.stderr, encoding="utf-8"
+        )
+        if proc.returncode:
+            raise RuntimeError(f"Database cleanup failed for {self.project_name}")
 
 
 def load_manifests(
@@ -312,7 +392,9 @@ def load_manifests(
                 "document_checks",
             }
             if set(data.keys()) != required_keys:
-                sys.exit(f"Error: Fragment {frag_path.name} must have exactly keys: {required_keys}")
+                sys.exit(
+                    f"Error: Fragment {frag_path.name} must have exactly keys: {required_keys}"
+                )
 
             ticket_id = data["ticket_id"]
             if ticket_id in fragments:
@@ -331,7 +413,9 @@ def load_manifests(
             ):
                 sys.exit(f"Error: Fragment {frag_path.name} path lists must be arrays")
 
-            total_checks = len(pytest_paths) + len(vitest_paths) + len(playwright_paths) + len(doc_checks)
+            total_checks = (
+                len(pytest_paths) + len(vitest_paths) + len(playwright_paths) + len(doc_checks)
+            )
             if total_checks == 0:
                 sys.exit(f"Error: Fragment {frag_path.name} must declare at least one check")
 
@@ -382,7 +466,15 @@ def run_target(
                 return code
             uv_bin = find_tool("uv")
 
-        sync_cmd = [uv_bin, "sync", "--frozen", "--python", "3.12", "--project", "backend"]
+        sync_cmd = [
+            uv_bin,
+            "sync",
+            "--frozen",
+            "--python",
+            "3.12",
+            "--project",
+            "backend",
+        ]
         code = run_command(sync_cmd, evidence_dir, len(command_log) + 1)
         command_log.append({"cmd": sync_cmd, "exit_code": code})
         if code != 0:
@@ -396,7 +488,16 @@ def run_target(
     elif target == "lint":
         lint_commands = [
             [uv_bin, "run", "--project", "backend", "ruff", "check", "backend"],
-            [uv_bin, "run", "--project", "backend", "ruff", "format", "--check", "backend"],
+            [
+                uv_bin,
+                "run",
+                "--project",
+                "backend",
+                "ruff",
+                "format",
+                "--check",
+                "backend",
+            ],
             [uv_bin, "run", "--project", "backend", "mypy", "backend/app"],
             [npm_bin, "--prefix", "frontend", "run", "lint"],
             [npm_bin, "--prefix", "frontend", "run", "typecheck"],
@@ -428,6 +529,22 @@ def run_target(
         command_log.append({"cmd": ["vitest", "--run"], "exit_code": code})
         return code
 
+    elif target == "frontend":
+        for script in ("lint", "typecheck", "test", "build"):
+            cmd = [npm_bin, "--prefix", "frontend", "run", script]
+            if script == "test":
+                cmd += ["--", "--run"]
+            code = run_command(
+                cmd,
+                evidence_dir,
+                len(command_log) + 1,
+                check_tool="vitest" if script == "test" else None,
+            )
+            command_log.append({"cmd": cmd, "exit_code": code})
+            if code:
+                return code
+        return 0
+
     elif target == "integration":
         db_mgr = IsolatedDatabaseManager(evidence_dir=evidence_dir, run_id=run_id)
         try:
@@ -437,7 +554,14 @@ def run_target(
                 "DATABASE_URL": database_url,
                 "TEST_RUN_ID": db_mgr.test_run_id,
             }
-            cmd = [uv_bin, "run", "--project", "backend", "pytest", "backend/tests/integration"]
+            cmd = [
+                uv_bin,
+                "run",
+                "--project",
+                "backend",
+                "pytest",
+                "backend/tests/integration",
+            ]
             code = run_command(
                 cmd,
                 evidence_dir,
@@ -484,8 +608,10 @@ def run_target(
         playwright_paths = fragment["playwright_paths"]
         doc_checks = fragment["document_checks"]
 
-        needs_db = any("integration" in p for p in pytest_paths)
-        db_mgr = IsolatedDatabaseManager(evidence_dir=evidence_dir, run_id=run_id) if needs_db else None
+        needs_db = any("integration" in p or "concurrency" in p for p in pytest_paths)
+        db_mgr = (
+            IsolatedDatabaseManager(evidence_dir=evidence_dir, run_id=run_id) if needs_db else None
+        )
 
         try:
             test_env = dict(os.environ)
@@ -515,7 +641,14 @@ def run_target(
                         transformed_paths.append(str(Path(*p.parts[1:])))
                     else:
                         transformed_paths.append(vp)
-                cmd = [npm_bin, "--prefix", "frontend", "test", "--", "--run"] + transformed_paths
+                cmd = [
+                    npm_bin,
+                    "--prefix",
+                    "frontend",
+                    "test",
+                    "--",
+                    "--run",
+                ] + transformed_paths
                 code = run_command(
                     cmd,
                     evidence_dir,
@@ -551,121 +684,178 @@ def run_target(
         sys.exit(f"Error: Target '{target}' is not implemented")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Repository verification runner")
-    parser.add_argument("target", help="Verification target to execute")
-    parser.add_argument("--ticket", help="Target ticket identifier", default=None)
-    parser.add_argument("--fresh", action="store_true", help="Force fresh execution and disable reuse")
-
-    args = parser.parse_args()
-    target = args.target
-
-    if target not in RECOGNIZED_TARGETS:
-        sys.exit(f"Error: Unrecognized target '{target}'")
-
-    central_manifest, fragments = load_manifests()
-
-    implemented_targets = set(central_manifest.get("implemented_targets", []))
-    if target != "regression" and target not in implemented_targets:
-        sys.exit(f"Error: Target '{target}' is not implemented")
-
-    utc_now = datetime.datetime.now(datetime.timezone.utc)
-    utc_timestamp = utc_now.strftime("%Y%m%dT%H%M%SZ")
-    run_id = f"{utc_timestamp}_{os.getpid()}"
-
-    env_evidence_dir = os.environ.get("EVIDENCE_DIR")
-    if env_evidence_dir:
-        evidence_dir = Path(env_evidence_dir)
-    else:
-        evidence_dir = REPO_ROOT / "evidence" / run_id
+def execute_gate(target, ticket, central, fragments, evidence_dir, run_id, fresh=False):
+    """Execute once or reuse a validated original run; always preserve failure evidence."""
     evidence_dir.mkdir(parents=True, exist_ok=True)
-
-    tool_versions = get_tool_versions()
-    git_sha = get_git_sha()
-    candidate_fingerprint = compute_fingerprint(target)
-    test_profile = os.environ.get("TEST_PROFILE", "standard")
-
-    # Check for truthful evidence reuse when applicable
-    reuse_activated = is_evidence_reuse_activated(central_manifest)
-    reusable_gates = set(get_reusable_gates(central_manifest))
-
+    started = time.perf_counter()
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    versions = get_tool_versions()
+    if target not in {"integration", "concurrency", "permissions", "build"}:
+        for name in ("docker", "compose", "postgres_image"):
+            versions.pop(name, None)
+    else:
+        for name in ("node", "npm", "frontend_packages"):
+            versions.pop(name, None)
+    sha = get_git_sha()
+    fingerprint = compute_fingerprint(target)
+    profile = os.environ.get("TEST_PROFILE", "standard")
+    root = Path(os.environ.get("EVIDENCE_ROOT", str(REPO_ROOT / "evidence")))
     if (
-        reuse_activated
-        and not args.fresh
-        and target in reusable_gates
-        and not args.ticket
+        is_evidence_reuse_activated(central)
+        and target in get_reusable_gates(central)
+        and not ticket
     ):
-        env_evidence_root = os.environ.get("EVIDENCE_ROOT")
-        evidence_root = Path(env_evidence_root) if env_evidence_root else REPO_ROOT / "evidence"
         eligible, reason, match = check_reuse_eligibility(
-            gate=target,
-            candidate_fingerprint=candidate_fingerprint,
-            candidate_tools=tool_versions,
-            test_profile=test_profile,
-            evidence_root=evidence_root,
-            fresh=args.fresh,
+            target, fingerprint, versions, profile, root, fresh=fresh
         )
         if eligible and match:
-            source_data, source_path = match
-            print(f"\n[CACHE] Evidence reuse eligible: {reason}")
-            print(f"[CACHE] Reusing manifest from {source_path} (reused, never rerun)")
-            reused_manifest = create_reused_manifest(
-                gate=target,
-                source_manifest=source_data,
-                source_manifest_path=source_path,
-                candidate_sha=git_sha,
-                candidate_fingerprint=candidate_fingerprint,
-                run_id=run_id,
-                timestamp=utc_now.isoformat(),
+            source, source_path = match
+            data = create_reused_manifest(
+                target, source, source_path, sha, fingerprint, run_id, timestamp
             )
-            manifest_file = evidence_dir / "manifest.json"
-            manifest_file.write_text(json.dumps(reused_manifest, indent=2), encoding="utf-8")
-            print(f"\nVerification '{target}' passed (reused). Evidence saved to {evidence_dir}")
-            return
-
-    command_log: list[dict[str, Any]] = []
-
-    exit_code = run_target(
-        target,
-        args.ticket,
-        central_manifest,
-        fragments,
-        evidence_dir,
-        command_log,
-        run_id,
-    )
-
-    manifest_data = {
-        "timestamp": utc_now.isoformat(),
+            data["duration_seconds"] = time.perf_counter() - started
+            (evidence_dir / "manifest.json").write_text(
+                json.dumps(data, indent=2), encoding="utf-8"
+            )
+            print(f"{target}: reused original execution {source_path}")
+            return 0
+        print(f"{target}: executing ({reason})")
+    commands = []
+    error = None
+    try:
+        code = run_target(target, ticket, central, fragments, evidence_dir, commands, run_id)
+    except (Exception, SystemExit) as exc:
+        code = 1
+        error = str(exc)
+        print(error, file=sys.stderr)
+    if any(entry["exit_code"] != 0 for entry in commands):
+        code = code or 1
+    if compute_fingerprint(target) != fingerprint:
+        code, error = 1, "Inputs changed during execution"
+    records = []
+    for index, entry in enumerate(commands, 1):
+        record = dict(entry)
+        for stream in ("stdout", "stderr"):
+            name = f"cmd_{index:02d}_{stream}.txt"
+            path = evidence_dir / name
+            record[f"{stream}_file"] = name
+            record[f"{stream}_sha256"] = (
+                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+            )
+        records.append(record)
+    data = {
+        "evidence_version": 2,
+        "timestamp": timestamp,
         "run_id": run_id,
-        "reused": False,
         "execution_type": "fresh",
-        "git_sha": git_sha,
-        "input_fingerprint": candidate_fingerprint,
+        "reused": False,
+        "git_sha": sha,
+        "input_fingerprint": fingerprint,
         "configuration_hash": compute_configuration_hash(),
-        "tool_versions": tool_versions,
-        "test_profile": test_profile,
+        "tool_versions": versions,
+        "test_profile": profile,
         "target": target,
-        "ticket": args.ticket,
-        "fresh": args.fresh,
-        "commands": [
-            {
-                "cmd": entry["cmd"],
-                "exit_code": entry["exit_code"],
-                "stdout_file": f"cmd_{idx+1:02d}_stdout.txt",
-                "stderr_file": f"cmd_{idx+1:02d}_stderr.txt",
-            }
-            for idx, entry in enumerate(command_log)
-        ],
-        "exit_code": exit_code,
+        "ticket": ticket,
+        "commands": records,
+        "exit_code": code,
+        "error": error,
+        "duration_seconds": time.perf_counter() - started,
     }
+    (evidence_dir / "manifest.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+    print(f"{target}: exit {code}; evidence {evidence_dir}")
+    return code
 
-    manifest_file = evidence_dir / "manifest.json"
-    manifest_file.write_text(json.dumps(manifest_data, indent=2), encoding="utf-8")
 
-    if exit_code != 0:
-        sys.exit(exit_code)
-    print(f"\nVerification '{target}' passed. Evidence saved to {evidence_dir}")
+def changed_scope(base):
+    """Unknown inputs require complete verification. Documentation never starts a database."""
+    proc = subprocess.run(
+        [find_tool("git"), "diff", "--name-only", base, "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode:
+        raise RuntimeError("Cannot resolve comparison base")
+    paths = proc.stdout.splitlines()
+    if paths and all(
+        p.endswith(".md") and (p.startswith("docs/") or p == "README.md") for p in paths
+    ):
+        return "docs"
+    if paths and all(p.startswith("frontend/") or p.endswith(".md") for p in paths):
+        return "frontend"
+    return "all"
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Repository verification runner")
+    parser.add_argument("target")
+    parser.add_argument("--ticket")
+    parser.add_argument("--fresh", action="store_true", help="Force fresh execution")
+    parser.add_argument(
+        "--base",
+        help="CI comparison base; selects documentation/frontend/full regression",
+    )
+    args = parser.parse_args()
+    central, fragments = load_manifests()
+    if args.target not in RECOGNIZED_TARGETS:
+        sys.exit(f"Error: Unrecognized target '{args.target}'")
+    if args.target not in central["implemented_targets"]:
+        sys.exit(f"Error: Target '{args.target}' is not implemented")
+    run_id = (
+        datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        + "_"
+        + uuid.uuid4().hex[:12]
+    )
+    evidence_dir = Path(os.environ.get("EVIDENCE_DIR", str(REPO_ROOT / "evidence" / run_id)))
+    if evidence_dir.exists() and any(evidence_dir.iterdir()):
+        sys.exit("Evidence directory must be new or empty")
+    if args.target == "regression":
+        scope = changed_scope(args.base) if args.base else "all"
+        if scope == "docs":
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            check = subprocess.run(
+                [find_tool("git"), "diff", "--check", args.base, "HEAD"], cwd=REPO_ROOT
+            )
+            (evidence_dir / "scope.json").write_text(
+                json.dumps(
+                    {
+                        "scope": scope,
+                        "base": args.base,
+                        "sha": get_git_sha(),
+                        "exit_code": check.returncode,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            sys.exit(check.returncode)
+        gates = ["frontend"] if scope == "frontend" else central["ordered_targets"]
+        for gate in gates:
+            if gate not in central["implemented_targets"]:
+                print(f"{gate}: not implemented; no passing evidence claimed")
+                continue
+            code = execute_gate(
+                gate,
+                None,
+                central,
+                fragments,
+                evidence_dir / gate,
+                run_id + "_" + gate,
+                args.fresh,
+            )
+            if code:
+                sys.exit(code)
+    else:
+        code = execute_gate(
+            args.target,
+            args.ticket,
+            central,
+            fragments,
+            evidence_dir,
+            run_id,
+            args.fresh,
+        )
+        if code:
+            sys.exit(code)
 
 
 if __name__ == "__main__":

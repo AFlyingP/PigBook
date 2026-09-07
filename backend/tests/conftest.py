@@ -68,3 +68,17 @@ async def db_session(db_connection: AsyncConnection) -> AsyncGenerator[AsyncSess
     )
     async with session_factory() as session:
         yield session
+
+
+@pytest.fixture(scope="session", autouse=True)
+def migrated_schema(request: pytest.FixtureRequest) -> None:
+    """Migrate once per isolated test process; lifecycle tests still exercise down/up."""
+    if any(
+        "integration" in item.path.parts or "concurrency" in item.path.parts
+        for item in request.session.items
+    ):
+        from alembic.config import Config
+
+        from alembic import command
+
+        command.upgrade(Config("backend/alembic.ini"), "head")
