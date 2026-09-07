@@ -76,13 +76,14 @@ python scripts/verify.py regression --fresh
 
 ### Verification Results
 
-All suites executed on local Windows 11 with Docker PostgreSQL 16.15:
+Fresh verification of source `96365746d7cee5b2cd4f06795e005f729fffa8c0` ran on local Windows 11 with Docker PostgreSQL 16.15:
 
 - **Lint & Typecheck**: Passed across all Python and TypeScript sources (Ruff, Mypy strict mode, ESLint, TypeScript compiler).
-- **Unit Tests**: 91 backend unit tests, 3 frontend component tests passed.
+- **Unit Tests**: 91 backend unit tests and 3 frontend component tests passed.
 - **Integration Tests**: 92 database integration tests passed in isolated PostgreSQL 16 containers.
-- **Permissions Gate**: 2 permission tests passed; 11 registered endpoints verified against the centralized permissions matrix.
-- **Performance / Load / Real-User Feedback**: Not yet measured.
+- **Concurrency Gate**: Three independent 200-user same-slot rounds each produced exactly one `201 Created` and 199 `409 SLOT_CONFLICT` responses. A separate 200-request identical-key run returned 200 stored-equivalent `201` responses with one initial execution and 199 replays, persisting one booking, one idempotency key, and one outbox event.
+- **Permissions Gate**: 2 permission tests passed; all 11 registered endpoints were verified against the centralized permissions matrix.
+- **Performance / Load / Real-User Feedback**: Not yet measured. No production latency or throughput claim is made from the local correctness gate.
 
 ## Known Limitations
 
