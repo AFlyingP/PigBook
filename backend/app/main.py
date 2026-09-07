@@ -20,6 +20,19 @@ from app.auth.dependencies import (
 from app.auth.rate_limit import RateLimitExceeded
 from app.auth.router import router as auth_router
 from app.auth.service import EmailExistsError, InvalidInvitationError
+from app.bookings.idempotency import (
+    IdempotencyKeyInvalid,
+    IdempotencyKeyMismatch,
+    IdempotencyKeyRequired,
+    IncompleteIdempotencyRecord,
+)
+from app.bookings.router import router as bookings_router
+from app.bookings.service import (
+    InvalidWindowError as BookingInvalidWindowError,
+)
+from app.bookings.service import (
+    NotFoundError as BookingNotFoundError,
+)
 from app.config import get_settings
 from app.resources.router import router as resources_router
 from app.resources.service import InvalidWindowError, NotFoundError
@@ -200,6 +213,67 @@ def create_app() -> FastAPI:
             message=exc.message,
         )
 
+    @app.exception_handler(BookingNotFoundError)
+    async def booking_not_found_handler(
+        _request: Request, exc: BookingNotFoundError
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=404,
+            code="NOT_FOUND",
+            message=exc.message,
+        )
+
+    @app.exception_handler(BookingInvalidWindowError)
+    async def booking_invalid_window_handler(
+        _request: Request, exc: BookingInvalidWindowError
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=422,
+            code="INVALID_WINDOW",
+            message=exc.message,
+        )
+
+    @app.exception_handler(IdempotencyKeyRequired)
+    async def idempotency_key_required_handler(
+        _request: Request, exc: IdempotencyKeyRequired
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=422,
+            code="IDEMPOTENCY_KEY_REQUIRED",
+            message=exc.message,
+        )
+
+    @app.exception_handler(IdempotencyKeyInvalid)
+    async def idempotency_key_invalid_handler(
+        _request: Request, exc: IdempotencyKeyInvalid
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=422,
+            code="IDEMPOTENCY_KEY_INVALID",
+            message=exc.message,
+        )
+
+    @app.exception_handler(IdempotencyKeyMismatch)
+    async def idempotency_key_mismatch_handler(
+        _request: Request, exc: IdempotencyKeyMismatch
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=422,
+            code="IDEMPOTENCY_KEY_MISMATCH",
+            message=exc.message,
+        )
+
+    @app.exception_handler(IncompleteIdempotencyRecord)
+    async def incomplete_idempotency_record_handler(
+        _request: Request, exc: IncompleteIdempotencyRecord
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=503,
+            code="RETRYABLE_UNAVAILABLE",
+            message=exc.message,
+            headers={"Retry-After": "1"},
+        )
+
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(
         _request: Request, exc: RequestValidationError
@@ -265,6 +339,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/api/v1")
     app.include_router(resources_router, prefix="/api/v1")
+    app.include_router(bookings_router, prefix="/api/v1")
 
     return app
 

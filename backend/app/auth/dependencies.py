@@ -77,6 +77,7 @@ policy_registry: dict[str, Policy] = {
     "E06": Policy.authenticated,
     "E07": Policy.authenticated,
     "E08": Policy.authenticated,
+    "E09": Policy.authenticated,
     "E29": Policy.admin,
     "E35": Policy.public,
 }
