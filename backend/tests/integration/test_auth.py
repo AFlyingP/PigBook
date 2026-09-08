@@ -1,3 +1,4 @@
+import asyncio
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -323,6 +324,13 @@ async def test_database_changes_take_immediate_effect() -> None:
             assert admin_scope.principal_id == user.id
 
 
+async def wait_for_fresh_window(minimum_seconds: float = 20.0) -> None:
+    """Wait out a fixed rate-limit window that is about to roll over mid-assertion."""
+    remaining = 60 - (datetime.now(timezone.utc).timestamp() % 60)
+    if remaining < minimum_seconds:
+        await asyncio.sleep(remaining + 0.1)
+
+
 @pytest.mark.asyncio
 async def test_rate_limiting_ip_and_email() -> None:
     """Rate limiting: exceeding 10 login attempts per IP per minute returns 429 with integer
@@ -331,6 +339,9 @@ async def test_rate_limiting_ip_and_email() -> None:
     """
     client_ip_email_test = f"10.6.{uuid.uuid4().int % 250}.{uuid.uuid4().int % 250}"
     test_email = f"rate_limit_{uuid.uuid4().hex[:8]}@example.com"
+
+    # Ensure sequence cannot straddle a 60-second fixed-window boundary (D-T013-02)
+    await wait_for_fresh_window(minimum_seconds=20.0)
 
     async with create_client(ip=client_ip_email_test) as client:
         # 5 attempts for the same email
@@ -354,6 +365,7 @@ async def test_rate_limiting_ip_and_email() -> None:
 
     # Test IP rate limit: 10 attempts per IP
     client_ip_test = f"10.7.{uuid.uuid4().int % 250}.{uuid.uuid4().int % 250}"
+    await wait_for_fresh_window(minimum_seconds=20.0)
     async with create_client(ip=client_ip_test) as client:
         for i in range(10):
             distinct_email = f"ip_rate_{i}_{uuid.uuid4().hex[:8]}@example.com"

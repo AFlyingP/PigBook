@@ -1,7 +1,7 @@
 import re
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -17,6 +17,7 @@ from app.auth.rate_limit import check_mutation_rate_limit, check_read_rate_limit
 from app.bookings.models import Booking
 from app.config import get_settings
 from app.db.session import get_session
+from app.waitlist.models import WaitlistEntry
 
 
 class AuthRequiredError(Exception):
@@ -96,6 +97,7 @@ class AuthorizedScope:
     resource_id: uuid.UUID | None = None
     expected_version: int | None = None
     assert_current: Callable[[AsyncSession], Awaitable[None]] | None = None
+    predicates: dict[Any, Any] = field(default_factory=dict)
 
 
 _STRONG_ETAG_RE = re.compile(r'^"(0|[1-9][0-9]*)"$')
@@ -130,7 +132,7 @@ def _enforce_policy_role(policy: Policy, role: str | None) -> None:
     allowed: tuple[str, ...]
     if policy is Policy.admin:
         allowed = ("admin",)
-    elif policy in (Policy.authenticated, Policy.own_booking):
+    elif policy in (Policy.authenticated, Policy.own_booking, Policy.own_waitlist):
         allowed = ("member", "admin")
     else:
         # `public` is answered before authentication; the remaining policies have no
@@ -154,6 +156,10 @@ policy_registry: dict[str, Policy] = {
     "E10": Policy.own_booking,
     "E11": Policy.own_booking,
     "E12": Policy.own_booking,
+    "E13": Policy.authenticated,
+    "E14": Policy.own_waitlist,
+    "E15": Policy.own_waitlist,
+    "E16": Policy.own_waitlist,
     "E29": Policy.admin,
     "E35": Policy.public,
 }
@@ -173,6 +179,13 @@ async def _resolve_own_booking_scope(
     found. Only owner-scoped identifiers are read here; no object row is locked, so the
     service can take the resource lock before the booking row (Spec 5.1).
     """
+    booking_predicate = (Booking.user_id == principal_id,)
+    predicates: dict[Any, Any] = {
+        "booking": booking_predicate,
+        "bookings": booking_predicate,
+        Booking: booking_predicate,
+    }
+
     raw_booking_id = request.path_params.get("id")
     if raw_booking_id is None:
         # Collection route: the scope is the principal's own reservations.
@@ -180,6 +193,7 @@ async def _resolve_own_booking_scope(
             principal_id=principal_id,
             policy=Policy.own_booking,
             assert_current=assert_current,
+            predicates=predicates,
         )
 
     # Mutating own-booking routes carry optimistic concurrency through If-Match, and the
@@ -223,6 +237,78 @@ async def _resolve_own_booking_scope(
         resource_id=row.resource_id,
         expected_version=expected_version,
         assert_current=assert_current,
+        predicates=predicates,
+    )
+
+
+async def _resolve_own_waitlist_scope(
+    request: Request,
+    session: AsyncSession,
+    *,
+    principal_id: uuid.UUID,
+    assert_current: Callable[[AsyncSession], Awaitable[None]],
+) -> AuthorizedScope:
+    """Resolve the own-waitlist scope for the addressed waitlist entry.
+
+    `own` means the authenticated principal's own waitlist entries for members and admins
+    alike. Only owner-scoped identifiers are read here; no object row is locked, so the
+    service can take the resource lock before the waitlist row (Spec 5.1).
+    """
+    waitlist_predicate = (WaitlistEntry.user_id == principal_id,)
+    predicates: dict[Any, Any] = {
+        "waitlist": waitlist_predicate,
+        "waitlist_entry": waitlist_predicate,
+        "waitlist_entries": waitlist_predicate,
+        WaitlistEntry: waitlist_predicate,
+    }
+
+    raw_entry_id = request.path_params.get("id")
+    if raw_entry_id is None:
+        # Collection route: the scope is the principal's own waitlist entries.
+        return AuthorizedScope(
+            principal_id=principal_id,
+            policy=Policy.own_waitlist,
+            assert_current=assert_current,
+            predicates=predicates,
+        )
+
+    expected_version: int | None = None
+    if request.method != "GET":
+        expected_version = _parse_if_match(request.headers.get("If-Match"))
+
+    try:
+        entry_id = uuid.UUID(str(raw_entry_id))
+    except (ValueError, TypeError):
+        raise RequestValidationError(
+            [
+                {
+                    "type": "uuid_parsing",
+                    "loc": ("path", "id"),
+                    "msg": "Input should be a valid UUID",
+                }
+            ]
+        ) from None
+
+    try:
+        stmt = select(WaitlistEntry.id, WaitlistEntry.resource_id).where(
+            WaitlistEntry.id == entry_id,
+            WaitlistEntry.user_id == principal_id,
+        )
+        row = (await session.execute(stmt)).one_or_none()
+    finally:
+        await session.rollback()
+
+    if row is None:
+        raise ObjectNotFoundError("Waitlist entry not found")
+
+    return AuthorizedScope(
+        principal_id=principal_id,
+        policy=Policy.own_waitlist,
+        object_id=row.id,
+        resource_id=row.resource_id,
+        expected_version=expected_version,
+        assert_current=assert_current,
+        predicates=predicates,
     )
 
 
@@ -310,24 +396,32 @@ def authorize(
                 raise InvalidTokenError("Invalid or expired token")
             _enforce_policy_role(policy, current_row[1])
 
-        if policy == Policy.own_booking:
-            # The own-booking budget is consumed and committed before ownership is
+        if policy in (Policy.own_booking, Policy.own_waitlist):
+            # The own-object budget is consumed and committed before ownership is
             # resolved, so a request rejected by the dependency still costs the caller
             # its bucket (Spec 8.2). The rate-limit transaction is separate and already
             # committed, so no bucket row is held while the domain transaction takes the
-            # user, resource or booking locks.
+            # user, resource, booking or waitlist locks.
             request_time = datetime.now(timezone.utc)
             if request.method == "GET":
                 await check_read_rate_limit(db_id, request_time)
             else:
                 await check_mutation_rate_limit(db_id, request_time)
 
-            return await _resolve_own_booking_scope(
-                request,
-                session,
-                principal_id=db_id,
-                assert_current=_assert_current,
-            )
+            if policy == Policy.own_booking:
+                return await _resolve_own_booking_scope(
+                    request,
+                    session,
+                    principal_id=db_id,
+                    assert_current=_assert_current,
+                )
+            else:
+                return await _resolve_own_waitlist_scope(
+                    request,
+                    session,
+                    principal_id=db_id,
+                    assert_current=_assert_current,
+                )
 
         return AuthorizedScope(
             principal_id=db_id,

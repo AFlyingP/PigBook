@@ -180,8 +180,12 @@ async def _list_own_bookings(
 
     Blackouts are never reachable here: they carry no owner and are excluded by kind.
     """
+    booking_predicates = scope.predicates.get("booking", ())
+    if not isinstance(booking_predicates, (list, tuple)):
+        booking_predicates = (booking_predicates,)
+
     conditions = [
-        Booking.user_id == scope.principal_id,
+        *booking_predicates,
         Booking.kind == "reservation",
     ]
     if status is not None:
@@ -213,10 +217,14 @@ async def _get_own_booking(
     scope: AuthorizedScope,
 ) -> BookingSchema:
     """Read the reservation already resolved as owned by the scope principal."""
+    booking_predicates = scope.predicates.get("booking", ())
+    if not isinstance(booking_predicates, (list, tuple)):
+        booking_predicates = (booking_predicates,)
+
     stmt = select(Booking).where(
         Booking.id == scope.object_id,
         Booking.kind == "reservation",
-        Booking.user_id == scope.principal_id,
+        *booking_predicates,
     )
     booking = (await session.execute(stmt)).scalar_one_or_none()
     if booking is None:
@@ -250,12 +258,16 @@ async def cancel_booking(
     lock_stmt = select(Resource.id).where(Resource.id == scope.resource_id).with_for_update()
     await session.execute(lock_stmt)
 
+    booking_predicates = scope.predicates.get("booking", ())
+    if not isinstance(booking_predicates, (list, tuple)):
+        booking_predicates = (booking_predicates,)
+
     booking_stmt = (
         select(Booking)
         .where(
             Booking.id == booking_id,
             Booking.kind == "reservation",
-            Booking.user_id == scope.principal_id,
+            *booking_predicates,
         )
         .with_for_update()
     )

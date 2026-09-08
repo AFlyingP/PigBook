@@ -16,6 +16,7 @@ os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
 
 import app.bookings.service as booking_service
+from app.auth.dependencies import AuthorizedScope, Policy
 from app.auth.models import RateLimit, User
 from app.auth.passwords import hash_password
 from app.auth.rate_limit import hash_identity, mutation_limit, read_limit, window_start_for
@@ -1057,3 +1058,82 @@ async def test_own_booking_routes_reject_invalid_inputs() -> None:
     assert stored.status == "cancelled"
     assert stored.cancellation_reason == "y" * 500
     assert stored.version == 2
+
+
+# --- D-T013-01: Scope predicates regression ------------------------------------------
+
+
+async def test_service_applies_scope_predicates_without_rederiving_ownership() -> None:
+    """Service applies scope-supplied predicates rather than hardcoding
+
+    user_id == principal_id (Spec 8.1, 3.4).
+    """
+    owner_a = await create_user()
+    owner_b = await create_user()
+    resource = await create_resource()
+    starts_at, ends_at = aligned_slot(days=22)
+    booking_a = await insert_booking(
+        resource=resource,
+        owner=owner_a,
+        created_by=owner_a,
+        starts_at=starts_at,
+        ends_at=ends_at,
+    )
+
+    sessionmaker = get_sessionmaker()
+
+    # 1. Calling _list_own_bookings with scope.principal_id = owner_b but predicates
+    # restricting to owner_a returns booking_a because service applies scope predicates.
+    scope_pred_a = AuthorizedScope(
+        principal_id=owner_b.id,
+        policy=Policy.own_booking,
+        predicates={"booking": (Booking.user_id == owner_a.id,)},
+    )
+    async with sessionmaker() as session:
+        page = await booking_service._list_own_bookings(session, scope=scope_pred_a)
+        assert any(item.id == booking_a.id for item in page.items)
+
+    # 2. Calling _list_own_bookings with scope.principal_id = owner_a but predicates
+    # restricting to owner_b returns EMPTY items because service applies predicates (owner_b).
+    scope_pred_b = AuthorizedScope(
+        principal_id=owner_a.id,
+        policy=Policy.own_booking,
+        predicates={"booking": (Booking.user_id == owner_b.id,)},
+    )
+    async with sessionmaker() as session:
+        page = await booking_service._list_own_bookings(session, scope=scope_pred_b)
+        assert not any(item.id == booking_a.id for item in page.items)
+
+    # 3. Calling _get_own_booking with scope.principal_id = owner_a but predicates
+    # restricting to owner_b raises NotFoundError.
+    scope_get_b = AuthorizedScope(
+        principal_id=owner_a.id,
+        policy=Policy.own_booking,
+        object_id=booking_a.id,
+        predicates={"booking": (Booking.user_id == owner_b.id,)},
+    )
+    async with sessionmaker() as session:
+        with pytest.raises(booking_service.NotFoundError):
+            await booking_service._get_own_booking(session, scope=scope_get_b)
+
+    # 4. Calling cancel_booking with scope.principal_id = owner_a but predicates
+    # restricting to owner_b raises NotFoundError.
+    scope_cancel_b = AuthorizedScope(
+        principal_id=owner_a.id,
+        policy=Policy.own_booking,
+        object_id=booking_a.id,
+        resource_id=resource.id,
+        expected_version=1,
+        predicates={"booking": (Booking.user_id == owner_b.id,)},
+    )
+    async with sessionmaker() as session:
+        async with session.begin():
+            with pytest.raises(booking_service.NotFoundError):
+                await booking_service.cancel_booking(
+                    session,
+                    scope=scope_cancel_b,
+                    booking_id=booking_a.id,
+                    expected_version=1,
+                    reason="scope predicate test",
+                    now=datetime.now(timezone.utc),
+                )
