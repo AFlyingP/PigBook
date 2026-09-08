@@ -315,7 +315,9 @@ async def cancel_booking(
     # The row is held FOR UPDATE and its version was verified above, so the conditional
     # WHERE always matches here; it is kept because it is the correct optimistic-
     # concurrency idiom and it keeps the update safe if the guard above ever moves.
-    await session.execute(update_stmt)
+    res_b = await session.execute(update_stmt)
+    if getattr(res_b, "rowcount", None) != 1:
+        raise RuntimeError(f"Booking {booking_id} version invariant violation")
 
     # Re-read the row the update just wrote, so the response and the outbox payload carry
     # the persisted values rather than the stale identity-map copy.

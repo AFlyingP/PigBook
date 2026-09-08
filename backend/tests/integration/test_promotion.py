@@ -1,5 +1,6 @@
 """Integration tests for waitlist promotion (Phase B / legacy T-015)."""
 
+import asyncio
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -8,7 +9,7 @@ from typing import Any
 import httpx
 import jwt
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.exc import IntegrityError
 
@@ -540,8 +541,11 @@ async def test_expires_at_short_lead_and_event_correctness() -> None:
 
 
 @pytest.mark.asyncio
-async def test_direct_writer_exclusion_conflict_savepoint() -> None:
-    """Direct-writer exclusion conflict during promotion leaves entry waiting and continues."""
+async def test_direct_writer_exclusion_conflict_savepoint_synthetic() -> None:
+    """Synthetic branch test: direct-writer exclusion conflict during promotion
+
+    leaves entry waiting.
+    """
     resource = await create_resource()
     user_1 = await create_user()
     user_2 = await create_user()
@@ -602,6 +606,196 @@ async def test_direct_writer_exclusion_conflict_savepoint() -> None:
         ).scalar_one()
         assert row_1.status == "waiting"
 
+        row_2 = (
+            await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry_2.id))
+        ).scalar_one()
+        assert row_2.status == "offered"
+        assert row_2.offered_booking_id == promoted[0]
+
+
+@pytest.mark.asyncio
+async def test_direct_writer_exclusion_conflict_real() -> None:
+    """A real PostgreSQL 23P01 exclusion conflict from an uncommitted writer
+
+    rolls back that offer savepoint, leaving the entry waiting, while a subsequent
+    disjoint entry is promoted (Spec 5.3, R14).
+    """
+    resource = await create_resource()
+    user_1 = await create_user()
+    user_2 = await create_user()
+    direct_writer = await create_user()
+
+    s1, e1 = aligned_slot(days=17, hour=10)
+    s2, e2 = aligned_slot(days=17, hour=14)
+
+    t0 = datetime.now(timezone.utc)
+    entry_1 = await insert_waitlist_entry(
+        resource=resource,
+        user=user_1,
+        starts_at=s1,
+        ends_at=e1,
+        created_at=t0,
+    )
+    entry_2 = await insert_waitlist_entry(
+        resource=resource,
+        user=user_2,
+        starts_at=s2,
+        ends_at=e2,
+        created_at=t0 + timedelta(seconds=1),
+    )
+
+    sessionmaker = get_sessionmaker()
+
+    # Session 1: Direct database writer (bypassing service and resource lock)
+    # inserts an overlapping booking and flushes (holding row lock in GiST index)
+    # but does NOT commit yet.
+    direct_booking = Booking(
+        id=uuid.uuid4(),
+        resource_id=resource.id,
+        user_id=direct_writer.id,
+        created_by=direct_writer.id,
+        kind="reservation",
+        time_range=Range(s1, e1, bounds="[)"),
+        status="confirmed",
+        expires_at=None,
+        version=1,
+    )
+
+    async with sessionmaker() as writer_session:
+        async with writer_session.begin():
+            writer_session.add(direct_booking)
+            await writer_session.flush()
+
+            # Session 2: run promote_waiters in an asyncio task.
+            # promote_waiters reads READ COMMITTED (does not see uncommitted direct_booking),
+            # attempts to insert offer for entry_1, and blocks on PostgreSQL GiST index!
+            async def run_promoter() -> list[uuid.UUID]:
+                async with sessionmaker() as promoter_session:
+                    async with promoter_session.begin():
+                        return await promote_waiters(
+                            promoter_session, resource.id, datetime.now(timezone.utc)
+                        )
+
+            promoter_task = asyncio.create_task(run_promoter())
+            await asyncio.sleep(0.5)
+
+        # writer_session commits here as context manager exits!
+        # Unblocks promoter_task with genuine PostgreSQL 23P01 ExclusionViolationError!
+        promoted = await promoter_task
+
+    assert len(promoted) == 1
+
+    async with sessionmaker() as session:
+        # Entry 1 remained waiting
+        row_1 = (
+            await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry_1.id))
+        ).scalar_one()
+        assert row_1.status == "waiting"
+        assert row_1.offered_booking_id is None
+
+        # Entry 2 was successfully promoted
+        row_2 = (
+            await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry_2.id))
+        ).scalar_one()
+        assert row_2.status == "offered"
+        assert row_2.offered_booking_id == promoted[0]
+
+
+@pytest.mark.asyncio
+async def test_promotion_entry_version_conflict_aborts_offer_without_orphan_booking() -> None:
+    """If an entry's version moves during promotion, the offer attempt rolls back
+
+    atomically without committing an orphan offered booking (Spec 5.3, R10).
+    """
+    resource = await create_resource()
+    user_1 = await create_user()
+    user_2 = await create_user()
+
+    s1, e1 = aligned_slot(days=18, hour=10)
+    s2, e2 = aligned_slot(days=18, hour=14)
+
+    t0 = datetime.now(timezone.utc)
+    entry_1 = await insert_waitlist_entry(
+        resource=resource,
+        user=user_1,
+        starts_at=s1,
+        ends_at=e1,
+        created_at=t0,
+    )
+    entry_2 = await insert_waitlist_entry(
+        resource=resource,
+        user=user_2,
+        starts_at=s2,
+        ends_at=e2,
+        created_at=t0 + timedelta(seconds=1),
+    )
+
+    sessionmaker = get_sessionmaker()
+
+    # Hook flush to move entry_1's version in an independent session
+    # immediately after the offered booking is staged inside the savepoint,
+    # before the update(WaitlistEntry) statement runs.
+    async with sessionmaker() as session:
+        async with session.begin():
+            real_flush = session.flush
+            entry_1_staged = False
+
+            async def hooked_flush(*args: Any, **kwargs: Any) -> None:
+                nonlocal entry_1_staged
+                await real_flush(*args, **kwargs)
+                if not entry_1_staged:
+                    entry_1_staged = True
+                    async with sessionmaker() as bg_session:
+                        async with bg_session.begin():
+                            await bg_session.execute(
+                                update(WaitlistEntry)
+                                .where(WaitlistEntry.id == entry_1.id)
+                                .values(version=99)
+                            )
+
+            session.flush = hooked_flush  # type: ignore[assignment]
+            promoted = await promote_waiters(session, resource.id, datetime.now(timezone.utc))
+
+    # Entry 1 offer aborted due to version conflict; Entry 2 promoted cleanly
+    assert len(promoted) == 1
+
+    async with sessionmaker() as session:
+        # Entry 1 remains waiting with version 99, no offered booking linked
+        row_1 = (
+            await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry_1.id))
+        ).scalar_one()
+        assert row_1.status == "waiting"
+        assert row_1.version == 99
+        assert row_1.offered_booking_id is None
+
+        # Assert no orphan booking exists for user_1 on slot 1
+        orphan_bookings = (
+            (
+                await session.execute(
+                    select(Booking).where(
+                        Booking.resource_id == resource.id,
+                        Booking.user_id == user_1.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(orphan_bookings) == 0
+
+        # Assert no outbox events exist for user_1
+        events_1 = (
+            (
+                await session.execute(
+                    select(Outbox).where(Outbox.payload["recipient_id"].astext == str(user_1.id))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(events_1) == 0
+
+        # Entry 2 was promoted
         row_2 = (
             await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry_2.id))
         ).scalar_one()

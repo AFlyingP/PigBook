@@ -311,51 +311,63 @@ async def promote_waiters(
                 version=1,
             )
 
-            # Savepoint handling: 23P01 on bookings_no_overlap from an independent writer
-            # rolls back only that offer's savepoint, leaves that entry waiting, and continues.
+            # Atomic promotion attempt: booking insert, entry update, and event
+            # are executed in the same savepoint. If the entry version moved or a 23P01
+            # exclusion conflict occurs, the whole attempt rolls back (Spec 5.3, R10).
             conflict = False
             try:
                 async with session.begin_nested():
                     session.add(offered_booking)
                     await session.flush()
-            except IntegrityError as exc:
-                orig = getattr(exc, "orig", exc)
-                cause = getattr(orig, "__cause__", None) or orig
-                sqlstate = (
-                    getattr(cause, "sqlstate", None)
-                    or getattr(orig, "sqlstate", None)
-                    or getattr(orig, "pgcode", None)
-                )
-                constraint_name = getattr(cause, "constraint_name", None) or getattr(
-                    orig, "constraint_name", None
-                )
-                if sqlstate == "23P01" and constraint_name == "bookings_no_overlap":
-                    conflict = True
+
+                    update_res = await session.execute(
+                        update(WaitlistEntry)
+                        .where(
+                            WaitlistEntry.id == entry.id,
+                            WaitlistEntry.version == entry.version,
+                            WaitlistEntry.status == "waiting",
+                        )
+                        .values(
+                            status="offered",
+                            offered_booking_id=offered_booking.id,
+                            version=WaitlistEntry.version + 1,
+                            updated_at=offer_now,
+                        )
+                        .execution_options(synchronize_session=False)
+                    )
+                    if getattr(update_res, "rowcount", None) != 1:
+                        raise RuntimeError(
+                            f"Waitlist entry {entry.id} version moved during promotion attempt"
+                        )
+
+                    await append_event(
+                        session,
+                        event_type="waitlist_offered",
+                        booking=offered_booking,
+                        now=offer_now,
+                    )
+            except (IntegrityError, RuntimeError) as exc:
+                if isinstance(exc, IntegrityError):
+                    orig = getattr(exc, "orig", exc)
+                    cause = getattr(orig, "__cause__", None) or orig
+                    sqlstate = (
+                        getattr(cause, "sqlstate", None)
+                        or getattr(orig, "sqlstate", None)
+                        or getattr(orig, "pgcode", None)
+                    )
+                    constraint_name = getattr(cause, "constraint_name", None) or getattr(
+                        orig, "constraint_name", None
+                    )
+                    if sqlstate == "23P01" and constraint_name == "bookings_no_overlap":
+                        conflict = True
+                    else:
+                        raise
                 else:
-                    raise
+                    conflict = True
 
             if conflict:
                 continue
 
-            # Success: link booking to entry, update entry to offered, append event
-            await session.execute(
-                update(WaitlistEntry)
-                .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
-                .values(
-                    status="offered",
-                    offered_booking_id=offered_booking.id,
-                    version=WaitlistEntry.version + 1,
-                    updated_at=offer_now,
-                )
-                .execution_options(synchronize_session=False)
-            )
-
-            await append_event(
-                session,
-                event_type="waitlist_offered",
-                booking=offered_booking,
-                now=offer_now,
-            )
             promoted_booking_ids.append(cast(uuid.UUID, offered_booking.id))
 
         if len(entries) < page_size:
@@ -429,7 +441,7 @@ async def accept_offer(
     # At the exact deadline expiration wins (db_now >= expires_at)
     if booking.expires_at is not None and db_now >= booking.expires_at:
         # Persist expiration of entry and booking, promote waiters, commit, and return 409
-        await session.execute(
+        res_e = await session.execute(
             update(WaitlistEntry)
             .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
             .values(
@@ -439,8 +451,10 @@ async def accept_offer(
             )
             .execution_options(synchronize_session=False)
         )
+        if getattr(res_e, "rowcount", None) != 1:
+            raise RuntimeError(f"Waitlist entry {entry.id} version invariant violation")
 
-        await session.execute(
+        res_b = await session.execute(
             update(Booking)
             .where(Booking.id == booking.id, Booking.version == booking.version)
             .values(
@@ -451,6 +465,8 @@ async def accept_offer(
             )
             .execution_options(synchronize_session=False)
         )
+        if getattr(res_b, "rowcount", None) != 1:
+            raise RuntimeError(f"Booking {booking.id} version invariant violation")
         await session.refresh(booking)
 
         await append_event(
@@ -475,7 +491,7 @@ async def accept_offer(
         )
 
     # 7. Succeeded: transition booking to confirmed, entry to accepted
-    await session.execute(
+    res_b = await session.execute(
         update(Booking)
         .where(Booking.id == booking.id, Booking.version == booking.version)
         .values(
@@ -486,9 +502,11 @@ async def accept_offer(
         )
         .execution_options(synchronize_session=False)
     )
+    if getattr(res_b, "rowcount", None) != 1:
+        raise RuntimeError(f"Booking {booking.id} version invariant violation")
     await session.refresh(booking)
 
-    await session.execute(
+    res_e = await session.execute(
         update(WaitlistEntry)
         .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
         .values(
@@ -498,6 +516,8 @@ async def accept_offer(
         )
         .execution_options(synchronize_session=False)
     )
+    if getattr(res_e, "rowcount", None) != 1:
+        raise RuntimeError(f"Waitlist entry {entry.id} version invariant violation")
 
     await append_event(
         session,
@@ -574,7 +594,7 @@ async def decline_entry(
         raise TooLate("A waitlist entry can only be withdrawn before its slot starts")
 
     if entry.status == "waiting":
-        await session.execute(
+        res_e = await session.execute(
             update(WaitlistEntry)
             .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
             .values(
@@ -584,6 +604,8 @@ async def decline_entry(
             )
             .execution_options(synchronize_session=False)
         )
+        if getattr(res_e, "rowcount", None) != 1:
+            raise RuntimeError(f"Waitlist entry {entry.id} version invariant violation")
         await session.refresh(entry)
         return WaitEntry.model_validate(entry)
 
@@ -594,7 +616,7 @@ async def decline_entry(
         )
         booking = (await session.execute(booking_stmt)).scalar_one_or_none()
         if booking is not None and booking.status == "offered":
-            await session.execute(
+            res_b = await session.execute(
                 update(Booking)
                 .where(Booking.id == booking.id, Booking.version == booking.version)
                 .values(
@@ -605,8 +627,10 @@ async def decline_entry(
                 )
                 .execution_options(synchronize_session=False)
             )
+            if getattr(res_b, "rowcount", None) != 1:
+                raise RuntimeError(f"Booking {booking.id} version invariant violation")
 
-    await session.execute(
+    res_e = await session.execute(
         update(WaitlistEntry)
         .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
         .values(
@@ -616,6 +640,8 @@ async def decline_entry(
         )
         .execution_options(synchronize_session=False)
     )
+    if getattr(res_e, "rowcount", None) != 1:
+        raise RuntimeError(f"Waitlist entry {entry.id} version invariant violation")
     await session.refresh(entry)
 
     await promote_waiters(session, scope.resource_id, db_now)

@@ -24,7 +24,12 @@ from app.db.session import get_sessionmaker
 from app.main import app
 from app.resources.models import Resource
 from app.waitlist.models import WaitlistEntry
-from app.waitlist.service import _list_own_waitlist, accept_offer, decline_entry
+from app.waitlist.service import (
+    _list_own_waitlist,
+    accept_offer,
+    decline_entry,
+    promote_waiters,
+)
 
 get_settings.cache_clear()
 
@@ -424,15 +429,31 @@ async def test_fifo_tie_break_ordering() -> None:
             session.add(entry_1)
             session.add(entry_2)
 
+    # Call promote_waiters directly to prove tie-break order determines promotion (R11)
     async with sessionmaker() as session:
-        stmt = (
-            select(WaitlistEntry)
-            .where(WaitlistEntry.resource_id == resource.id, WaitlistEntry.status == "waiting")
-            .order_by(WaitlistEntry.created_at.asc(), WaitlistEntry.id.asc())
-        )
-        ordered = (await session.execute(stmt)).scalars().all()
-        expected_first = entry_1 if entry_1.id < entry_2.id else entry_2
-        assert ordered[0].id == expected_first.id
+        async with session.begin():
+            promoted = await promote_waiters(session, resource.id, datetime.now(timezone.utc))
+
+    assert len(promoted) == 1
+    expected_winner = entry_1 if entry_1.id < entry_2.id else entry_2
+    expected_loser = entry_2 if entry_1.id < entry_2.id else entry_1
+
+    async with sessionmaker() as session:
+        winner_row = (
+            await session.execute(
+                select(WaitlistEntry).where(WaitlistEntry.id == expected_winner.id)
+            )
+        ).scalar_one()
+        assert winner_row.status == "offered"
+        assert winner_row.offered_booking_id == promoted[0]
+
+        loser_row = (
+            await session.execute(
+                select(WaitlistEntry).where(WaitlistEntry.id == expected_loser.id)
+            )
+        ).scalar_one()
+        assert loser_row.status == "waiting"
+        assert loser_row.offered_booking_id is None
 
 
 @pytest.mark.asyncio

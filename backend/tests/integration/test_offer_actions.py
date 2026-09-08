@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import jwt
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import Range
 
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
@@ -749,3 +749,162 @@ async def test_accept_offer_with_distinct_entry_and_booking_versions() -> None:
         )
         assert len(events) == 1
         assert events[0].aggregate_version == 2
+
+
+@pytest.mark.asyncio
+async def test_accept_offer_exact_deadline_boundary_expires() -> None:
+    """At the exact deadline boundary (db_now >= expires_at), expiration wins (Spec 5.3, R12).
+
+    This test sets expires_at to the database clock sampled immediately before the accept
+    request. In PostgreSQL, clock_timestamp() is monotonic; when accept_offer executes, its
+    freshly sampled database clock is guaranteed to be >= expires_at. Because the deadline
+    rule is db_now >= expires_at, expiration deterministically wins without timing flakiness.
+    """
+    resource = await create_resource()
+    user = await create_user()
+    s, e = aligned_slot(days=13)
+    now = datetime.now(timezone.utc)
+
+    entry, booking = await create_offered_pair(
+        resource=resource,
+        user=user,
+        starts_at=s,
+        ends_at=e,
+        expires_at=now + timedelta(minutes=15),
+    )
+
+    sessionmaker = get_sessionmaker()
+    # Sample exact database clock right now, and align booking.expires_at to this exact instant
+    async with sessionmaker() as session:
+        async with session.begin():
+            db_now = (await session.execute(select(func.clock_timestamp()))).scalar_one()
+            await session.execute(
+                update(Booking)
+                .where(Booking.id == booking.id)
+                .values(expires_at=db_now, version=Booking.version + 1)
+            )
+
+    async with make_client() as client:
+        r_accept = await client.post(
+            f"/api/v1/waitlist/{entry.id}/accept",
+            json={},
+            headers={**auth(user), "If-Match": '"1"'},
+        )
+        assert r_accept.status_code == 409, r_accept.text
+        assert r_accept.json()["error"]["code"] == "HOLD_EXPIRED"
+
+    async with sessionmaker() as session:
+        b_row = (
+            await session.execute(select(Booking).where(Booking.id == booking.id))
+        ).scalar_one()
+        assert b_row.status == "expired"
+        assert b_row.expires_at is None
+        assert b_row.version == 3
+
+        e_row = (
+            await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry.id))
+        ).scalar_one()
+        assert e_row.status == "expired"
+        assert e_row.version == 2
+
+        exp_events = (
+            (
+                await session.execute(
+                    select(Outbox).where(
+                        Outbox.aggregate_id == booking.id,
+                        Outbox.event_type == "hold_expired",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(exp_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_e15_preconditions_and_duplicate_withdrawal() -> None:
+    """E15 negative preconditions (missing/malformed/stale If-Match) and repeat withdrawal (R13)."""
+    resource = await create_resource()
+    user = await create_user()
+    s, e = aligned_slot(days=14)
+    now = datetime.now(timezone.utc)
+
+    entry = WaitlistEntry(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        resource_id=resource.id,
+        time_range=Range(s, e, bounds="[)"),
+        status="waiting",
+        version=2,
+        created_at=now,
+        updated_at=now,
+    )
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        async with session.begin():
+            session.add(entry)
+
+    async with make_client() as client:
+        # 1. Missing If-Match -> 428 PRECONDITION_REQUIRED
+        r_missing = await client.delete(
+            f"/api/v1/waitlist/{entry.id}",
+            headers=auth(user),
+        )
+        assert r_missing.status_code == 428
+        assert r_missing.json()["error"]["code"] == "PRECONDITION_REQUIRED"
+
+        # 2. Malformed If-Match -> 422 VALIDATION_ERROR
+        for bad_header in ("not-quoted", 'W/"2"', "*", '""'):
+            r_malformed = await client.delete(
+                f"/api/v1/waitlist/{entry.id}",
+                headers={**auth(user), "If-Match": bad_header},
+            )
+            assert r_malformed.status_code == 422
+            assert r_malformed.json()["error"]["code"] == "VALIDATION_ERROR"
+
+        # 3. Stale If-Match (entry is version 2, caller sends "1") -> 412 VERSION_MISMATCH
+        r_stale = await client.delete(
+            f"/api/v1/waitlist/{entry.id}",
+            headers={**auth(user), "If-Match": '"1"'},
+        )
+        assert r_stale.status_code == 412
+        assert r_stale.json()["error"]["code"] == "VERSION_MISMATCH"
+
+        # 4. Valid If-Match: "2" -> 200 OK, transitions to cancelled, version 3
+        r_withdraw = await client.delete(
+            f"/api/v1/waitlist/{entry.id}",
+            headers={**auth(user), "If-Match": '"2"'},
+        )
+        assert r_withdraw.status_code == 200
+        assert r_withdraw.json()["status"] == "cancelled"
+        assert r_withdraw.json()["version"] == 3
+        assert r_withdraw.headers.get("etag") == '"3"'
+
+        # 5. Repeat withdrawal at post-cancellation version ("3") -> 200 OK (idempotent no-op)
+        r_repeat = await client.delete(
+            f"/api/v1/waitlist/{entry.id}",
+            headers={**auth(user), "If-Match": '"3"'},
+        )
+        assert r_repeat.status_code == 200
+        assert r_repeat.json()["status"] == "cancelled"
+        assert r_repeat.json()["version"] == 3
+
+    # Assert version remains 3 and no outbox events exist for this resource
+    async with sessionmaker() as session:
+        stored = (
+            await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry.id))
+        ).scalar_one()
+        assert stored.status == "cancelled"
+        assert stored.version == 3
+
+        events = (
+            (
+                await session.execute(
+                    select(Outbox).where(Outbox.payload["resource_id"].astext == str(resource.id))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(events) == 0
