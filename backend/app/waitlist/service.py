@@ -10,10 +10,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.dependencies import AuthorizedScope
 from app.auth.models import User
 from app.bookings.models import Booking
+from app.bookings.schemas import Booking as BookingSchema
 from app.bookings.schemas import StoredResponse
 from app.bookings.service import (
+    InvalidState,
     NotFoundError,
     ResourceInactive,
+    TooLate,
+    VersionMismatch,
     validate_booking_window,
 )
 from app.notifications.outbox import append_event
@@ -372,8 +376,144 @@ async def accept_offer(
     expected_version: int,
     now: datetime,
 ) -> StoredResponse:
-    # Placeholder for Phase C
-    raise NotImplementedError()
+    """Accept an offered waitlist entry (E16).
+
+    Lock order: resource FOR UPDATE, then entry + booking FOR UPDATE (never booking first).
+    Validates entry version pinned by If-Match before state checking (Spec 5.3).
+    At or after exact deadline, persists expiration and promotion, then returns 409 HOLD_EXPIRED.
+    """
+    if scope.resource_id is None:
+        raise RuntimeError("own_waitlist scope for accept is missing resource identity")
+
+    # 1. Lock resource FOR UPDATE
+    await session.execute(
+        select(Resource.id).where(Resource.id == scope.resource_id).with_for_update()
+    )
+
+    # 2. Reselect waitlist entry FOR UPDATE
+    waitlist_predicates = scope.predicates.get("waitlist", ())
+    if not isinstance(waitlist_predicates, (list, tuple)):
+        waitlist_predicates = (waitlist_predicates,)
+
+    entry_stmt = (
+        select(WaitlistEntry)
+        .where(
+            WaitlistEntry.id == entry_id,
+            *waitlist_predicates,
+        )
+        .with_for_update()
+    )
+    entry = (await session.execute(entry_stmt)).scalar_one_or_none()
+    if entry is None:
+        raise NotFoundError("Waitlist entry not found")
+
+    # 3. If-Match version check wins error precedence over state checking (Spec 5.3)
+    if entry.version != expected_version:
+        raise VersionMismatch("Waitlist entry has been modified by another request")
+
+    # 4. State check
+    if entry.status != "offered":
+        raise InvalidState(f"Waitlist entry in status '{entry.status}' cannot be accepted")
+
+    if entry.offered_booking_id is None:
+        raise InvalidState("Offered waitlist entry has no linked offered booking")
+
+    # 5. Reselect offered booking FOR UPDATE
+    booking_stmt = select(Booking).where(Booking.id == entry.offered_booking_id).with_for_update()
+    booking = (await session.execute(booking_stmt)).scalar_one_or_none()
+    if booking is None or booking.status != "offered":
+        raise InvalidState("Linked booking is not in offered status")
+
+    # 6. Sample database clock for deadline evaluation
+    db_clock = await session.scalar(select(func.clock_timestamp()))
+    db_now = db_clock if db_clock is not None else now
+
+    # At the exact deadline expiration wins (db_now >= expires_at)
+    if booking.expires_at is not None and db_now >= booking.expires_at:
+        # Persist expiration of entry and booking, promote waiters, commit, and return 409
+        await session.execute(
+            update(WaitlistEntry)
+            .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
+            .values(
+                status="expired",
+                version=WaitlistEntry.version + 1,
+                updated_at=db_now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+        await session.execute(
+            update(Booking)
+            .where(Booking.id == booking.id, Booking.version == booking.version)
+            .values(
+                status="expired",
+                expires_at=None,
+                version=Booking.version + 1,
+                updated_at=db_now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await session.refresh(booking)
+
+        await append_event(
+            session,
+            event_type="hold_expired",
+            booking=booking,
+            now=db_now,
+        )
+
+        await promote_waiters(session, scope.resource_id, db_now)
+
+        return StoredResponse(
+            status=409,
+            body={
+                "error": {
+                    "code": "HOLD_EXPIRED",
+                    "message": "The offer for this booking has expired",
+                    "details": {},
+                }
+            },
+            headers={},
+        )
+
+    # 7. Succeeded: transition booking to confirmed, entry to accepted
+    await session.execute(
+        update(Booking)
+        .where(Booking.id == booking.id, Booking.version == booking.version)
+        .values(
+            status="confirmed",
+            expires_at=None,
+            version=Booking.version + 1,
+            updated_at=db_now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.refresh(booking)
+
+    await session.execute(
+        update(WaitlistEntry)
+        .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
+        .values(
+            status="accepted",
+            version=WaitlistEntry.version + 1,
+            updated_at=db_now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+
+    await append_event(
+        session,
+        event_type="booking_confirmed",
+        booking=booking,
+        now=db_now,
+    )
+
+    booking_schema = BookingSchema.model_validate(booking)
+    return StoredResponse(
+        status=200,
+        body=booking_schema.model_dump(mode="json"),
+        headers={"ETag": f'"{booking.version}"'},
+    )
 
 
 async def decline_entry(
@@ -384,5 +524,100 @@ async def decline_entry(
     expected_version: int,
     now: datetime,
 ) -> WaitEntry:
-    # Placeholder for Phase C
-    raise NotImplementedError()
+    """Withdraw or decline a waitlist entry (E15).
+
+    Holds resource FOR UPDATE, then entry FOR UPDATE.
+    Validates entry version pinned by If-Match before state checking (Spec 5.3).
+    A waiting entry withdrawal changes only the entry.
+    An offered entry decline cancels both entry and booking, and promotes waiters.
+    """
+    if scope.resource_id is None:
+        raise RuntimeError("own_waitlist scope for decline is missing resource identity")
+
+    # 1. Lock resource FOR UPDATE
+    await session.execute(
+        select(Resource.id).where(Resource.id == scope.resource_id).with_for_update()
+    )
+
+    # 2. Reselect waitlist entry FOR UPDATE
+    waitlist_predicates = scope.predicates.get("waitlist", ())
+    if not isinstance(waitlist_predicates, (list, tuple)):
+        waitlist_predicates = (waitlist_predicates,)
+
+    entry_stmt = (
+        select(WaitlistEntry)
+        .where(
+            WaitlistEntry.id == entry_id,
+            *waitlist_predicates,
+        )
+        .with_for_update()
+    )
+    entry = (await session.execute(entry_stmt)).scalar_one_or_none()
+    if entry is None:
+        raise NotFoundError("Waitlist entry not found")
+
+    # 3. If-Match check before state
+    if entry.version != expected_version:
+        raise VersionMismatch("Waitlist entry has been modified by another request")
+
+    # Duplicate cancellation at current version returns 200 without new version
+    if entry.status == "cancelled":
+        return WaitEntry.model_validate(entry)
+
+    if entry.status not in ("waiting", "offered"):
+        raise InvalidState(f"Waitlist entry in status '{entry.status}' cannot be cancelled")
+
+    db_clock = await session.scalar(select(func.clock_timestamp()))
+    db_now = db_clock if db_clock is not None else now
+
+    if db_now >= entry.time_range.lower:
+        raise TooLate("A waitlist entry can only be withdrawn before its slot starts")
+
+    if entry.status == "waiting":
+        await session.execute(
+            update(WaitlistEntry)
+            .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
+            .values(
+                status="cancelled",
+                version=WaitlistEntry.version + 1,
+                updated_at=db_now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        await session.refresh(entry)
+        return WaitEntry.model_validate(entry)
+
+    # entry.status == 'offered'
+    if entry.offered_booking_id is not None:
+        booking_stmt = (
+            select(Booking).where(Booking.id == entry.offered_booking_id).with_for_update()
+        )
+        booking = (await session.execute(booking_stmt)).scalar_one_or_none()
+        if booking is not None and booking.status == "offered":
+            await session.execute(
+                update(Booking)
+                .where(Booking.id == booking.id, Booking.version == booking.version)
+                .values(
+                    status="cancelled",
+                    expires_at=None,
+                    version=Booking.version + 1,
+                    updated_at=db_now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+
+    await session.execute(
+        update(WaitlistEntry)
+        .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
+        .values(
+            status="cancelled",
+            version=WaitlistEntry.version + 1,
+            updated_at=db_now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.refresh(entry)
+
+    await promote_waiters(session, scope.resource_id, db_now)
+
+    return WaitEntry.model_validate(entry)
