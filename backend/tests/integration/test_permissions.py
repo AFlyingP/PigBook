@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import jwt
 import pytest
+from sqlalchemy import select
 
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
@@ -14,6 +15,7 @@ os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-byt
 from app.auth.dependencies import Policy, policy_registry
 from app.auth.models import RefreshToken, User
 from app.auth.passwords import hash_password
+from app.bookings.models import Booking
 from app.config import get_settings
 from app.db.session import get_sessionmaker
 from app.main import app
@@ -120,6 +122,9 @@ def test_policy_metadata_coverage() -> None:
         "E07",
         "E08",
         "E09",
+        "E10",
+        "E11",
+        "E12",
         "E29",
         "E35",
     }
@@ -132,6 +137,9 @@ def test_policy_metadata_coverage() -> None:
     assert policy_registry["E07"] == Policy.authenticated
     assert policy_registry["E08"] == Policy.authenticated
     assert policy_registry["E09"] == Policy.authenticated
+    assert policy_registry["E10"] == Policy.own_booking
+    assert policy_registry["E11"] == Policy.own_booking
+    assert policy_registry["E12"] == Policy.own_booking
     assert policy_registry["E29"] == Policy.admin
     assert policy_registry["E35"] == Policy.public
 
@@ -535,3 +543,248 @@ async def test_permission_matrix() -> None:
         assert r_e09_adm.json()["user_id"] == str(admin_user.id)
         assert r_e09_adm.json()["resource_id"] == str(e09_res.id)
         assert r_e09_adm.json()["status"] == "confirmed"
+
+        member_booking_id = r_e09_mem.json()["id"]
+        admin_booking_id = r_e09_adm.json()["id"]
+
+        # 12. E10: GET /api/v1/bookings (Policy.own_booking)
+        # Member and Admin each see only their own reservations;
+        # Anonymous denied (401 AUTH_REQUIRED); Disabled denied (401 INVALID_TOKEN)
+        r_e10_anon = await client.get("/api/v1/bookings?limit=100&offset=0")
+        assert r_e10_anon.status_code == 401
+        assert r_e10_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        r_e10_dis = await client.get(
+            "/api/v1/bookings?limit=100&offset=0",
+            headers={"Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e10_dis.status_code == 401
+        assert r_e10_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        r_e10_mem = await client.get(
+            "/api/v1/bookings?limit=100&offset=0",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e10_mem.status_code == 200
+        mem_listed = [item["id"] for item in r_e10_mem.json()["items"]]
+        assert member_booking_id in mem_listed
+        assert admin_booking_id not in mem_listed
+
+        r_e10_adm = await client.get(
+            "/api/v1/bookings?limit=100&offset=0",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e10_adm.status_code == 200
+        adm_listed = [item["id"] for item in r_e10_adm.json()["items"]]
+        assert admin_booking_id in adm_listed
+        assert member_booking_id not in adm_listed
+
+        # 13. E11: GET /api/v1/bookings/{id} (Policy.own_booking)
+        # Owner allowed; a foreign booking is 404 for members and admins alike
+        r_e11_anon = await client.get(f"/api/v1/bookings/{member_booking_id}")
+        assert r_e11_anon.status_code == 401
+        assert r_e11_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        r_e11_dis = await client.get(
+            f"/api/v1/bookings/{member_booking_id}",
+            headers={"Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e11_dis.status_code == 401
+        assert r_e11_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        r_e11_mem_own = await client.get(
+            f"/api/v1/bookings/{member_booking_id}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e11_mem_own.status_code == 200
+        assert r_e11_mem_own.json()["id"] == member_booking_id
+        assert r_e11_mem_own.headers.get("etag") == '"1"'
+
+        r_e11_mem_other = await client.get(
+            f"/api/v1/bookings/{admin_booking_id}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e11_mem_other.status_code == 404
+        assert r_e11_mem_other.json()["error"]["code"] == "NOT_FOUND"
+
+        r_e11_adm_own = await client.get(
+            f"/api/v1/bookings/{admin_booking_id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e11_adm_own.status_code == 200
+        assert r_e11_adm_own.json()["id"] == admin_booking_id
+
+        r_e11_adm_other = await client.get(
+            f"/api/v1/bookings/{member_booking_id}",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e11_adm_other.status_code == 404
+        assert r_e11_adm_other.json()["error"]["code"] == "NOT_FOUND"
+
+        # 14. E12: POST /api/v1/bookings/{id}/cancel (Policy.own_booking)
+        # Every request below carries an otherwise-valid body and a current If-Match,
+        # so a denial cannot be mistaken for a precondition or validation failure.
+        cancel_body = {"reason": "permission matrix"}
+        current_if_match = {"If-Match": '"1"'}
+
+        r_e12_anon = await client.post(
+            f"/api/v1/bookings/{member_booking_id}/cancel",
+            json=cancel_body,
+            headers=current_if_match,
+        )
+        assert r_e12_anon.status_code == 401
+        assert r_e12_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        r_e12_dis = await client.post(
+            f"/api/v1/bookings/{member_booking_id}/cancel",
+            json=cancel_body,
+            headers={**current_if_match, "Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e12_dis.status_code == 401
+        assert r_e12_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        r_e12_mem_other = await client.post(
+            f"/api/v1/bookings/{admin_booking_id}/cancel",
+            json=cancel_body,
+            headers={**current_if_match, "Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e12_mem_other.status_code == 404
+        assert r_e12_mem_other.json()["error"]["code"] == "NOT_FOUND"
+
+        r_e12_adm_other = await client.post(
+            f"/api/v1/bookings/{member_booking_id}/cancel",
+            json=cancel_body,
+            headers={**current_if_match, "Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e12_adm_other.status_code == 404
+        assert r_e12_adm_other.json()["error"]["code"] == "NOT_FOUND"
+
+        r_e12_mem_own = await client.post(
+            f"/api/v1/bookings/{member_booking_id}/cancel",
+            json=cancel_body,
+            headers={**current_if_match, "Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e12_mem_own.status_code == 200
+        assert r_e12_mem_own.json()["status"] == "cancelled"
+        assert r_e12_mem_own.json()["version"] == 2
+        assert r_e12_mem_own.headers.get("etag") == '"2"'
+
+        r_e12_adm_own = await client.post(
+            f"/api/v1/bookings/{admin_booking_id}/cancel",
+            json=cancel_body,
+            headers={**current_if_match, "Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e12_adm_own.status_code == 200
+        assert r_e12_adm_own.json()["status"] == "cancelled"
+        assert r_e12_adm_own.json()["user_id"] == str(admin_user.id)
+
+
+@pytest.mark.asyncio
+async def test_own_booking_routes_reject_overposting_and_spoofed_claims() -> None:
+    """Body fields and token claims cannot widen own-booking authorization."""
+    member_user = await create_user(role="member", enabled=True)
+    other_user = await create_user(role="member", enabled=True)
+    member_token = make_token(member_user)
+
+    resource = Resource(
+        id=uuid.uuid4(),
+        name=f"OverpostResource_{uuid.uuid4().hex[:6]}",
+        description="For overposting cases",
+        location="Room 103",
+        active=True,
+        version=1,
+    )
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        async with session.begin():
+            session.add(resource)
+
+    slot_base = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0) + timedelta(
+        days=3
+    )
+
+    client_ip = f"10.8.{uuid.uuid4().int % 250}.{uuid.uuid4().int % 250}"
+    async with make_client(ip=client_ip) as client:
+        created = await client.post(
+            "/api/v1/bookings",
+            json={
+                "resource_id": str(resource.id),
+                "starts_at": slot_base.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "ends_at": (slot_base + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+            headers={
+                "Authorization": f"Bearer {member_token}",
+                "Idempotency-Key": str(uuid.uuid4()),
+            },
+        )
+        assert created.status_code == 201
+        booking_id = created.json()["id"]
+
+        # Extra body fields on the cancel request are rejected, never applied.
+        for overposted in (
+            {"reason": "x", "user_id": str(other_user.id)},
+            {"reason": "x", "status": "confirmed"},
+            {"reason": "x", "version": 99},
+            {"reason": "x", "resource_id": str(uuid.uuid4())},
+        ):
+            r_overpost = await client.post(
+                f"/api/v1/bookings/{booking_id}/cancel",
+                json=overposted,
+                headers={
+                    "Authorization": f"Bearer {member_token}",
+                    "If-Match": '"1"',
+                },
+            )
+            assert r_overpost.status_code == 422, overposted
+            assert r_overpost.json()["error"]["code"] == "VALIDATION_ERROR"
+
+        # A spoofed admin role claim grants no access to a booking owned by someone else.
+        settings = get_settings()
+        jwt_secret = settings.JWT_SECRET or "test-jwt-secret-minimum-32-bytes-long-12345678"
+        now = datetime.now(timezone.utc)
+        spoofed_token = jwt.encode(
+            {
+                "sub": str(other_user.id),
+                "role": "admin",
+                "iat": int(now.timestamp()),
+                "exp": int((now + timedelta(minutes=15)).timestamp()),
+                "jti": str(uuid.uuid4()),
+                "iss": settings.JWT_ISSUER,
+                "aud": settings.JWT_AUDIENCE,
+            },
+            jwt_secret,
+            algorithm="HS256",
+        )
+
+        r_spoof_read = await client.get(
+            f"/api/v1/bookings/{booking_id}",
+            headers={"Authorization": f"Bearer {spoofed_token}"},
+        )
+        assert r_spoof_read.status_code == 404
+        assert r_spoof_read.json()["error"]["code"] == "NOT_FOUND"
+
+        r_spoof_cancel = await client.post(
+            f"/api/v1/bookings/{booking_id}/cancel",
+            json={"reason": "spoofed"},
+            headers={"Authorization": f"Bearer {spoofed_token}", "If-Match": '"1"'},
+        )
+        assert r_spoof_cancel.status_code == 404
+        assert r_spoof_cancel.json()["error"]["code"] == "NOT_FOUND"
+
+        # The spoofed claim also grants no admin-only access.
+        r_spoof_admin = await client.post(
+            "/api/v1/admin/invitations",
+            json={"email": f"perm_spoof_{uuid.uuid4().hex[:8]}@example.com", "role": "member"},
+            headers={"Authorization": f"Bearer {spoofed_token}"},
+        )
+        assert r_spoof_admin.status_code == 403
+        assert r_spoof_admin.json()["error"]["code"] == "FORBIDDEN"
+
+    # The booking is untouched by every rejected attempt above.
+    async with sessionmaker() as session:
+        stored = (
+            await session.execute(select(Booking).where(Booking.id == uuid.UUID(booking_id)))
+        ).scalar_one()
+        assert stored.status == "confirmed"
+        assert stored.version == 1
+        assert stored.user_id == member_user.id

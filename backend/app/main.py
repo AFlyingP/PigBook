@@ -13,9 +13,12 @@ from app.auth.dependencies import (
     AuthRequiredError,
     ForbiddenError,
     InvalidCredentialsError,
+    InvalidIfMatchError,
     InvalidRefreshError,
     InvalidTokenError,
+    ObjectNotFoundError,
     OriginRejectedError,
+    PreconditionRequiredError,
 )
 from app.auth.rate_limit import RateLimitExceeded
 from app.auth.router import router as auth_router
@@ -27,6 +30,11 @@ from app.bookings.idempotency import (
     IncompleteIdempotencyRecord,
 )
 from app.bookings.router import router as bookings_router
+from app.bookings.service import (
+    InvalidState,
+    TooLate,
+    VersionMismatch,
+)
 from app.bookings.service import (
     InvalidWindowError as BookingInvalidWindowError,
 )
@@ -230,6 +238,56 @@ def create_app() -> FastAPI:
         return make_error_response(
             status_code=422,
             code="INVALID_WINDOW",
+            message=exc.message,
+        )
+
+    @app.exception_handler(ObjectNotFoundError)
+    async def object_not_found_handler(_request: Request, exc: ObjectNotFoundError) -> JSONResponse:
+        return make_error_response(
+            status_code=404,
+            code="NOT_FOUND",
+            message=exc.message,
+        )
+
+    @app.exception_handler(PreconditionRequiredError)
+    async def precondition_required_handler(
+        _request: Request, exc: PreconditionRequiredError
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=428,
+            code="PRECONDITION_REQUIRED",
+            message=exc.message,
+        )
+
+    @app.exception_handler(InvalidIfMatchError)
+    async def invalid_if_match_handler(_request: Request, exc: InvalidIfMatchError) -> JSONResponse:
+        return make_error_response(
+            status_code=422,
+            code="VALIDATION_ERROR",
+            message=exc.message,
+        )
+
+    @app.exception_handler(VersionMismatch)
+    async def version_mismatch_handler(_request: Request, exc: VersionMismatch) -> JSONResponse:
+        return make_error_response(
+            status_code=412,
+            code="VERSION_MISMATCH",
+            message=exc.message,
+        )
+
+    @app.exception_handler(TooLate)
+    async def too_late_handler(_request: Request, exc: TooLate) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="TOO_LATE",
+            message=exc.message,
+        )
+
+    @app.exception_handler(InvalidState)
+    async def invalid_state_handler(_request: Request, exc: InvalidState) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="INVALID_STATE",
             message=exc.message,
         )
 

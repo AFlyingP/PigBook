@@ -1,14 +1,18 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import AuthorizedScope
 from app.bookings.models import Booking
+from app.bookings.schemas import Booking as BookingSchema
+from app.bookings.schemas import BookingStatusFilter
+from app.notifications.outbox import append_event
 from app.resources.models import Resource
+from app.resources.schemas import Page
 
 
 class NotFoundError(Exception):
@@ -33,6 +37,30 @@ class SlotConflict(Exception):
 
 class InvalidWindowError(Exception):
     def __init__(self, message: str = "Invalid booking window") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class VersionMismatch(Exception):
+    """Raised when the version pinned by If-Match is no longer the stored version."""
+
+    def __init__(self, message: str = "Object has been modified by another request") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class TooLate(Exception):
+    """Raised when a booking can no longer be cancelled by its owner."""
+
+    def __init__(self, message: str = "A booking can only be cancelled before it starts") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class InvalidState(Exception):
+    """Raised when the stored state does not allow the requested transition."""
+
+    def __init__(self, message: str = "Booking is in a state that cannot be cancelled") -> None:
         self.message = message
         super().__init__(message)
 
@@ -138,3 +166,147 @@ async def insert_confirmed(
         raise
 
     return booking
+
+
+async def _list_own_bookings(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    limit: int = 25,
+    offset: int = 0,
+    status: BookingStatusFilter | None = None,
+) -> Page[BookingSchema]:
+    """List the scope principal's own reservations, newest first.
+
+    Blackouts are never reachable here: they carry no owner and are excluded by kind.
+    """
+    conditions = [
+        Booking.user_id == scope.principal_id,
+        Booking.kind == "reservation",
+    ]
+    if status is not None:
+        conditions.append(Booking.status == status.value)
+
+    count_stmt = select(func.count()).select_from(Booking).where(*conditions)
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    stmt = (
+        select(Booking)
+        .where(*conditions)
+        .order_by(Booking.created_at.desc(), Booking.id.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    return Page[BookingSchema](
+        items=[BookingSchema.model_validate(row) for row in rows],
+        total=total,
+        limit=limit,
+        offset=offset,
+    )
+
+
+async def _get_own_booking(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+) -> BookingSchema:
+    """Read the reservation already resolved as owned by the scope principal."""
+    stmt = select(Booking).where(
+        Booking.id == scope.object_id,
+        Booking.kind == "reservation",
+        Booking.user_id == scope.principal_id,
+    )
+    booking = (await session.execute(stmt)).scalar_one_or_none()
+    if booking is None:
+        raise NotFoundError("Booking not found")
+    return BookingSchema.model_validate(booking)
+
+
+async def cancel_booking(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    booking_id: uuid.UUID,
+    expected_version: int,
+    reason: str,
+    now: datetime,
+) -> BookingSchema:
+    """Cancel the authorized booking and append its cancellation event atomically.
+
+    The resource row is locked FOR UPDATE before the booking row is re-selected, so a
+    release is exclusive against competing creates on the same resource. A stale
+    expected version is reported before any state or time check. Cancelling an already
+    cancelled booking at its current version is a no-op that returns the stored booking
+    without a new version or a second event.
+
+    The caller supplies an open transaction; deadline comparisons use the database clock
+    sampled once both rows are held, rather than `now`, which only dates the request.
+    """
+    if scope.resource_id is None:
+        raise NotFoundError("Booking not found")
+
+    lock_stmt = select(Resource.id).where(Resource.id == scope.resource_id).with_for_update()
+    await session.execute(lock_stmt)
+
+    booking_stmt = (
+        select(Booking)
+        .where(
+            Booking.id == booking_id,
+            Booking.kind == "reservation",
+            Booking.user_id == scope.principal_id,
+        )
+        .with_for_update()
+    )
+    booking = (await session.execute(booking_stmt)).scalar_one_or_none()
+    if booking is None:
+        raise NotFoundError("Booking not found")
+
+    # Sample the database clock only once the booking row is held. Acquiring the two
+    # locks above can block for as long as `lock_timeout`, and a booking that started
+    # during that wait is no longer cancellable by its owner (Spec 1.2, 5.3).
+    db_clock = await session.scalar(select(func.clock_timestamp()))
+    db_now = db_clock if db_clock is not None else now
+
+    if booking.version != expected_version:
+        raise VersionMismatch("Booking has been modified by another request")
+
+    if booking.status == "cancelled":
+        return BookingSchema.model_validate(booking)
+
+    if booking.status not in ("confirmed", "offered"):
+        raise InvalidState(f"A booking in state '{booking.status}' cannot be cancelled")
+
+    if db_now >= booking.time_range.lower:
+        raise TooLate("A booking can only be cancelled before it starts")
+
+    update_stmt = (
+        update(Booking)
+        .where(Booking.id == booking_id, Booking.version == expected_version)
+        .values(
+            status="cancelled",
+            expires_at=None,
+            cancellation_reason=reason,
+            version=Booking.version + 1,
+            updated_at=db_now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    # The row is held FOR UPDATE and its version was verified above, so the conditional
+    # WHERE always matches here; it is kept because it is the correct optimistic-
+    # concurrency idiom and it keeps the update safe if the guard above ever moves.
+    await session.execute(update_stmt)
+
+    # Re-read the row the update just wrote, so the response and the outbox payload carry
+    # the persisted values rather than the stale identity-map copy.
+    await session.refresh(booking)
+
+    await append_event(
+        session,
+        event_type="booking_cancelled",
+        booking=booking,
+        now=db_now,
+    )
+
+    return BookingSchema.model_validate(booking)

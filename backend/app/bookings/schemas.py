@@ -1,10 +1,24 @@
 import uuid
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any
 
 from pydantic import ConfigDict, Field, field_serializer, model_validator
 
 from app.auth.schemas import BaseSchema
+
+
+class BookingStatusFilter(str, Enum):
+    """Booking statuses a caller can filter their own reservations by.
+
+    `pending` is a transient in-transaction state that is never committed by the booking
+    services, so it is not an accepted filter value.
+    """
+
+    confirmed = "confirmed"
+    offered = "offered"
+    cancelled = "cancelled"
+    expired = "expired"
 
 
 class StoredResponse(BaseSchema):
