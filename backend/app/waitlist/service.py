@@ -1,12 +1,14 @@
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import cast
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import AuthorizedScope
+from app.auth.models import User
 from app.bookings.models import Booking
 from app.bookings.schemas import StoredResponse
 from app.bookings.service import (
@@ -14,6 +16,7 @@ from app.bookings.service import (
     ResourceInactive,
     validate_booking_window,
 )
+from app.notifications.outbox import append_event
 from app.resources.models import Resource
 from app.resources.schemas import Page
 from app.waitlist.models import WaitlistEntry
@@ -202,8 +205,163 @@ async def promote_waiters(
     resource_id: uuid.UUID,
     now: datetime,
 ) -> list[uuid.UUID]:
-    # Placeholder for Phase B
-    return []
+    """Hold resource FOR UPDATE throughout release and promotion (Spec 5.1, 5.3).
+
+    Scan all waiting entries for that resource in ascending (created_at, id)
+    using keyset pages of 100 inside this transaction.
+    """
+    # 1. Hold the resource FOR UPDATE
+    await session.execute(select(Resource.id).where(Resource.id == resource_id).with_for_update())
+
+    page_size = 100
+    last_created_at: datetime | None = None
+    last_id: uuid.UUID | None = None
+    promoted_booking_ids: list[uuid.UUID] = []
+
+    while True:
+        query = select(WaitlistEntry).where(
+            WaitlistEntry.resource_id == resource_id,
+            WaitlistEntry.status == "waiting",
+        )
+        if last_created_at is not None and last_id is not None:
+            query = query.where(
+                or_(
+                    WaitlistEntry.created_at > last_created_at,
+                    and_(
+                        WaitlistEntry.created_at == last_created_at,
+                        WaitlistEntry.id > last_id,
+                    ),
+                )
+            )
+        query = query.order_by(
+            WaitlistEntry.created_at.asc(),
+            WaitlistEntry.id.asc(),
+        ).limit(page_size)
+
+        entries = (await session.execute(query)).scalars().all()
+        if not entries:
+            break
+
+        for entry in entries:
+            last_created_at = cast(datetime, entry.created_at)
+            last_id = cast(uuid.UUID, entry.id)
+
+            # Sample database clock
+            db_clock = await session.scalar(select(func.clock_timestamp()))
+            db_now = db_clock if db_clock is not None else now
+
+            # Check owner enabled
+            owner_stmt = select(User.enabled).where(User.id == entry.user_id)
+            owner_enabled = (await session.execute(owner_stmt)).scalar_one_or_none()
+            if owner_enabled is None or not owner_enabled:
+                await session.execute(
+                    update(WaitlistEntry)
+                    .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
+                    .values(
+                        status="expired",
+                        version=WaitlistEntry.version + 1,
+                        updated_at=db_now,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                continue
+
+            # Check starts_at < db_time + 15 minutes
+            if entry.time_range.lower < db_now + timedelta(minutes=15):
+                await session.execute(
+                    update(WaitlistEntry)
+                    .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
+                    .values(
+                        status="expired",
+                        version=WaitlistEntry.version + 1,
+                        updated_at=db_now,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
+                continue
+
+            # Check if entire requested window is free
+            overlap_stmt = select(Booking.id).where(
+                Booking.resource_id == resource_id,
+                Booking.status.in_(("confirmed", "offered")),
+                Booking.time_range.op("&&")(entry.time_range),
+            )
+            has_overlap = (await session.execute(overlap_stmt)).first() is not None
+            if has_overlap:
+                # FIFO per exact window: blocked older window does not block younger disjoint window
+                continue
+
+            # Sample clock_timestamp() immediately before each offer
+            offer_clock = await session.scalar(select(func.clock_timestamp()))
+            offer_now = offer_clock if offer_clock is not None else db_now
+
+            offer_expires_at = offer_now + timedelta(minutes=15)
+            if offer_expires_at > entry.time_range.lower:
+                offer_expires_at = entry.time_range.lower
+
+            offered_booking = Booking(
+                id=uuid.uuid4(),
+                resource_id=resource_id,
+                user_id=entry.user_id,
+                created_by=entry.user_id,
+                kind="reservation",
+                time_range=entry.time_range,
+                status="offered",
+                expires_at=offer_expires_at,
+                version=1,
+            )
+
+            # Savepoint handling: 23P01 on bookings_no_overlap from an independent writer
+            # rolls back only that offer's savepoint, leaves that entry waiting, and continues.
+            conflict = False
+            try:
+                async with session.begin_nested():
+                    session.add(offered_booking)
+                    await session.flush()
+            except IntegrityError as exc:
+                orig = getattr(exc, "orig", exc)
+                cause = getattr(orig, "__cause__", None) or orig
+                sqlstate = (
+                    getattr(cause, "sqlstate", None)
+                    or getattr(orig, "sqlstate", None)
+                    or getattr(orig, "pgcode", None)
+                )
+                constraint_name = getattr(cause, "constraint_name", None) or getattr(
+                    orig, "constraint_name", None
+                )
+                if sqlstate == "23P01" and constraint_name == "bookings_no_overlap":
+                    conflict = True
+                else:
+                    raise
+
+            if conflict:
+                continue
+
+            # Success: link booking to entry, update entry to offered, append event
+            await session.execute(
+                update(WaitlistEntry)
+                .where(WaitlistEntry.id == entry.id, WaitlistEntry.version == entry.version)
+                .values(
+                    status="offered",
+                    offered_booking_id=offered_booking.id,
+                    version=WaitlistEntry.version + 1,
+                    updated_at=offer_now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+
+            await append_event(
+                session,
+                event_type="waitlist_offered",
+                booking=offered_booking,
+                now=offer_now,
+            )
+            promoted_booking_ids.append(cast(uuid.UUID, offered_booking.id))
+
+        if len(entries) < page_size:
+            break
+
+    return promoted_booking_ids
 
 
 async def accept_offer(

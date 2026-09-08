@@ -13,6 +13,7 @@ from app.bookings.schemas import BookingStatusFilter
 from app.notifications.outbox import append_event
 from app.resources.models import Resource
 from app.resources.schemas import Page
+from app.waitlist.models import WaitlistEntry
 
 
 class NotFoundError(Exception):
@@ -314,11 +315,28 @@ async def cancel_booking(
     # the persisted values rather than the stale identity-map copy.
     await session.refresh(booking)
 
+    # Update linked offered entry if any (Spec 5.3)
+    entry_stmt = (
+        update(WaitlistEntry)
+        .where(WaitlistEntry.offered_booking_id == booking_id)
+        .values(
+            status="cancelled",
+            version=WaitlistEntry.version + 1,
+            updated_at=db_now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.execute(entry_stmt)
+
     await append_event(
         session,
         event_type="booking_cancelled",
         booking=booking,
         now=db_now,
     )
+
+    from app.waitlist.service import promote_waiters
+
+    await promote_waiters(session, scope.resource_id, db_now)
 
     return BookingSchema.model_validate(booking)
