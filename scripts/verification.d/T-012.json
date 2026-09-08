@@ -1,0 +1,10 @@
+{
+  "ticket_id": "T-012",
+  "pytest_paths": [
+    "backend/tests/integration/test_race_lab_safety.py",
+    "backend/tests/unit/test_verify_runner.py"
+  ],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}

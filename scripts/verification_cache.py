@@ -33,7 +33,11 @@ def should_exclude(rel_path: Path) -> bool:
         if part in EXCLUDED_DIR_NAMES:
             return True
     name = rel_path.name
-    if name in EXCLUDED_FILE_PATTERNS or name.endswith(".pyc") or name.endswith(".tsbuildinfo"):
+    if (
+        name in EXCLUDED_FILE_PATTERNS
+        or name.endswith(".pyc")
+        or name.endswith(".tsbuildinfo")
+    ):
         return True
     return False
 
@@ -74,12 +78,12 @@ def get_gate_inputs(gate: str, root: Path) -> list[Path]:
     add_file(root / "docs" / "schema.sql")
     add_file(root / "docs" / "openapi.json")
     add_file(root / "openapi.json")
-    if gate not in ("integration", "concurrency", "permissions"):
+    if gate not in ("integration", "concurrency", "permissions", "race-lab"):
         add_tree(root / "frontend")
     add_file(root / "scripts" / "verification.json")
     add_tree(root / "scripts" / "verification.d")
 
-    if gate in ("concurrency", "permissions"):
+    if gate in ("concurrency", "permissions", "race-lab"):
         add_tree(root / "backend")
         add_tree(root / "scripts")
         add_glob("compose*.yaml")
