@@ -16,7 +16,8 @@
     "build",
     "frontend",
     "concurrency",
-    "permissions"
+    "permissions",
+    "race-lab"
   ],
   "implemented_endpoints": {
     "E35": "T-001",

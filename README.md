@@ -8,7 +8,8 @@ The service currently implements core authentication, resource management, and b
 - **Authentication & Authorization**: Registration via single-use invitation tokens, password login (Argon2id), rotating refresh token families in HttpOnly cookies, logout with family revocation, centralized role-based access control, and atomic PostgreSQL-backed rate limiting.
 - **Resource Management**: Active resource catalog pagination, detail lookups with version-based `ETag`, and occupied availability interval queries on 30-minute UTC boundaries.
 - **Atomic Idempotent Booking Creation**: `POST /api/v1/bookings` creates confirmed reservations backed by a GiST exclusion constraint (`bookings_no_overlap`), preventing overlapping reservations without application preflight checks. Requests require a UUID v4 `Idempotency-Key`; the idempotency record, booking, and transactional outbox event commit atomically in a single transaction. Replays return stored responses without re-executing business logic.
-- **Automated Verification**: Complete verification suite including unit tests, isolated PostgreSQL 16 integration tests, centralized permission matrix verification, and concurrency race gates.
+- **Automated Verification**: Complete verification suite including unit tests, isolated PostgreSQL 16 integration tests, centralized permission matrix verification, concurrency race gates, and a disposable PostgreSQL race lab gate.
+- **Disposable PostgreSQL Race Lab**: Standalone demonstration script (`scripts/race_demo.py`, detailed in [`docs/race-lab.md`](docs/race-lab.md)) reproducing check-then-insert double-booking vulnerabilities under real concurrency on unprotected tables and proving mutual exclusion invariant enforcement via PostgreSQL GiST exclusion constraints (`bookings_no_overlap`, SQLSTATE `23P01`) within dedicated disposable database namespaces.
 
 ## Prerequisites
 
@@ -70,6 +71,9 @@ python scripts/verify.py concurrency --fresh
 # Run centralized permission matrix verification
 python scripts/verify.py permissions --fresh
 
+# Run disposable PostgreSQL race lab demonstration gate
+python scripts/verify.py race-lab --fresh
+
 # Run full regression suite across all implemented gates
 python scripts/verify.py regression --fresh
 ```
@@ -84,6 +88,13 @@ Fresh verification of source `96365746d7cee5b2cd4f06795e005f729fffa8c0` ran on l
 - **Concurrency Gate**: Three independent 200-user same-slot rounds each produced exactly one `201 Created` and 199 `409 SLOT_CONFLICT` responses. A separate 200-request identical-key run returned 200 stored-equivalent `201` responses with one initial execution and 199 replays, persisting one booking, one idempotency key, and one outbox event.
 - **Permissions Gate**: 2 permission tests passed; all 11 registered endpoints were verified against the centralized permissions matrix.
 - **Performance / Load / Real-User Feedback**: Not yet measured. No production latency or throughput claim is made from the local correctness gate.
+
+### Standalone Disposable Race Lab Verification
+
+- **Verification Commands**:
+  - `python scripts/verify.py race-lab --fresh`: Standalone demonstration gate executing before/after concurrency checks in an ephemeral PostgreSQL database namespace.
+  - `python scripts/verify.py ticket --ticket T-012 --fresh`: Dedicated safety, authorization, and isolation test suite.
+- **Results**: Measured race-lab results are not yet recorded for this commit.
 
 ## Known Limitations
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import atexit
 import datetime
 import hashlib
 import json
@@ -10,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import uuid
@@ -90,6 +92,42 @@ def check_no_skips(stdout: str, tool: str) -> str | None:
     return None
 
 
+def sanitize_command(cmd_args: list[str]) -> list[str]:
+    """Redact raw approval tokens and mask credentials in URLs for manifests, logs, and stdout."""
+    sanitized: list[str] = []
+    redact_next = False
+    for arg in cmd_args:
+        if redact_next:
+            sanitized.append("[REDACTED]")
+            redact_next = False
+            continue
+        if arg == "--approval-token":
+            sanitized.append(arg)
+            redact_next = True
+            continue
+        if arg.startswith("--approval-token="):
+            sanitized.append("--approval-token=[REDACTED]")
+            continue
+        # Mask credentials in URLs: postgresql://user:pass@host:port/db
+        masked = re.sub(r"://([^:]+):([^@]+)@", r"://\g<1>:***@", arg)
+        sanitized.append(masked)
+    if redact_next:
+        sanitized.append("[REDACTED]")
+    return sanitized
+
+
+def sanitize_text(text: str, secrets: list[str] | None = None) -> str:
+    """Mask credentials in URLs and redact secret tokens/passwords."""
+    if not text:
+        return text
+    masked = re.sub(r"://([^:\s\'\"]+):([^@\s\'\"]+)@", r"://\g<1>:***@", text)
+    if secrets:
+        for s in secrets:
+            if s and len(s) >= 4:
+                masked = masked.replace(s, "[REDACTED]")
+    return masked
+
+
 def run_command(
     cmd: list[str],
     evidence_dir: Path,
@@ -99,27 +137,49 @@ def run_command(
     check_tool: str | None = None,
 ) -> int:
     display_cwd = str(cwd) if cwd else str(REPO_ROOT)
-    print(f"[{cmd_index}] Running: {' '.join(cmd)} (cwd: {display_cwd})")
+    sanitized_display = " ".join(sanitize_command(cmd))
+    print(f"[{cmd_index}] Running: {sanitized_display} (cwd: {display_cwd})")
 
-    proc = subprocess.run(
-        cmd,
-        cwd=cwd or REPO_ROOT,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
+    # Collect any secrets passed via env or arguments for output sanitization
+    secrets_to_redact: list[str] = []
+    if env:
+        for k, v in env.items():
+            k_upper = k.upper()
+            if any(term in k_upper for term in ("TOKEN", "PASSWORD", "SECRET", "DSN", "URL")):
+                for match in re.finditer(r"://[^:\s\'\"]+:([^@\s\'\"]+)@", v):
+                    secrets_to_redact.append(match.group(1))
+                if any(term in k_upper for term in ("TOKEN", "PASSWORD", "SECRET")):
+                    secrets_to_redact.append(v)
 
-    if proc.stdout:
-        print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
+    stdout_text = ""
+    stderr_text = ""
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd or REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        stdout_text = sanitize_text(proc.stdout, secrets_to_redact)
+        stderr_text = sanitize_text(proc.stderr, secrets_to_redact)
+        return_code = proc.returncode
+    except Exception as exc:
+        # Use generic failure messages to prevent exception messages from leaking secrets
+        err_msg = f"Command execution failed: {type(exc).__name__}\n"
+        print(f"[{cmd_index}] {err_msg.strip()}", file=sys.stderr)
+        stderr_text = err_msg
+        return_code = 1
 
-    return_code = proc.returncode
+    if stdout_text:
+        print(stdout_text, end="")
+    if stderr_text:
+        print(stderr_text, end="", file=sys.stderr)
 
     # If the process exited 0, check for skips or zero collected tests
     if return_code == 0 and check_tool:
-        skip_err = check_no_skips(proc.stdout, check_tool)
+        skip_err = check_no_skips(stdout_text, check_tool)
         if skip_err:
             print(f"\nError: {skip_err}", file=sys.stderr)
             return_code = 1
@@ -127,8 +187,8 @@ def run_command(
     stdout_file = evidence_dir / f"cmd_{cmd_index:02d}_stdout.txt"
     stderr_file = evidence_dir / f"cmd_{cmd_index:02d}_stderr.txt"
 
-    stdout_file.write_text(proc.stdout, encoding="utf-8")
-    stderr_file.write_text(proc.stderr, encoding="utf-8")
+    stdout_file.write_text(stdout_text, encoding="utf-8")
+    stderr_file.write_text(stderr_text, encoding="utf-8")
 
     return return_code
 
@@ -260,6 +320,9 @@ def find_free_port(start_port: int, max_attempts: int = 100) -> int:
 class IsolatedDatabaseManager:
     """Manages ephemeral PostgreSQL 16 database lifecycle strictly scoped by TEST_RUN_ID."""
 
+    _active_managers: set["IsolatedDatabaseManager"] = set()
+    _atexit_registered: bool = False
+
     def __init__(self, evidence_dir: Path, run_id: str) -> None:
         self.evidence_dir = evidence_dir
         self.test_run_id = f"{run_id}_{uuid.uuid4().hex}"
@@ -269,6 +332,8 @@ class IsolatedDatabaseManager:
         self.db_name = f"cb_test_{slug}"
         self.db_user = "commonsbook_test"
         self.db_password = "commonsbook_test"
+        self._started = False
+        self._stopped = False
 
         port_offset = (
             int(
@@ -281,10 +346,39 @@ class IsolatedDatabaseManager:
         self.allocated_port = find_free_port(base_port)
         self.docker_bin = find_tool("docker")
 
+    @classmethod
+    def _ensure_atexit_registered(cls) -> None:
+        if not cls._atexit_registered:
+            cls._atexit_registered = True
+            atexit.register(cls._cleanup_all)
+
+    @classmethod
+    def _cleanup_all(cls) -> None:
+        for mgr in list(cls._active_managers):
+            try:
+                mgr.stop()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "IsolatedDatabaseManager":
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.stop()
+
+    def __del__(self) -> None:
+        if getattr(self, "_started", False) and not getattr(self, "_stopped", False):
+            try:
+                self.stop()
+            except Exception:
+                pass
+
     def start(self, command_log: list[dict[str, Any]]) -> str:
-        override_yaml = (
-            f'services:\n  db:\n    ports:\n      - "127.0.0.1:{self.allocated_port}:5432"\n'
-        )
+        self._started = True
+        IsolatedDatabaseManager._active_managers.add(self)
+        IsolatedDatabaseManager._ensure_atexit_registered()
+
+        override_yaml = f'services:\n  db:\n    ports:\n      - "127.0.0.1:{self.allocated_port}:5432"\n'
         cmd = [
             self.docker_bin,
             "compose",
@@ -319,24 +413,32 @@ class IsolatedDatabaseManager:
         )
         command_log.append(
             {
-                "cmd": cmd + [f"(stdin: port 127.0.0.1:{self.allocated_port}:5432)"],
+                "cmd": sanitize_command(
+                    cmd + [f"(stdin: port 127.0.0.1:{self.allocated_port}:5432)"]
+                ),
                 "exit_code": proc.returncode,
             }
         )
         index = len(command_log)
-        (self.evidence_dir / f"cmd_{index:02d}_stdout.txt").write_text(
-            proc.stdout, encoding="utf-8"
-        )
-        (self.evidence_dir / f"cmd_{index:02d}_stderr.txt").write_text(
-            proc.stderr, encoding="utf-8"
-        )
+        if self.evidence_dir.exists():
+            (self.evidence_dir / f"cmd_{index:02d}_stdout.txt").write_text(
+                proc.stdout, encoding="utf-8"
+            )
+            (self.evidence_dir / f"cmd_{index:02d}_stderr.txt").write_text(
+                proc.stderr, encoding="utf-8"
+            )
         if proc.returncode != 0:
             print(proc.stderr, file=sys.stderr)
-            raise RuntimeError(f"Failed to start isolated database container: {proc.stderr}")
+            raise RuntimeError(
+                f"Failed to start isolated database container: {proc.stderr}"
+            )
 
         return f"postgresql+asyncpg://{self.db_user}:{self.db_password}@127.0.0.1:{self.allocated_port}/{self.db_name}"
 
-    def stop(self, command_log: list[dict[str, Any]]) -> None:
+    def stop(self, command_log: list[dict[str, Any]] | None = None) -> None:
+        if self._stopped:
+            return
+
         cmd = [
             self.docker_bin,
             "compose",
@@ -348,7 +450,9 @@ class IsolatedDatabaseManager:
             "-v",
             "--remove-orphans",
         ]
-        print(f"Tearing down isolated test database in namespace '{self.project_name}'...")
+        print(
+            f"Tearing down isolated test database in namespace '{self.project_name}'..."
+        )
         proc = subprocess.run(
             cmd,
             cwd=REPO_ROOT,
@@ -356,16 +460,83 @@ class IsolatedDatabaseManager:
             stderr=subprocess.PIPE,
             text=True,
         )
-        command_log.append({"cmd": cmd, "exit_code": proc.returncode})
-        index = len(command_log)
-        (self.evidence_dir / f"cmd_{index:02d}_stdout.txt").write_text(
-            proc.stdout, encoding="utf-8"
-        )
-        (self.evidence_dir / f"cmd_{index:02d}_stderr.txt").write_text(
-            proc.stderr, encoding="utf-8"
-        )
-        if proc.returncode:
+        if command_log is not None:
+            command_log.append(
+                {"cmd": sanitize_command(cmd), "exit_code": proc.returncode}
+            )
+            index = len(command_log)
+            if self.evidence_dir.exists():
+                (self.evidence_dir / f"cmd_{index:02d}_stdout.txt").write_text(
+                    proc.stdout, encoding="utf-8"
+                )
+                (self.evidence_dir / f"cmd_{index:02d}_stderr.txt").write_text(
+                    proc.stderr, encoding="utf-8"
+                )
+
+        # Genuinely ensure all runner-owned containers for this project are removed
+        self._force_cleanup()
+
+        if proc.returncode != 0:
             raise RuntimeError(f"Database cleanup failed for {self.project_name}")
+
+        self._stopped = True
+        IsolatedDatabaseManager._active_managers.discard(self)
+
+    def _force_cleanup(self) -> None:
+        """Ensure no containers or networks remain for this project."""
+        try:
+            # Check for leftover containers by project label
+            ps_cmd = [
+                self.docker_bin,
+                "ps",
+                "-a",
+                "-q",
+                "--filter",
+                f"label=com.docker.compose.project={self.project_name}",
+            ]
+            proc = subprocess.run(ps_cmd, capture_output=True, text=True)
+            cids = [c.strip() for c in proc.stdout.splitlines() if c.strip()]
+            if cids:
+                subprocess.run(
+                    [self.docker_bin, "rm", "-f"] + cids,
+                    capture_output=True,
+                )
+
+            # Check for leftover containers by name pattern
+            ps_name_cmd = [
+                self.docker_bin,
+                "ps",
+                "-a",
+                "-q",
+                "--filter",
+                f"name={self.project_name}",
+            ]
+            proc_name = subprocess.run(ps_name_cmd, capture_output=True, text=True)
+            cids_name = [c.strip() for c in proc_name.stdout.splitlines() if c.strip()]
+            if cids_name:
+                subprocess.run(
+                    [self.docker_bin, "rm", "-f"] + cids_name,
+                    capture_output=True,
+                )
+
+            # Check for leftover networks
+            net_cmd = [
+                self.docker_bin,
+                "network",
+                "ls",
+                "-q",
+                "--filter",
+                f"label=com.docker.compose.project={self.project_name}",
+            ]
+            proc_net = subprocess.run(net_cmd, capture_output=True, text=True)
+            nids = [n.strip() for n in proc_net.stdout.splitlines() if n.strip()]
+            if nids:
+                subprocess.run(
+                    [self.docker_bin, "network", "rm"] + nids,
+                    capture_output=True,
+                )
+        except Exception:
+            pass
 
 
 def load_manifests(
@@ -415,14 +586,21 @@ def load_manifests(
                 sys.exit(f"Error: Fragment {frag_path.name} path lists must be arrays")
 
             total_checks = (
-                len(pytest_paths) + len(vitest_paths) + len(playwright_paths) + len(doc_checks)
+                len(pytest_paths)
+                + len(vitest_paths)
+                + len(playwright_paths)
+                + len(doc_checks)
             )
             if total_checks == 0:
-                sys.exit(f"Error: Fragment {frag_path.name} must declare at least one check")
+                sys.exit(
+                    f"Error: Fragment {frag_path.name} must declare at least one check"
+                )
 
             for dc in doc_checks:
                 if dc not in LEGAL_DOCUMENT_CHECKS:
-                    sys.exit(f"Error: Illegal document check '{dc}' in {frag_path.name}")
+                    sys.exit(
+                        f"Error: Illegal document check '{dc}' in {frag_path.name}"
+                    )
 
             for p in pytest_paths:
                 if p.endswith(".md"):
@@ -599,7 +777,9 @@ def run_target(
                 "DATABASE_URL": database_url,
                 "TEST_RUN_ID": db_mgr.test_run_id,
             }
-            code = run_command(upgrade_cmd, evidence_dir, len(command_log) + 1, env=env_db)
+            code = run_command(
+                upgrade_cmd, evidence_dir, len(command_log) + 1, env=env_db
+            )
             command_log.append({"cmd": upgrade_cmd, "exit_code": code})
             if code != 0:
                 return code
@@ -647,8 +827,12 @@ def run_target(
             print(
                 f"Starting Uvicorn server on port {server_port} for concurrency gate..."
             )
-            server_stdout_f = open(evidence_dir / "uvicorn_stdout.txt", "w", encoding="utf-8")
-            server_stderr_f = open(evidence_dir / "uvicorn_stderr.txt", "w", encoding="utf-8")
+            server_stdout_f = open(
+                evidence_dir / "uvicorn_stdout.txt", "w", encoding="utf-8"
+            )
+            server_stderr_f = open(
+                evidence_dir / "uvicorn_stderr.txt", "w", encoding="utf-8"
+            )
             server_proc = subprocess.Popen(
                 server_cmd,
                 cwd=REPO_ROOT,
@@ -664,7 +848,9 @@ def run_target(
                 if server_proc.poll() is not None:
                     break
                 try:
-                    with urllib.request.urlopen(f"{server_url}/healthz", timeout=1) as resp:
+                    with urllib.request.urlopen(
+                        f"{server_url}/healthz", timeout=1
+                    ) as resp:
                         if resp.status == 200:
                             ready = True
                             break
@@ -674,8 +860,12 @@ def run_target(
             if not ready:
                 server_stdout_f.flush()
                 server_stderr_f.flush()
-                err_content = (evidence_dir / "uvicorn_stderr.txt").read_text(encoding="utf-8")
-                out_content = (evidence_dir / "uvicorn_stdout.txt").read_text(encoding="utf-8")
+                err_content = (evidence_dir / "uvicorn_stderr.txt").read_text(
+                    encoding="utf-8"
+                )
+                out_content = (evidence_dir / "uvicorn_stdout.txt").read_text(
+                    encoding="utf-8"
+                )
                 raise RuntimeError(
                     f"Uvicorn server failed to become ready on {server_url}:\n{err_content}\n{out_content}"
                 )
@@ -780,6 +970,137 @@ def run_target(
         finally:
             db_mgr.stop(command_log)
 
+    elif target == "race-lab":
+        db_mgr = IsolatedDatabaseManager(evidence_dir=evidence_dir, run_id=run_id)
+        try:
+            database_url = db_mgr.start(command_log)
+            lab_run_id = f"gate_{uuid.uuid4().hex[:12]}"
+            lab_db_name = f"commonsbook_racelab_{lab_run_id}"
+            approval_token = uuid.uuid4().hex + uuid.uuid4().hex
+            token_sha256 = hashlib.sha256(approval_token.encode("utf-8")).hexdigest()
+
+            parsed_db = urllib.parse.urlsplit(database_url)
+
+            # Persist ONLY a redacted/hash-only approval record in final evidence
+            # (never the raw token)
+            evidence_approval_file = evidence_dir / "approval.json"
+            evidence_approval_data = {
+                "run_id": lab_run_id,
+                "database": lab_db_name,
+                "host": parsed_db.hostname or "127.0.0.1",
+                "port": parsed_db.port or 5432,
+                "token_sha256": token_sha256,
+                "actions": ["create", "cleanup"],
+            }
+            evidence_approval_file.write_text(
+                json.dumps(evidence_approval_data, indent=2), encoding="utf-8"
+            )
+
+            admin_url = urllib.parse.urlunsplit(parsed_db._replace(path="/postgres"))
+            backend_python = (
+                REPO_ROOT
+                / "backend"
+                / ".venv"
+                / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            )
+
+            # Race demo receives actual approval material via temporary directory OUTSIDE evidence
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_approval_file = Path(temp_dir) / "approval.json"
+                temp_approval_data = {
+                    "run_id": lab_run_id,
+                    "database": lab_db_name,
+                    "host": parsed_db.hostname or "127.0.0.1",
+                    "port": parsed_db.port or 5432,
+                    "token": approval_token,
+                    "token_sha256": token_sha256,
+                    "actions": ["create", "cleanup"],
+                }
+                temp_approval_file.write_text(
+                    json.dumps(temp_approval_data, indent=2), encoding="utf-8"
+                )
+
+                # Pass token through environment variable whose value is NOT recorded in command_log
+                race_env = {
+                    **os.environ,
+                    "RACE_LAB_APPROVAL_TOKEN": approval_token,
+                }
+                cmd = [
+                    str(backend_python),
+                    "scripts/race_demo.py",
+                    "--admin-url",
+                    admin_url,
+                    "--run-id",
+                    lab_run_id,
+                    "--approval-file",
+                    str(temp_approval_file),
+                    "--evidence-dir",
+                    str(evidence_dir),
+                ]
+                code = run_command(
+                    cmd,
+                    evidence_dir,
+                    len(command_log) + 1,
+                    env=race_env,
+                )
+                sanitized_cmd = sanitize_command(cmd)
+                command_log.append({"cmd": sanitized_cmd, "exit_code": code})
+                if code != 0:
+                    return code
+
+            clean_admin_url = re.sub(
+                r"^postgresql\+asyncpg://", "postgresql://", admin_url
+            )
+            cleanup_script = (
+                "import asyncio, os, sys, asyncpg\n"
+                "async def check():\n"
+                "    dsn = os.environ.get('CLEANUP_VERIFY_DSN')\n"
+                "    if not dsn:\n"
+                "        sys.exit('Missing CLEANUP_VERIFY_DSN')\n"
+                "    target_db = sys.argv[1]\n"
+                "    try:\n"
+                "        conn = await asyncpg.connect(dsn)\n"
+                "    except Exception:\n"
+                "        sys.exit('Database connection failed during cleanup verification')\n"
+                "    try:\n"
+                "        exists = await conn.fetchval(\n"
+                "            'SELECT 1 FROM pg_database WHERE datname = $1', target_db\n"
+                "        )\n"
+                "    except Exception:\n"
+                "        sys.exit('Database query failed during cleanup verification')\n"
+                "    finally:\n"
+                "        try:\n"
+                "            await conn.close()\n"
+                "        except Exception:\n"
+                "            pass\n"
+                "    if exists:\n"
+                "        sys.exit(f'Disposable database {target_db} still exists after cleanup')\n"
+                "    print(f'Verified ephemeral database {target_db} cleaned up')\n"
+                "asyncio.run(check())\n"
+            )
+            verify_cleanup_cmd = [
+                str(backend_python),
+                "-c",
+                cleanup_script,
+                lab_db_name,
+            ]
+            cleanup_env = {
+                **os.environ,
+                "CLEANUP_VERIFY_DSN": clean_admin_url,
+            }
+            clean_code = run_command(
+                verify_cleanup_cmd,
+                evidence_dir,
+                len(command_log) + 1,
+                env=cleanup_env,
+            )
+            command_log.append(
+                {"cmd": sanitize_command(verify_cleanup_cmd), "exit_code": clean_code}
+            )
+            return clean_code
+        finally:
+            db_mgr.stop(command_log)
+
     elif target == "regression":
         regression_order = central_manifest.get("ordered_targets", [])
         implemented_targets = set(central_manifest.get("implemented_targets", []))
@@ -816,7 +1137,9 @@ def run_target(
 
         needs_db = any("integration" in p or "concurrency" in p for p in pytest_paths)
         db_mgr = (
-            IsolatedDatabaseManager(evidence_dir=evidence_dir, run_id=run_id) if needs_db else None
+            IsolatedDatabaseManager(evidence_dir=evidence_dir, run_id=run_id)
+            if needs_db
+            else None
         )
 
         try:
@@ -866,10 +1189,14 @@ def run_target(
                     return code
 
             if playwright_paths:
-                sys.exit("Error: Playwright verification paths not implemented in this version")
+                sys.exit(
+                    "Error: Playwright verification paths not implemented in this version"
+                )
 
             if doc_checks:
-                sys.exit("Error: Document verification checks not implemented in this version")
+                sys.exit(
+                    "Error: Document verification checks not implemented in this version"
+                )
 
             return 0
         finally:
@@ -884,10 +1211,40 @@ def run_target(
         return code
 
     elif target in central_manifest.get("implemented_targets", []):
-        sys.exit(f"Error: Target '{target}' is implemented in manifest but has no runner logic")
+        sys.exit(
+            f"Error: Target '{target}' is implemented in manifest but has no runner logic"
+        )
 
     else:
         sys.exit(f"Error: Target '{target}' is not implemented")
+
+
+def scan_evidence_for_leaks(
+    evidence_dir: Path, known_secrets: list[str] | None = None
+) -> list[str]:
+    """Scan all files in evidence directory for credential leaks or unmasked secrets."""
+    violations: list[str] = []
+    uri_password_pattern = re.compile(r"://[^:\s\'\"]+:([^@\s\'\"]+)@")
+    if not evidence_dir.exists():
+        return violations
+    for file_path in sorted(evidence_dir.rglob("*")):
+        if not file_path.is_file():
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        for match in uri_password_pattern.finditer(content):
+            pw = match.group(1)
+            if pw != "***":
+                rel = file_path.relative_to(evidence_dir)
+                violations.append(f"Unmasked password in {rel}")
+        if known_secrets:
+            for sec in known_secrets:
+                if sec and len(sec) >= 6 and sec in content:
+                    rel = file_path.relative_to(evidence_dir)
+                    violations.append(f"Known secret leaked in {rel}")
+    return violations
 
 
 def execute_gate(target, ticket, central, fragments, evidence_dir, run_id, fresh=False):
@@ -896,7 +1253,7 @@ def execute_gate(target, ticket, central, fragments, evidence_dir, run_id, fresh
     started = time.perf_counter()
     timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
     versions = get_tool_versions()
-    if target not in {"integration", "concurrency", "permissions", "build"}:
+    if target not in {"integration", "concurrency", "permissions", "build", "race-lab"}:
         for name in ("docker", "compose", "postgres_image"):
             versions.pop(name, None)
     else:
@@ -904,7 +1261,11 @@ def execute_gate(target, ticket, central, fragments, evidence_dir, run_id, fresh
             versions.pop(name, None)
     sha = get_git_sha()
     fingerprint = compute_fingerprint(target)
-    profile = "race" if target == "concurrency" else os.environ.get("TEST_PROFILE", "standard")
+    profile = (
+        "race"
+        if target == "concurrency"
+        else os.environ.get("TEST_PROFILE", "standard")
+    )
     root = Path(os.environ.get("EVIDENCE_ROOT", str(REPO_ROOT / "evidence")))
     if (
         is_evidence_reuse_activated(central)
@@ -929,11 +1290,15 @@ def execute_gate(target, ticket, central, fragments, evidence_dir, run_id, fresh
     commands = []
     error = None
     try:
-        code = run_target(target, ticket, central, fragments, evidence_dir, commands, run_id)
+        code = run_target(
+            target, ticket, central, fragments, evidence_dir, commands, run_id
+        )
     except (Exception, SystemExit) as exc:
         code = 1
         error = str(exc)
         print(error, file=sys.stderr)
+    finally:
+        IsolatedDatabaseManager._cleanup_all()
     if any(entry["exit_code"] != 0 for entry in commands):
         code = code or 1
     if compute_fingerprint(target) != fingerprint:
@@ -941,14 +1306,25 @@ def execute_gate(target, ticket, central, fragments, evidence_dir, run_id, fresh
     records = []
     for index, entry in enumerate(commands, 1):
         record = dict(entry)
+        if "cmd" in record and isinstance(record["cmd"], list):
+            record["cmd"] = sanitize_command(record["cmd"])
         for stream in ("stdout", "stderr"):
             name = f"cmd_{index:02d}_{stream}.txt"
             path = evidence_dir / name
             record[f"{stream}_file"] = name
             record[f"{stream}_sha256"] = (
-                hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+                hashlib.sha256(path.read_bytes()).hexdigest()
+                if path.is_file()
+                else None
             )
         records.append(record)
+    leak_violations = scan_evidence_for_leaks(evidence_dir)
+    if leak_violations:
+        code = 1
+        leak_msg = f"Security violation: credential leak detected in evidence: {', '.join(leak_violations)}"
+        error = f"{error}; {leak_msg}" if error else leak_msg
+        print(f"Error: {leak_msg}", file=sys.stderr)
+
     data = {
         "evidence_version": 2,
         "timestamp": timestamp,
@@ -967,7 +1343,9 @@ def execute_gate(target, ticket, central, fragments, evidence_dir, run_id, fresh
         "error": error,
         "duration_seconds": time.perf_counter() - started,
     }
-    (evidence_dir / "manifest.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+    (evidence_dir / "manifest.json").write_text(
+        json.dumps(data, indent=2), encoding="utf-8"
+    )
     print(f"{target}: exit {code}; evidence {evidence_dir}")
     return code
 
@@ -1012,7 +1390,9 @@ def main() -> None:
         + "_"
         + uuid.uuid4().hex[:12]
     )
-    evidence_dir = Path(os.environ.get("EVIDENCE_DIR", str(REPO_ROOT / "evidence" / run_id)))
+    evidence_dir = Path(
+        os.environ.get("EVIDENCE_DIR", str(REPO_ROOT / "evidence" / run_id))
+    )
     if evidence_dir.exists() and any(evidence_dir.iterdir()):
         sys.exit("Evidence directory must be new or empty")
     if args.target == "regression":
