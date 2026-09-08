@@ -1,0 +1,7 @@
+{
+  "ticket_id": "T-017",
+  "pytest_paths": ["backend/tests/integration/test_scheduler.py"],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}

@@ -36,7 +36,7 @@ A waitlist entry (`waitlist_entries`) transitions through the following lifecycl
 - **`offered`**: Promoted atomically when inventory becomes free. Linked to a fresh reservation booking with `status='offered'` and a finite `expires_at` deadline.
 - **`accepted`**: Terminal state reached when the waiter accepts the offer before `expires_at` via `POST /api/v1/waitlist/{id}/accept`. Transitions the linked booking to `status='confirmed'`.
 - **`cancelled`**: Terminal state reached when withdrawn by its owner via `DELETE /api/v1/waitlist/{id}` or when an offered hold is declined.
-- **`expired`**: Terminal state reached if the entry's start time is within 15 minutes of the current database time, if the owner is disabled, or if the offered hold deadline expires before acceptance. No automatic requeue.
+- **`expired`**: Terminal state reached if the entry's start time is within 15 minutes of the current database time, if the owner is disabled, or if the offered hold deadline expires before acceptance (either during offer acceptance attempts or automatically via the 30-second background scheduler). No automatic requeue.
 
 ---
 
@@ -160,6 +160,9 @@ When confirmed capacity is released (e.g., via `POST /api/v1/bookings/{id}/cance
   - Atomically invokes `promote_waiters` to offer the released slot to the next eligible waiter.
   - A voluntary decline of an offered hold by the waiter emits no notification outbox event, as the withdrawal originates directly from the recipient.
 - If the slot has already started (`db_now >= entry.starts_at`), returns 409 `TOO_LATE`.
+
+### Background Hold Expiry and Promotion Scheduler
+In addition to lazy expiration during user acceptance attempts, the background worker daemon periodically discovers resources with overdue holds (`status='offered' AND expires_at <= clock_timestamp()`) or waiting entries every 30 seconds. For each candidate resource, the scheduler acquires the resource lock (`FOR UPDATE SKIP LOCKED`), samples `clock_timestamp()` after lock acquisition, transitions overdue bookings and linked waitlist entries to `status='expired'`, appends `hold_expired` outbox events, and invokes `promote_waiters` with the standard 15-minute hold horizon to advance subsequent waiters automatically.
 
 ---
 
