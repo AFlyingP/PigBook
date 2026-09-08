@@ -152,8 +152,9 @@ The worker process runs as an independent asyncio service supervising independen
 
 #### Session and Connection Invariants
 - Each task and operation owns its own `AsyncSession`; sessions are never shared across tasks.
-- Tasks checkout database connections only for the duration of individual short operations/transactions; sessions are never held across `asyncio.sleep` awaits.
-- Compatible with strict database pool sizing (`pool_size=2`, `max_overflow=0`).
+- The worker operates against the shared application database engine (`app.db.session.get_engine`) with its default pool settings.
+- Tasks check out a database connection only for the duration of individual short operations and transactions; connections and sessions are never held across `asyncio.sleep` or long awaits.
+- Dedicated worker pool sizing (such as a separate engine with `pool_size=2`, `max_overflow=0`) remains to be configured with deployment topology.
 
 #### Graceful Shutdown Budget
 - On receiving `SIGTERM` or `SIGINT`, the worker sets its shutdown event, stopping new work across all tasks.

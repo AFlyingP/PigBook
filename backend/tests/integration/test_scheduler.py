@@ -29,10 +29,17 @@ from app.resources.models import Resource
 from app.waitlist.models import WaitlistEntry
 from app.waitlist.scheduler import (
     HoldExpiryScheduler,
+    _expire_and_promote,
     expire_and_promote,
     record_heartbeat,
 )
-from app.worker import SHUTDOWN_BUDGET_SECONDS, WorkerSupervisor
+from app.worker import (
+    HEARTBEAT_INTERVAL_SECONDS,
+    MAINTENANCE_INTERVAL_SECONDS,
+    SCHEDULER_INTERVAL_SECONDS,
+    SHUTDOWN_BUDGET_SECONDS,
+    WorkerSupervisor,
+)
 
 get_settings.cache_clear()
 
@@ -565,7 +572,7 @@ async def test_deadline_sampled_after_the_lock() -> None:
         async with sessionmaker() as session:
             async with session.begin():
                 # skip_locked=False forces waiting on the resource lock
-                count = await expire_and_promote(
+                count = await _expire_and_promote(
                     session, resource_id=res.id, now=now, skip_locked=False
                 )
                 result_expired.append(count)
@@ -613,9 +620,9 @@ async def test_accept_versus_expire_race() -> None:
 
     accept_resp, expire_count = await asyncio.gather(_do_accept(), _do_expire())
 
-    # Concurrent race yields one valid terminal outcome:
-    # 200 (accept won), 409 (accept detected expiry), or 412 (scheduler expired first)
-    assert accept_resp.status_code in (200, 409, 412)
+    # Concurrent race yields one valid terminal outcome at/after deadline:
+    # 409 HOLD_EXPIRED (accept won lock) or 412 VERSION_MISMATCH (scheduler won lock)
+    assert accept_resp.status_code in (409, 412)
 
     async with sessionmaker() as session:
         b = (await session.execute(select(Booking).where(Booking.id == booking.id))).scalar_one()
@@ -623,17 +630,13 @@ async def test_accept_versus_expire_race() -> None:
             await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry.id))
         ).scalar_one()
 
-        if accept_resp.status_code == 200:
-            assert b.status == "confirmed"
-            assert e.status == "accepted"
-        elif accept_resp.status_code == 409:
+        assert b.status == "expired"
+        assert e.status == "expired"
+
+        if accept_resp.status_code == 409:
             assert accept_resp.json()["error"]["code"] == "HOLD_EXPIRED"
-            assert b.status == "expired"
-            assert e.status == "expired"
         else:
             assert accept_resp.json()["error"]["code"] == "VERSION_MISMATCH"
-            assert b.status == "expired"
-            assert e.status == "expired"
 
         # Check outbox events: no duplicate event
         events = (
@@ -642,7 +645,7 @@ async def test_accept_versus_expire_race() -> None:
             .all()
         )
         assert len(events) == 1
-        assert events[0].event_type in ("booking_confirmed", "hold_expired")
+        assert events[0].event_type == "hold_expired"
 
     # Part 2: Committed 409 HOLD_EXPIRED still persists expiration and promotion
     res2 = await create_resource()
@@ -702,15 +705,18 @@ async def test_lifecycle_decoupled_from_email_dispatch() -> None:
     )
 
     dispatcher_started = asyncio.Event()
+    dispatcher_finished = False
 
     async def blocked_dispatcher(supervisor: WorkerSupervisor) -> None:
+        nonlocal dispatcher_finished
         dispatcher_started.set()
         await asyncio.sleep(20)
+        dispatcher_finished = True
 
     supervisor = WorkerSupervisor(
         sessionmaker,
-        heartbeat_interval=0.1,
-        scheduler_interval=0.1,
+        heartbeat_interval=0.15,
+        scheduler_interval=0.15,
         maintenance_interval=3600,
         registered_tasks=[blocked_dispatcher],
     )
@@ -718,19 +724,29 @@ async def test_lifecycle_decoupled_from_email_dispatch() -> None:
     task = asyncio.create_task(supervisor.run())
     await dispatcher_started.wait()
 
-    # Wait 0.8s while dispatcher is blocked for 20s
-    await asyncio.sleep(0.8)
-
-    # Assert heartbeat advanced and hold expired
+    # Read first heartbeat timestamp while dispatcher is blocked
+    await asyncio.sleep(0.2)
     async with sessionmaker() as session:
-        hb = (
+        hb1 = (
             await session.execute(select(WorkerHeartbeat).where(WorkerHeartbeat.name == "primary"))
-        ).scalar_one_or_none()
-        assert hb is not None
-        assert hb.seen_at is not None
+        ).scalar_one()
+        seen_at_1 = hb1.seen_at
 
+    # Wait for at least one more heartbeat interval while dispatcher remains blocked
+    await asyncio.sleep(0.3)
+    async with sessionmaker() as session:
+        hb2 = (
+            await session.execute(select(WorkerHeartbeat).where(WorkerHeartbeat.name == "primary"))
+        ).scalar_one()
+        seen_at_2 = hb2.seen_at
+
+        # Verify due hold was expired by the scheduler
         b = (await session.execute(select(Booking).where(Booking.id == booking.id))).scalar_one()
         assert b.status == "expired"
+
+    # Assert strict heartbeat advancement occurred while dispatcher is still sleeping for 20s
+    assert seen_at_2 > seen_at_1
+    assert not dispatcher_finished
 
     # Stop supervisor cleanly
     supervisor.request_shutdown()
@@ -998,9 +1014,28 @@ async def test_supervision_and_shutdown() -> None:
 @pytest.mark.asyncio
 async def test_maximum_delay_observability() -> None:
     """Heartbeat seen_at advances every 10s and expiry_scan_at advances on discovery."""
+    # 1. Assert production cadence constants
+    assert HEARTBEAT_INTERVAL_SECONDS == 10.0
+    assert SCHEDULER_INTERVAL_SECONDS == 30.0
+    assert MAINTENANCE_INTERVAL_SECONDS == 3600.0
+
     sessionmaker = get_sessionmaker()
 
-    # Direct heartbeat recording
+    # 2. Direct heartbeat and discovery cycle strict advancement
+    async with sessionmaker() as session:
+        async with session.begin():
+            await record_heartbeat(session, seen=True, expiry_scan=True)
+
+    async with sessionmaker() as session:
+        hb0 = (
+            await session.execute(select(WorkerHeartbeat).where(WorkerHeartbeat.name == "primary"))
+        ).scalar_one()
+        seen_0 = hb0.seen_at
+        scan_0 = hb0.expiry_scan_at
+
+    await asyncio.sleep(0.05)
+
+    # seen_at strictly advances across a heartbeat interval
     async with sessionmaker() as session:
         async with session.begin():
             await record_heartbeat(session, seen=True, expiry_scan=False)
@@ -1009,18 +1044,56 @@ async def test_maximum_delay_observability() -> None:
         hb1 = (
             await session.execute(select(WorkerHeartbeat).where(WorkerHeartbeat.name == "primary"))
         ).scalar_one()
-        seen_1 = hb1.seen_at
-        scan_1 = hb1.expiry_scan_at
+        assert hb1.seen_at > seen_0
+        assert hb1.expiry_scan_at == scan_0
 
     await asyncio.sleep(0.05)
 
-    # Discovery cycle updates expiry_scan_at
-    scheduler = HoldExpiryScheduler(sessionmaker)
+    # expiry_scan_at strictly advances across a complete discovery cycle
+    empty_res = await create_resource()
+    scheduler = HoldExpiryScheduler(sessionmaker, resource_ids=[empty_res.id])
     await scheduler.run_cycle()
 
     async with sessionmaker() as session:
         hb2 = (
             await session.execute(select(WorkerHeartbeat).where(WorkerHeartbeat.name == "primary"))
         ).scalar_one()
-        assert hb2.expiry_scan_at >= scan_1
-        assert hb2.seen_at >= seen_1
+        assert hb2.expiry_scan_at > scan_0
+        assert hb2.seen_at > hb1.seen_at
+
+    # 3. Real WorkerSupervisor multi-beat progression across database reads
+    short_hb = 0.1
+    supervisor = WorkerSupervisor(
+        sessionmaker,
+        heartbeat_interval=short_hb,
+        scheduler_interval=60.0,
+        maintenance_interval=3600.0,
+    )
+    sup_task = asyncio.create_task(supervisor.run())
+
+    # Wait for first live supervisor heartbeat
+    await asyncio.sleep(0.15)
+    async with sessionmaker() as session:
+        hb_live_1 = (
+            await session.execute(select(WorkerHeartbeat).where(WorkerHeartbeat.name == "primary"))
+        ).scalar_one()
+        live_seen_1 = hb_live_1.seen_at
+
+    # Wait for subsequent live supervisor heartbeat
+    await asyncio.sleep(0.2)
+    async with sessionmaker() as session:
+        hb_live_2 = (
+            await session.execute(select(WorkerHeartbeat).where(WorkerHeartbeat.name == "primary"))
+        ).scalar_one()
+        live_seen_2 = hb_live_2.seen_at
+
+    assert live_seen_2 > live_seen_1
+
+    # Clean supervisor shutdown
+    supervisor.request_shutdown()
+    await supervisor._shutdown()
+    sup_task.cancel()
+    try:
+        await sup_task
+    except (asyncio.CancelledError, BaseException):
+        pass

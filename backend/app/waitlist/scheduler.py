@@ -34,14 +34,13 @@ async def expire_and_promote(
     *,
     resource_id: uuid.UUID,
     now: datetime,
-    skip_locked: bool = True,
 ) -> int:
     """Expire overdue offered bookings on a resource and promote waiting entries.
 
     Fixed public interface (Spec 3.4).
     Accepts an already-open transaction and never commits it.
 
-    Acquires the resource row FOR UPDATE (with SKIP LOCKED by default).
+    Acquires the resource row FOR UPDATE SKIP LOCKED.
     If the resource cannot be locked or does not exist, returns 0.
     Samples clock_timestamp() only after acquiring the resource lock.
     Transitions due offered bookings (status='offered' AND expires_at <= db_now)
@@ -51,6 +50,22 @@ async def expire_and_promote(
     Returns the number of offered bookings expired by that call (0 when the call
     only performed promotion repair or skipped a locked resource).
     """
+    return await _expire_and_promote(
+        session,
+        resource_id=resource_id,
+        now=now,
+        skip_locked=True,
+    )
+
+
+async def _expire_and_promote(
+    session: AsyncSession,
+    *,
+    resource_id: uuid.UUID,
+    now: datetime,
+    skip_locked: bool = True,
+) -> int:
+    """Internal helper supporting non-skipping lock acquisition for race tests."""
     # 1. Acquire resource row lock
     stmt = (
         select(Resource).where(Resource.id == resource_id).with_for_update(skip_locked=skip_locked)
@@ -238,7 +253,6 @@ class HoldExpiryScheduler:
                         session,
                         resource_id=resource_id,
                         now=ref_now,
-                        skip_locked=True,
                     )
                     total_expired += expired
 
