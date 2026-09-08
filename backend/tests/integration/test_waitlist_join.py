@@ -9,7 +9,7 @@ from typing import Any
 import httpx
 import jwt
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import Range
 
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
@@ -603,3 +603,91 @@ async def test_owner_scoped_waitlist_operations_fail_closed_without_predicates()
                     expected_version=1,
                     now=now,
                 )
+
+
+@pytest.mark.asyncio
+async def test_simultaneous_joins_at_capacity_limit() -> None:
+    """Spec 11.6 v1.1: 499 active entries and simultaneous joins yield 201 and 409 WAITLIST_FULL."""
+    resource = await create_resource()
+    owner = await create_user()
+    s, e = aligned_slot(days=21)
+
+    # Busy slot
+    await insert_booking(
+        resource=resource,
+        owner=owner,
+        created_by=owner,
+        starts_at=s,
+        ends_at=e,
+        status="confirmed",
+    )
+
+    sessionmaker = get_sessionmaker()
+    dummy_users = [await create_user() for _ in range(5)]
+
+    # Bulk insert 499 active entries
+    base_time = datetime.now(timezone.utc)
+    active_entries = []
+    for i in range(499):
+        slot_s = s + timedelta(days=30 + i)
+        slot_e = slot_s + timedelta(hours=1)
+        active_entries.append(
+            WaitlistEntry(
+                id=uuid.uuid4(),
+                user_id=dummy_users[i % len(dummy_users)].id,
+                resource_id=resource.id,
+                time_range=Range(slot_s, slot_e, bounds="[)"),
+                status="waiting",
+                version=1,
+                created_at=base_time,
+                updated_at=base_time,
+            )
+        )
+    async with sessionmaker() as session:
+        async with session.begin():
+            session.add_all(active_entries)
+
+    user_a = await create_user()
+    user_b = await create_user()
+
+    # Two genuinely concurrent joins for the same busy window from two different users
+    payload = {
+        "resource_id": str(resource.id),
+        "starts_at": s.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "ends_at": e.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    async with make_client() as client:
+        t1 = client.post("/api/v1/waitlist", json=payload, headers=auth(user_a))
+        t2 = client.post("/api/v1/waitlist", json=payload, headers=auth(user_b))
+        r1, r2 = await asyncio.gather(t1, t2)
+
+    statuses = [r1.status_code, r2.status_code]
+    assert sorted(statuses) == [201, 409]
+
+    err_res = r1 if r1.status_code == 409 else r2
+    assert err_res.json()["error"]["code"] == "WAITLIST_FULL"
+
+    succ_res = r1 if r1.status_code == 201 else r2
+    assert succ_res.json()["status"] == "waiting"
+
+    # Exactly 500 active rows afterwards (never 501), and winner's row is waiting
+    async with sessionmaker() as session:
+        count = (
+            await session.execute(
+                select(func.count())
+                .select_from(WaitlistEntry)
+                .where(
+                    WaitlistEntry.resource_id == resource.id,
+                    WaitlistEntry.status.in_(("waiting", "offered")),
+                )
+            )
+        ).scalar_one()
+        assert count == 500
+
+        winner_id = uuid.UUID(succ_res.json()["id"])
+        winner_entry = (
+            await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == winner_id))
+        ).scalar_one()
+        assert winner_entry.status == "waiting"
+        assert winner_entry.version == 1

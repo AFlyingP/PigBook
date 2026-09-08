@@ -672,3 +672,80 @@ async def test_cancelling_confirmed_booking_does_not_rewrite_accepted_entry() ->
             .all()
         )
         assert len(all_entries) == 1
+
+
+@pytest.mark.asyncio
+async def test_accept_offer_with_distinct_entry_and_booking_versions() -> None:
+    """Spec 11.6 v1.1: Accept with distinct entry_version=3 and booking_version=1 (R9)."""
+    resource = await create_resource()
+    user = await create_user()
+    s, e = aligned_slot(days=12)
+    now = datetime.now(timezone.utc)
+
+    # Offered pair with entry_version=3, booking_version=1
+    entry, booking = await create_offered_pair(
+        resource=resource,
+        user=user,
+        starts_at=s,
+        ends_at=e,
+        expires_at=now + timedelta(minutes=15),
+        entry_version=3,
+        booking_version=1,
+    )
+
+    async with make_client() as client:
+        # If-Match: "1" pins stale entry version -> returns 412 VERSION_MISMATCH
+        r_stale = await client.post(
+            f"/api/v1/waitlist/{entry.id}/accept",
+            json={},
+            headers={**auth(user), "If-Match": '"1"'},
+        )
+        assert r_stale.status_code == 412
+        assert r_stale.json()["error"]["code"] == "VERSION_MISMATCH"
+
+        # If-Match: "3" pins current entry version -> succeeds 200
+        r_accept = await client.post(
+            f"/api/v1/waitlist/{entry.id}/accept",
+            json={},
+            headers={**auth(user), "If-Match": '"3"'},
+        )
+        assert r_accept.status_code == 200, r_accept.text
+        data = r_accept.json()
+        assert data["id"] == str(booking.id)
+        assert data["status"] == "confirmed"
+        # Booking version was 1, increments to 2
+        assert data["version"] == 2
+        assert data["expires_at"] is None
+        assert r_accept.headers.get("etag") == '"2"'
+
+    # Verify database state and outbox event
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        b_row = (
+            await session.execute(select(Booking).where(Booking.id == booking.id))
+        ).scalar_one()
+        assert b_row.status == "confirmed"
+        assert b_row.version == 2
+        assert b_row.expires_at is None
+
+        e_row = (
+            await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry.id))
+        ).scalar_one()
+        assert e_row.status == "accepted"
+        # Entry version was 3, increments to 4
+        assert e_row.version == 4
+
+        events = (
+            (
+                await session.execute(
+                    select(Outbox).where(
+                        Outbox.aggregate_id == booking.id,
+                        Outbox.event_type == "booking_confirmed",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(events) == 1
+        assert events[0].aggregate_version == 2
