@@ -17,10 +17,10 @@ from app.waitlist.schemas import (
     WaitlistStatusFilter,
 )
 from app.waitlist.service import (
+    _list_own_waitlist,
     accept_offer,
     decline_entry,
     join_waitlist,
-    list_own_waitlist,
 )
 
 router = APIRouter()
@@ -73,7 +73,7 @@ async def list_waitlist_endpoint(
     if scope.principal_id is None:
         raise AuthRequiredError("Authentication required")
 
-    return await list_own_waitlist(
+    return await _list_own_waitlist(
         session,
         scope=scope,
         limit=limit,

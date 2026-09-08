@@ -1137,3 +1137,49 @@ async def test_service_applies_scope_predicates_without_rederiving_ownership() -
                     reason="scope predicate test",
                     now=datetime.now(timezone.utc),
                 )
+
+
+async def test_owner_scoped_booking_operations_fail_closed_without_predicates() -> None:
+    """Owner-scoped booking operations fail closed when scope carries no predicates (R2)."""
+    owner = await create_user()
+    resource = await create_resource()
+    starts_at, ends_at = aligned_slot(days=23)
+    booking = await insert_booking(
+        resource=resource,
+        owner=owner,
+        created_by=owner,
+        starts_at=starts_at,
+        ends_at=ends_at,
+    )
+
+    sessionmaker = get_sessionmaker()
+
+    # Scope with empty predicates mapping
+    empty_scope = AuthorizedScope(
+        principal_id=owner.id,
+        policy=Policy.own_booking,
+        object_id=booking.id,
+        resource_id=resource.id,
+        expected_version=1,
+    )
+
+    async with sessionmaker() as session:
+        # _list_own_bookings must fail closed
+        with pytest.raises(RuntimeError, match="requires dependency-supplied predicate"):
+            await booking_service._list_own_bookings(session, scope=empty_scope)
+
+        # _get_own_booking must fail closed
+        with pytest.raises(RuntimeError, match="requires dependency-supplied predicate"):
+            await booking_service._get_own_booking(session, scope=empty_scope)
+
+        # cancel_booking must fail closed
+        async with session.begin():
+            with pytest.raises(RuntimeError, match="requires dependency-supplied predicate"):
+                await booking_service.cancel_booking(
+                    session,
+                    scope=empty_scope,
+                    booking_id=booking.id,
+                    expected_version=1,
+                    reason="fail-closed test",
+                    now=datetime.now(timezone.utc),
+                )

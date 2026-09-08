@@ -181,7 +181,9 @@ async def _list_own_bookings(
 
     Blackouts are never reachable here: they carry no owner and are excluded by kind.
     """
-    booking_predicates = scope.predicates.get("booking", ())
+    booking_predicates = scope.predicates.get("booking")
+    if not booking_predicates:
+        raise RuntimeError("Owner-scoped booking operation requires dependency-supplied predicate")
     if not isinstance(booking_predicates, (list, tuple)):
         booking_predicates = (booking_predicates,)
 
@@ -218,7 +220,9 @@ async def _get_own_booking(
     scope: AuthorizedScope,
 ) -> BookingSchema:
     """Read the reservation already resolved as owned by the scope principal."""
-    booking_predicates = scope.predicates.get("booking", ())
+    booking_predicates = scope.predicates.get("booking")
+    if not booking_predicates:
+        raise RuntimeError("Owner-scoped booking operation requires dependency-supplied predicate")
     if not isinstance(booking_predicates, (list, tuple)):
         booking_predicates = (booking_predicates,)
 
@@ -259,7 +263,9 @@ async def cancel_booking(
     lock_stmt = select(Resource.id).where(Resource.id == scope.resource_id).with_for_update()
     await session.execute(lock_stmt)
 
-    booking_predicates = scope.predicates.get("booking", ())
+    booking_predicates = scope.predicates.get("booking")
+    if not booking_predicates:
+        raise RuntimeError("Owner-scoped booking operation requires dependency-supplied predicate")
     if not isinstance(booking_predicates, (list, tuple)):
         booking_predicates = (booking_predicates,)
 
@@ -318,7 +324,10 @@ async def cancel_booking(
     # Update linked offered entry if any (Spec 5.3)
     entry_stmt = (
         update(WaitlistEntry)
-        .where(WaitlistEntry.offered_booking_id == booking_id)
+        .where(
+            WaitlistEntry.offered_booking_id == booking_id,
+            WaitlistEntry.status == "offered",
+        )
         .values(
             status="cancelled",
             version=WaitlistEntry.version + 1,

@@ -49,7 +49,6 @@ from app.waitlist.router import router as waitlist_router
 from app.waitlist.service import (
     AlreadyBooked,
     AlreadyWaitlisted,
-    HoldExpired,
     SlotAvailable,
     WaitlistFull,
 )
@@ -337,14 +336,6 @@ def create_app() -> FastAPI:
         return make_error_response(
             status_code=409,
             code="WAITLIST_FULL",
-            message=exc.message,
-        )
-
-    @app.exception_handler(HoldExpired)
-    async def hold_expired_handler(_request: Request, exc: HoldExpired) -> JSONResponse:
-        return make_error_response(
-            status_code=409,
-            code="HOLD_EXPIRED",
             message=exc.message,
         )
 

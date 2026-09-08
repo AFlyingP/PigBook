@@ -59,12 +59,6 @@ class WaitlistFull(Exception):
         super().__init__(message)
 
 
-class HoldExpired(Exception):
-    def __init__(self, message: str = "The offer for this booking has expired") -> None:
-        self.message = message
-        super().__init__(message)
-
-
 async def join_waitlist(
     session: AsyncSession,
     *,
@@ -167,7 +161,7 @@ async def join_waitlist(
     return WaitEntry.model_validate(entry)
 
 
-async def list_own_waitlist(
+async def _list_own_waitlist(
     session: AsyncSession,
     *,
     scope: AuthorizedScope,
@@ -176,7 +170,9 @@ async def list_own_waitlist(
     status: str | None = None,
 ) -> Page[WaitEntry]:
     """List the caller's own waitlist entries, ordered created_at descending then id."""
-    waitlist_predicates = scope.predicates.get("waitlist", ())
+    waitlist_predicates = scope.predicates.get("waitlist")
+    if not waitlist_predicates:
+        raise RuntimeError("Owner-scoped waitlist operation requires dependency-supplied predicate")
     if not isinstance(waitlist_predicates, (list, tuple)):
         waitlist_predicates = (waitlist_predicates,)
 
@@ -391,7 +387,9 @@ async def accept_offer(
     )
 
     # 2. Reselect waitlist entry FOR UPDATE
-    waitlist_predicates = scope.predicates.get("waitlist", ())
+    waitlist_predicates = scope.predicates.get("waitlist")
+    if not waitlist_predicates:
+        raise RuntimeError("Owner-scoped waitlist operation requires dependency-supplied predicate")
     if not isinstance(waitlist_predicates, (list, tuple)):
         waitlist_predicates = (waitlist_predicates,)
 
@@ -540,7 +538,9 @@ async def decline_entry(
     )
 
     # 2. Reselect waitlist entry FOR UPDATE
-    waitlist_predicates = scope.predicates.get("waitlist", ())
+    waitlist_predicates = scope.predicates.get("waitlist")
+    if not waitlist_predicates:
+        raise RuntimeError("Owner-scoped waitlist operation requires dependency-supplied predicate")
     if not isinstance(waitlist_predicates, (list, tuple)):
         waitlist_predicates = (waitlist_predicates,)
 

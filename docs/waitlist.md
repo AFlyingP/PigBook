@@ -109,7 +109,7 @@ Application locks serialize multi-row coordination, but mutual exclusion is guar
 
 ## 5. Promotion on Inventory Release (`promote_waiters`)
 
-When confirmed capacity is released (e.g., via `POST /api/v1/bookings/{id}/cancel` or blackout deletion), `promote_waiters` executes **in the same transaction before commit**:
+When confirmed capacity is released (e.g., via `POST /api/v1/bookings/{id}/cancel`, or via administrative cancellation once implemented), `promote_waiters` executes **in the same transaction before commit**:
 
 1. **Full Keyset Scan**:
    - The service scans all waiting entries for the resource ordered by `(created_at ASC, id ASC)`.
@@ -158,11 +158,12 @@ When confirmed capacity is released (e.g., via `POST /api/v1/bookings/{id}/cance
 - If the entry is in `offered` status:
   - Transitions both the waitlist entry and its linked offered booking to `cancelled` (`version = version + 1`, `expires_at = None`).
   - Atomically invokes `promote_waiters` to offer the released slot to the next eligible waiter.
+  - A voluntary decline of an offered hold by the waiter emits no notification outbox event, as the withdrawal originates directly from the recipient.
 - If the slot has already started (`db_now >= entry.starts_at`), returns 409 `TOO_LATE`.
 
 ---
 
 ## 7. Known Limitations and Verification Notes
 
-1. **Document Checks Execution**: The verification script (`scripts/verify.py`) does not implement a document-check runner and aborts if `document_checks` in `scripts/verification.d/T-014.json` is non-empty. Documentation is reviewed directly by the repository orchestrator.
+1. **Document Checks Execution**: The verification script (`scripts/verify.py`) does not implement an automated document-check executor; `document_checks` in verification fragments remains empty to avoid runner failures, and documentation files are maintained directly as repository artifacts.
 2. **Uncoordinated Database Writers**: FIFO fairness guarantees apply to operations routed through application transactions holding the resource lock. Independent direct SQL writers without resource locking can trigger savepoint rollback during offer creation, which leaves the entry in `waiting` status without starving subsequent disjoint requests.

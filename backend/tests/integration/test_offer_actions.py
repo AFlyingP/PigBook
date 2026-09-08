@@ -521,6 +521,36 @@ async def test_decline_offered_entry_cancels_and_promotes_next_waiter() -> None:
         assert next_row.status == "offered"
         assert next_row.offered_booking_id is not None
 
+        # R6: Assert self-decline of an offered entry emits no booking_cancelled event
+        cancelled_events = (
+            (
+                await session.execute(
+                    select(Outbox).where(
+                        Outbox.aggregate_id == booking_offered.id,
+                        Outbox.event_type == "booking_cancelled",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(cancelled_events) == 0
+
+        # The promoted waiter received their waitlist_offered event
+        promoted_events = (
+            (
+                await session.execute(
+                    select(Outbox).where(
+                        Outbox.aggregate_id == next_row.offered_booking_id,
+                        Outbox.event_type == "waitlist_offered",
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(promoted_events) == 1
+
 
 @pytest.mark.asyncio
 async def test_withdraw_waiting_entry_changes_only_entry() -> None:
@@ -579,3 +609,66 @@ async def test_withdraw_waiting_entry_changes_only_entry() -> None:
         # Verify no new outbox events created
         events_after = (await session.execute(select(Outbox))).scalars().all()
         assert len(events_after) == len(events_before)
+
+
+@pytest.mark.asyncio
+async def test_cancelling_confirmed_booking_does_not_rewrite_accepted_entry() -> None:
+    """Cancelling a confirmed booking through E12 does not rewrite an accepted waitlist
+
+    entry (R1).
+    """
+    resource = await create_resource()
+    user = await create_user()
+    s, e = aligned_slot(days=11)
+    now = datetime.now(timezone.utc)
+
+    # 1. User is offered and accepts the booking
+    entry, booking = await create_offered_pair(
+        resource=resource,
+        user=user,
+        starts_at=s,
+        ends_at=e,
+        expires_at=now + timedelta(minutes=15),
+    )
+
+    async with make_client() as client:
+        r_accept = await client.post(
+            f"/api/v1/waitlist/{entry.id}/accept",
+            json={},
+            headers={**auth(user), "If-Match": '"1"'},
+        )
+        assert r_accept.status_code == 200
+        assert r_accept.json()["status"] == "confirmed"
+        assert r_accept.json()["version"] == 2
+
+        # 2. Cancel the now-confirmed reservation via E12
+        r_cancel = await client.post(
+            f"/api/v1/bookings/{booking.id}/cancel",
+            json={"reason": "cancelling confirmed reservation"},
+            headers={**auth(user), "If-Match": '"2"'},
+        )
+        assert r_cancel.status_code == 200
+        assert r_cancel.json()["status"] == "cancelled"
+        assert r_cancel.json()["version"] == 3
+
+    # 3. Assert the waitlist entry remains 'accepted' with its version unchanged at 2
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        stored_entry = (
+            await session.execute(select(WaitlistEntry).where(WaitlistEntry.id == entry.id))
+        ).scalar_one()
+        assert stored_entry.status == "accepted"
+        assert stored_entry.version == 2
+        assert stored_entry.offered_booking_id == booking.id
+
+        # Assert no other waitlist entries were modified or created
+        all_entries = (
+            (
+                await session.execute(
+                    select(WaitlistEntry).where(WaitlistEntry.resource_id == resource.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(all_entries) == 1

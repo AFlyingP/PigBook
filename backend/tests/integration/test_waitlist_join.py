@@ -15,6 +15,7 @@ from sqlalchemy.dialects.postgresql import Range
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
 
+from app.auth.dependencies import AuthorizedScope, Policy
 from app.auth.models import User
 from app.auth.passwords import hash_password
 from app.bookings.models import Booking
@@ -23,6 +24,7 @@ from app.db.session import get_sessionmaker
 from app.main import app
 from app.resources.models import Resource
 from app.waitlist.models import WaitlistEntry
+from app.waitlist.service import _list_own_waitlist, accept_offer, decline_entry
 
 get_settings.cache_clear()
 
@@ -542,3 +544,62 @@ async def test_waitlist_capacity_cap_500() -> None:
         )
         assert r_full.status_code == 409, r_full.text
         assert r_full.json()["error"]["code"] == "WAITLIST_FULL"
+
+
+@pytest.mark.asyncio
+async def test_owner_scoped_waitlist_operations_fail_closed_without_predicates() -> None:
+    """Owner-scoped waitlist operations fail closed when scope carries no predicates (R2)."""
+    resource = await create_resource()
+    user = await create_user()
+    s, e = aligned_slot(days=20)
+    now = datetime.now(timezone.utc)
+
+    entry = WaitlistEntry(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        resource_id=resource.id,
+        time_range=Range(s, e, bounds="[)"),
+        status="waiting",
+        version=1,
+        created_at=now,
+        updated_at=now,
+    )
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        async with session.begin():
+            session.add(entry)
+
+    empty_scope = AuthorizedScope(
+        principal_id=user.id,
+        policy=Policy.own_waitlist,
+        object_id=entry.id,
+        resource_id=resource.id,
+        expected_version=1,
+    )
+
+    async with sessionmaker() as session:
+        # _list_own_waitlist must fail closed
+        with pytest.raises(RuntimeError, match="requires dependency-supplied predicate"):
+            await _list_own_waitlist(session, scope=empty_scope)
+
+        # decline_entry must fail closed
+        async with session.begin():
+            with pytest.raises(RuntimeError, match="requires dependency-supplied predicate"):
+                await decline_entry(
+                    session,
+                    scope=empty_scope,
+                    entry_id=entry.id,
+                    expected_version=1,
+                    now=now,
+                )
+
+        # accept_offer must fail closed
+        async with session.begin():
+            with pytest.raises(RuntimeError, match="requires dependency-supplied predicate"):
+                await accept_offer(
+                    session,
+                    scope=empty_scope,
+                    entry_id=entry.id,
+                    expected_version=1,
+                    now=now,
+                )
