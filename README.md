@@ -91,10 +91,13 @@ Fresh verification of source `96365746d7cee5b2cd4f06795e005f729fffa8c0` ran on l
 
 ### Standalone Disposable Race Lab Verification
 
-- **Verification Commands**:
-  - `python scripts/verify.py race-lab --fresh`: Standalone demonstration gate executing before/after concurrency checks in an ephemeral PostgreSQL database namespace.
-  - `python scripts/verify.py ticket --ticket T-012 --fresh`: Dedicated safety, authorization, and isolation test suite.
-- **Results**: Measured race-lab results are not yet recorded for this commit.
+Fresh verification of implementation source `8d46afaed5c3c211350ead66f29986264c7a5825` ran on local Windows 11 with Docker PostgreSQL 16.15 (subsequent documentation-only bytes were not lab rerun inputs):
+
+- **Command**: `python scripts/verify.py race-lab --fresh`
+- **Before Phase (Unprotected check-then-insert)**: Concurrency vulnerability reproduced on `race_lab.bookings_unprotected` (2 overlapping rows committed under application preflight checks; 1 overlapping pair detected).
+- **After Phase (Protected with GiST exclusion constraint)**: Mutual exclusion deterministically enforced by PostgreSQL GiST exclusion constraint `bookings_no_overlap` on `race_lab.bookings_protected` (Writer 1 committed, Writer 2 rejected with SQLSTATE `23P01`; exactly 1 active booking committed).
+- **Cleanup**: Ephemeral database namespace (`commonsbook_racelab_gate_8df458e5d718`) dropped and verified nonexistent via `pg_database` query; zero residual containers or networks.
+- **Ticket Gate**: `python scripts/verify.py ticket --ticket T-012 --fresh` passed (86 passed: 56 safety/authorization/isolation tests, 30 runner verification tests).
 
 ## Known Limitations
 

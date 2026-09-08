@@ -1,6 +1,6 @@
 # Disposable PostgreSQL Race Lab
 
-This document describes the design, strict safety contracts, execution workflow, and verification architecture of the Disposable PostgreSQL Race Lab (`scripts/race_demo.py`).
+This document describes the design, strict safety contracts, execution workflow, and authentic verification results of the Disposable PostgreSQL Race Lab (`scripts/race_demo.py`).
 
 ---
 
@@ -125,14 +125,35 @@ python scripts/verify.py ticket --ticket T-012 --fresh
 
 ## 5. Verification Results
 
-Reproducible verification commands:
+Reproducible verification command:
 
 ```bash
-# Execute the race-lab verification gate in an ephemeral Docker PostgreSQL container
 python scripts/verify.py race-lab --fresh
+```
 
-# Execute the dedicated ticket T-012 safety test suite
+Compact verification result for implementation source `8d46afaed5c3c211350ead66f29986264c7a5825` (local Windows 11, Docker PostgreSQL 16.15; subsequent documentation-only bytes were not lab rerun inputs):
+
+- **Target Database**: Ephemeral disposable database (`commonsbook_racelab_gate_8df458e5d718`, loopback host `127.0.0.1`).
+- **Before Phase (Unprotected check-then-insert)**:
+  - Table: `race_lab.bookings_unprotected`
+  - Outcome: Concurrency vulnerability reproduced. Both concurrent transactions observed 0 overlaps and committed successfully, persisting 2 overlapping active reservations (1 overlapping pair detected).
+- **After Phase (Protected with GiST exclusion constraint)**:
+  - Table: `race_lab.bookings_protected`
+  - Constraint: `bookings_no_overlap`
+  - Outcome: Mutual exclusion invariant enforced. Writer 1 committed, Writer 2 was rejected by PostgreSQL with SQLSTATE `23P01` (`ExclusionViolationError`) naming constraint `bookings_no_overlap`. Exactly 1 active booking committed.
+- **Cleanup**:
+  - Ephemeral database dropped and confirmed nonexistent via `pg_database` query.
+  - Zero residual Docker containers or compose project resources.
+- **Evidence Integrity**:
+  - Evidence directory: `evidence/20260908T024205Z_34bd94c44d39`
+  - Input fingerprint: `bc8ae85a5f85aaf492b3fb367c29637e9d9e5536ea64315309400b02490d08bd`
+  - Secrets and raw approval tokens are redacted; approval record stores `token_sha256` (`185ac7a26921b6b63f1bb7387688a5e4b96b3b1fabd7a87b27e3be8f0af91470`).
+
+Safety gate verification:
+
+```bash
 python scripts/verify.py ticket --ticket T-012 --fresh
 ```
 
-Measured race-lab results are not yet recorded for this commit. Authentic results will be documented following clean verification execution against the recorded implementation commit.
+- **Evidence Integrity**: Evidence directory `evidence/20260908T024214Z_bc987ad1474d` (input fingerprint `06eb3a17c201730219ea175c9a27a0127bcceb75f12daf78356e7329af2a1baf`).
+- **Test Results**: 86 passed (56 safety/authorization/isolation integration tests, 30 runner verification unit tests). All safety refusal contracts (unauthorized hosts, non-disposable database names, missing/malformed approval tokens, missing cleanup actions), isolation guarantees, and invariant checks pass.
