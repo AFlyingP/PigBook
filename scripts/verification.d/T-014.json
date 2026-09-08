@@ -1,0 +1,14 @@
+{
+  "ticket_id": "T-014",
+  "pytest_paths": [
+    "backend/tests/integration/test_waitlist_join.py",
+    "backend/tests/integration/test_promotion.py",
+    "backend/tests/integration/test_offer_actions.py",
+    "backend/tests/integration/test_permissions.py",
+    "backend/tests/integration/test_auth.py",
+    "backend/tests/integration/test_own_bookings.py"
+  ],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}

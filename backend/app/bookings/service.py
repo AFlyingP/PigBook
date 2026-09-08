@@ -13,6 +13,7 @@ from app.bookings.schemas import BookingStatusFilter
 from app.notifications.outbox import append_event
 from app.resources.models import Resource
 from app.resources.schemas import Page
+from app.waitlist.models import WaitlistEntry
 
 
 class NotFoundError(Exception):
@@ -180,8 +181,14 @@ async def _list_own_bookings(
 
     Blackouts are never reachable here: they carry no owner and are excluded by kind.
     """
+    booking_predicates = scope.predicates.get("booking")
+    if not booking_predicates:
+        raise RuntimeError("Owner-scoped booking operation requires dependency-supplied predicate")
+    if not isinstance(booking_predicates, (list, tuple)):
+        booking_predicates = (booking_predicates,)
+
     conditions = [
-        Booking.user_id == scope.principal_id,
+        *booking_predicates,
         Booking.kind == "reservation",
     ]
     if status is not None:
@@ -213,10 +220,16 @@ async def _get_own_booking(
     scope: AuthorizedScope,
 ) -> BookingSchema:
     """Read the reservation already resolved as owned by the scope principal."""
+    booking_predicates = scope.predicates.get("booking")
+    if not booking_predicates:
+        raise RuntimeError("Owner-scoped booking operation requires dependency-supplied predicate")
+    if not isinstance(booking_predicates, (list, tuple)):
+        booking_predicates = (booking_predicates,)
+
     stmt = select(Booking).where(
         Booking.id == scope.object_id,
         Booking.kind == "reservation",
-        Booking.user_id == scope.principal_id,
+        *booking_predicates,
     )
     booking = (await session.execute(stmt)).scalar_one_or_none()
     if booking is None:
@@ -250,12 +263,18 @@ async def cancel_booking(
     lock_stmt = select(Resource.id).where(Resource.id == scope.resource_id).with_for_update()
     await session.execute(lock_stmt)
 
+    booking_predicates = scope.predicates.get("booking")
+    if not booking_predicates:
+        raise RuntimeError("Owner-scoped booking operation requires dependency-supplied predicate")
+    if not isinstance(booking_predicates, (list, tuple)):
+        booking_predicates = (booking_predicates,)
+
     booking_stmt = (
         select(Booking)
         .where(
             Booking.id == booking_id,
             Booking.kind == "reservation",
-            Booking.user_id == scope.principal_id,
+            *booking_predicates,
         )
         .with_for_update()
     )
@@ -296,11 +315,29 @@ async def cancel_booking(
     # The row is held FOR UPDATE and its version was verified above, so the conditional
     # WHERE always matches here; it is kept because it is the correct optimistic-
     # concurrency idiom and it keeps the update safe if the guard above ever moves.
-    await session.execute(update_stmt)
+    res_b = await session.execute(update_stmt)
+    if getattr(res_b, "rowcount", None) != 1:
+        raise RuntimeError(f"Booking {booking_id} version invariant violation")
 
     # Re-read the row the update just wrote, so the response and the outbox payload carry
     # the persisted values rather than the stale identity-map copy.
     await session.refresh(booking)
+
+    # Update linked offered entry if any (Spec 5.3)
+    entry_stmt = (
+        update(WaitlistEntry)
+        .where(
+            WaitlistEntry.offered_booking_id == booking_id,
+            WaitlistEntry.status == "offered",
+        )
+        .values(
+            status="cancelled",
+            version=WaitlistEntry.version + 1,
+            updated_at=db_now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await session.execute(entry_stmt)
 
     await append_event(
         session,
@@ -308,5 +345,9 @@ async def cancel_booking(
         booking=booking,
         now=db_now,
     )
+
+    from app.waitlist.service import promote_waiters
+
+    await promote_waiters(session, scope.resource_id, db_now)
 
     return BookingSchema.model_validate(booking)

@@ -12,6 +12,8 @@ from sqlalchemy import select
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
 
+from sqlalchemy.dialects.postgresql import Range
+
 from app.auth.dependencies import Policy, policy_registry
 from app.auth.models import RefreshToken, User
 from app.auth.passwords import hash_password
@@ -20,6 +22,7 @@ from app.config import get_settings
 from app.db.session import get_sessionmaker
 from app.main import app
 from app.resources.models import Resource
+from app.waitlist.models import WaitlistEntry
 
 get_settings.cache_clear()
 
@@ -125,6 +128,10 @@ def test_policy_metadata_coverage() -> None:
         "E10",
         "E11",
         "E12",
+        "E13",
+        "E14",
+        "E15",
+        "E16",
         "E29",
         "E35",
     }
@@ -140,6 +147,10 @@ def test_policy_metadata_coverage() -> None:
     assert policy_registry["E10"] == Policy.own_booking
     assert policy_registry["E11"] == Policy.own_booking
     assert policy_registry["E12"] == Policy.own_booking
+    assert policy_registry["E13"] == Policy.authenticated
+    assert policy_registry["E14"] == Policy.own_waitlist
+    assert policy_registry["E15"] == Policy.own_waitlist
+    assert policy_registry["E16"] == Policy.own_waitlist
     assert policy_registry["E29"] == Policy.admin
     assert policy_registry["E35"] == Policy.public
 
@@ -677,6 +688,280 @@ async def test_permission_matrix() -> None:
         assert r_e12_adm_own.status_code == 200
         assert r_e12_adm_own.json()["status"] == "cancelled"
         assert r_e12_adm_own.json()["user_id"] == str(admin_user.id)
+
+        # 15. E13: POST /api/v1/waitlist (Policy.authenticated)
+        # Member/Admin allowed (201); Anonymous denied (401 AUTH_REQUIRED);
+        # Disabled denied (401 INVALID_TOKEN).
+        e13_res = Resource(
+            id=uuid.uuid4(),
+            name=f"E13Resource_{uuid.uuid4().hex[:6]}",
+            description="For E13 permissions matrix",
+            location="Room 104",
+            active=True,
+            version=1,
+        )
+        dummy_creator = await create_user()
+        e13_slot_start = (slot_base + timedelta(hours=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        e13_slot_end = (slot_base + timedelta(hours=11)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        active_b = Booking(
+            id=uuid.uuid4(),
+            resource_id=e13_res.id,
+            user_id=dummy_creator.id,
+            created_by=dummy_creator.id,
+            kind="reservation",
+            time_range=Range(
+                slot_base + timedelta(hours=10),
+                slot_base + timedelta(hours=11),
+                bounds="[)",
+            ),
+            status="confirmed",
+            version=1,
+        )
+        async with sessionmaker() as session:
+            async with session.begin():
+                session.add(e13_res)
+                await session.flush()
+                session.add(active_b)
+
+        wait_create_body = {
+            "resource_id": str(e13_res.id),
+            "starts_at": e13_slot_start,
+            "ends_at": e13_slot_end,
+        }
+
+        # Anon -> 401
+        r_e13_anon = await client.post("/api/v1/waitlist", json=wait_create_body)
+        assert r_e13_anon.status_code == 401
+        assert r_e13_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        # Disabled -> 401
+        r_e13_dis = await client.post(
+            "/api/v1/waitlist",
+            json=wait_create_body,
+            headers={"Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e13_dis.status_code == 401
+        assert r_e13_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        # Member -> 201
+        r_e13_mem = await client.post(
+            "/api/v1/waitlist",
+            json=wait_create_body,
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e13_mem.status_code == 201
+        assert r_e13_mem.json()["user_id"] == str(member_user.id)
+        member_waitlist_id = r_e13_mem.json()["id"]
+
+        # Admin -> 201
+        r_e13_adm = await client.post(
+            "/api/v1/waitlist",
+            json=wait_create_body,
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e13_adm.status_code == 201
+        assert r_e13_adm.json()["user_id"] == str(admin_user.id)
+        admin_waitlist_id = r_e13_adm.json()["id"]
+
+        # 16. E14: GET /api/v1/waitlist (Policy.own_waitlist)
+        # Member and Admin each see only their own entries;
+        # Anonymous denied (401 AUTH_REQUIRED); Disabled denied (401 INVALID_TOKEN)
+        r_e14_anon = await client.get("/api/v1/waitlist?limit=100&offset=0")
+        assert r_e14_anon.status_code == 401
+        assert r_e14_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        r_e14_dis = await client.get(
+            "/api/v1/waitlist?limit=100&offset=0",
+            headers={"Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e14_dis.status_code == 401
+        assert r_e14_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        r_e14_mem = await client.get(
+            "/api/v1/waitlist?limit=100&offset=0",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e14_mem.status_code == 200
+        mem_wl_items = [x["id"] for x in r_e14_mem.json()["items"]]
+        assert member_waitlist_id in mem_wl_items
+        assert admin_waitlist_id not in mem_wl_items
+
+        r_e14_adm = await client.get(
+            "/api/v1/waitlist?limit=100&offset=0",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e14_adm.status_code == 200
+        adm_wl_items = [x["id"] for x in r_e14_adm.json()["items"]]
+        assert admin_waitlist_id in adm_wl_items
+        assert member_waitlist_id not in adm_wl_items
+
+        # 17. E15: DELETE /api/v1/waitlist/{id} (Policy.own_waitlist)
+        # Foreign entry returns 404 for member and admin alike; owner succeeds with 200.
+        r_e15_anon = await client.delete(
+            f"/api/v1/waitlist/{member_waitlist_id}",
+            headers=current_if_match,
+        )
+        assert r_e15_anon.status_code == 401
+        assert r_e15_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        r_e15_dis = await client.delete(
+            f"/api/v1/waitlist/{member_waitlist_id}",
+            headers={**current_if_match, "Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e15_dis.status_code == 401
+        assert r_e15_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        r_e15_mem_other = await client.delete(
+            f"/api/v1/waitlist/{admin_waitlist_id}",
+            headers={**current_if_match, "Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e15_mem_other.status_code == 404
+        assert r_e15_mem_other.json()["error"]["code"] == "NOT_FOUND"
+
+        r_e15_adm_other = await client.delete(
+            f"/api/v1/waitlist/{member_waitlist_id}",
+            headers={**current_if_match, "Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e15_adm_other.status_code == 404
+        assert r_e15_adm_other.json()["error"]["code"] == "NOT_FOUND"
+
+        r_e15_mem_own = await client.delete(
+            f"/api/v1/waitlist/{member_waitlist_id}",
+            headers={**current_if_match, "Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e15_mem_own.status_code == 200
+        assert r_e15_mem_own.json()["status"] == "cancelled"
+        assert r_e15_mem_own.json()["version"] == 2
+
+        r_e15_adm_own = await client.delete(
+            f"/api/v1/waitlist/{admin_waitlist_id}",
+            headers={**current_if_match, "Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e15_adm_own.status_code == 200
+        assert r_e15_adm_own.json()["status"] == "cancelled"
+
+        # 18. E16: POST /api/v1/waitlist/{id}/accept (Policy.own_waitlist)
+        # Create offered entries for member and admin
+        now = datetime.now(timezone.utc)
+        mem_offered_b = Booking(
+            id=uuid.uuid4(),
+            resource_id=e13_res.id,
+            user_id=member_user.id,
+            created_by=member_user.id,
+            kind="reservation",
+            time_range=Range(
+                slot_base + timedelta(hours=14),
+                slot_base + timedelta(hours=15),
+                bounds="[)",
+            ),
+            status="offered",
+            expires_at=now + timedelta(minutes=15),
+            version=1,
+        )
+        mem_offered_entry = WaitlistEntry(
+            id=uuid.uuid4(),
+            user_id=member_user.id,
+            resource_id=e13_res.id,
+            time_range=Range(
+                slot_base + timedelta(hours=14),
+                slot_base + timedelta(hours=15),
+                bounds="[)",
+            ),
+            status="offered",
+            offered_booking_id=mem_offered_b.id,
+            version=1,
+        )
+
+        adm_offered_b = Booking(
+            id=uuid.uuid4(),
+            resource_id=e13_res.id,
+            user_id=admin_user.id,
+            created_by=admin_user.id,
+            kind="reservation",
+            time_range=Range(
+                slot_base + timedelta(hours=16),
+                slot_base + timedelta(hours=17),
+                bounds="[)",
+            ),
+            status="offered",
+            expires_at=now + timedelta(minutes=15),
+            version=1,
+        )
+        adm_offered_entry = WaitlistEntry(
+            id=uuid.uuid4(),
+            user_id=admin_user.id,
+            resource_id=e13_res.id,
+            time_range=Range(
+                slot_base + timedelta(hours=16),
+                slot_base + timedelta(hours=17),
+                bounds="[)",
+            ),
+            status="offered",
+            offered_booking_id=adm_offered_b.id,
+            version=1,
+        )
+
+        async with sessionmaker() as session:
+            async with session.begin():
+                session.add(mem_offered_b)
+                session.add(adm_offered_b)
+                await session.flush()
+                session.add(mem_offered_entry)
+                session.add(adm_offered_entry)
+
+        # Anon -> 401
+        r_e16_anon = await client.post(
+            f"/api/v1/waitlist/{mem_offered_entry.id}/accept",
+            json={},
+            headers=current_if_match,
+        )
+        assert r_e16_anon.status_code == 401
+        assert r_e16_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        # Disabled -> 401
+        r_e16_dis = await client.post(
+            f"/api/v1/waitlist/{mem_offered_entry.id}/accept",
+            json={},
+            headers={**current_if_match, "Authorization": f"Bearer {disabled_token}"},
+        )
+        assert r_e16_dis.status_code == 401
+        assert r_e16_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        # Member other -> 404
+        r_e16_mem_other = await client.post(
+            f"/api/v1/waitlist/{adm_offered_entry.id}/accept",
+            json={},
+            headers={**current_if_match, "Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e16_mem_other.status_code == 404
+        assert r_e16_mem_other.json()["error"]["code"] == "NOT_FOUND"
+
+        # Admin other -> 404
+        r_e16_adm_other = await client.post(
+            f"/api/v1/waitlist/{mem_offered_entry.id}/accept",
+            json={},
+            headers={**current_if_match, "Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e16_adm_other.status_code == 404
+        assert r_e16_adm_other.json()["error"]["code"] == "NOT_FOUND"
+
+        # Member own -> 200
+        r_e16_mem_own = await client.post(
+            f"/api/v1/waitlist/{mem_offered_entry.id}/accept",
+            json={},
+            headers={**current_if_match, "Authorization": f"Bearer {member_token}"},
+        )
+        assert r_e16_mem_own.status_code == 200
+        assert r_e16_mem_own.json()["status"] == "confirmed"
+
+        # Admin own -> 200
+        r_e16_adm_own = await client.post(
+            f"/api/v1/waitlist/{adm_offered_entry.id}/accept",
+            json={},
+            headers={**current_if_match, "Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_e16_adm_own.status_code == 200
+        assert r_e16_adm_own.json()["status"] == "confirmed"
 
 
 @pytest.mark.asyncio

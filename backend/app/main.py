@@ -32,6 +32,7 @@ from app.bookings.idempotency import (
 from app.bookings.router import router as bookings_router
 from app.bookings.service import (
     InvalidState,
+    ResourceInactive,
     TooLate,
     VersionMismatch,
 )
@@ -44,6 +45,13 @@ from app.bookings.service import (
 from app.config import get_settings
 from app.resources.router import router as resources_router
 from app.resources.service import InvalidWindowError, NotFoundError
+from app.waitlist.router import router as waitlist_router
+from app.waitlist.service import (
+    AlreadyBooked,
+    AlreadyWaitlisted,
+    SlotAvailable,
+    WaitlistFull,
+)
 
 
 def make_error_response(
@@ -291,6 +299,46 @@ def create_app() -> FastAPI:
             message=exc.message,
         )
 
+    @app.exception_handler(ResourceInactive)
+    async def resource_inactive_handler(_request: Request, exc: ResourceInactive) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="RESOURCE_INACTIVE",
+            message=exc.message,
+        )
+
+    @app.exception_handler(SlotAvailable)
+    async def slot_available_handler(_request: Request, exc: SlotAvailable) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="SLOT_AVAILABLE",
+            message=exc.message,
+        )
+
+    @app.exception_handler(AlreadyWaitlisted)
+    async def already_waitlisted_handler(_request: Request, exc: AlreadyWaitlisted) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="ALREADY_WAITLISTED",
+            message=exc.message,
+        )
+
+    @app.exception_handler(AlreadyBooked)
+    async def already_booked_handler(_request: Request, exc: AlreadyBooked) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="ALREADY_BOOKED",
+            message=exc.message,
+        )
+
+    @app.exception_handler(WaitlistFull)
+    async def waitlist_full_handler(_request: Request, exc: WaitlistFull) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="WAITLIST_FULL",
+            message=exc.message,
+        )
+
     @app.exception_handler(IdempotencyKeyRequired)
     async def idempotency_key_required_handler(
         _request: Request, exc: IdempotencyKeyRequired
@@ -398,6 +446,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_router, prefix="/api/v1")
     app.include_router(resources_router, prefix="/api/v1")
     app.include_router(bookings_router, prefix="/api/v1")
+    app.include_router(waitlist_router, prefix="/api/v1")
 
     return app
 

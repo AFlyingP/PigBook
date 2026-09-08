@@ -355,8 +355,9 @@ before deciding what to do.
 
 - `confirmed` or `offered` becomes `cancelled`: `expires_at` is cleared, the request's
   `reason` is stored as `cancellation_reason`, the version increments by exactly one, and a
-  single `booking_cancelled` event is appended in the same transaction as the update. The
-  released interval is bookable again as soon as that transaction commits.
+  single `booking_cancelled` event is appended in the same transaction as the update. Eligible
+  waitlist offers are created in the same transaction before any remaining released capacity
+  becomes visible to a fresh create.
 - **HTTP 409 `TOO_LATE`** once the booking has started. The comparison uses the database
   clock, not the application's clock, and the boundary is strict: cancelling is allowed up
   to, but not at, `starts_at`. The clock is sampled after the resource and booking rows
@@ -386,13 +387,17 @@ Successful responses carry the new version as an `ETag` header.
 
 The cancellation locks the resource row `FOR UPDATE` before re-reading the booking, which
 is the same order every inventory-releasing operation uses, and the update itself is
-conditional on the expected version. Two simultaneous cancellations of one booking at the
-same starting version therefore produce exactly one `200` and one `412`, one cancelled row
-at the next version, and exactly one `booking_cancelled` event. If the transaction fails at
-any point, the status change, the version increment and the event roll back together.
+conditional on the expected version. Holding the resource row `FOR UPDATE` ensures that
+cancellation and subsequent waitlist promotion commit atomically, creating holds for eligible
+waiters before competing fresh creates can take the released capacity. Two simultaneous
+cancellations of one booking at the same starting version therefore produce exactly one `200`
+and one `412`, one cancelled row at the next version, and exactly one `booking_cancelled`
+event. If the transaction fails at any point, the status change, the version increment, waitlist
+promotions, and the event roll back together.
 
 ### Limitations
 
 There is no reschedule operation: cancel the booking and create a new one. Cancelling a
 booking that has already started is not possible through this route. Waitlist promotion on
-release is not part of these endpoints.
+release is executed atomically within the cancellation transaction before commit; see
+`docs/waitlist.md` for queue fairness, keyset scanning, and offer acceptance.

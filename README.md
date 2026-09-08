@@ -101,6 +101,5 @@ Fresh verification of implementation source `8d46afaed5c3c211350ead66f29986264c7
 
 ## Known Limitations
 
-- Waitlist admission and queue promotion workflows are not yet implemented.
 - Background outbox worker daemon for asynchronous email delivery is not yet wired.
 - Administrative management endpoints (resource creation, user modification, blackout scheduling) are not yet exposed.

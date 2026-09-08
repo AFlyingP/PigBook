@@ -38,7 +38,9 @@ Available policies:
 - `public`: Accessible without authentication.
 - `authenticated`: Requires an enabled user with member or admin role.
 - `admin`: Requires an enabled user with admin role.
-- `own_booking`, `own_waitlist`, `metrics`: Reserved for domain resource policies.
+- `own_booking`: Owner-scoped policy for reservation access and cancellation.
+- `own_waitlist`: Owner-scoped policy for waitlist entries, withdrawal, and offer acceptance.
+- `metrics`: Reserved for domain resource policies (no route registered yet).
 
 ### Non-Trust of Token Claims
 The `role` claim inside the JWT access token is not trusted for authorization decisions. On every request to an authenticated route:
