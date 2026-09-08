@@ -1,55 +1,31 @@
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import Range
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.dependencies import AuthorizedScope, AuthRequiredError, Policy, authorize
-from app.auth.rate_limit import (
-    RateLimitBucket,
-    consume_rate_limits,
-    hash_identity,
-)
+from app.auth.rate_limit import check_mutation_rate_limit
 from app.bookings.idempotency import _parse_idempotency_key, execute_create
 from app.bookings.schemas import Booking as BookingSchema
-from app.bookings.schemas import BookingCreate, StoredResponse
+from app.bookings.schemas import BookingCreate, BookingStatusFilter, Cancel, StoredResponse
 from app.bookings.service import (
     ResourceInactive,
     SlotConflict,
+    _get_own_booking,
+    _list_own_bookings,
+    cancel_booking,
     insert_confirmed,
     validate_booking_window,
 )
-from app.config import get_settings
-from app.db.session import transaction_dependency
+from app.db.session import get_session, transaction_dependency
 from app.notifications.outbox import append_event
+from app.resources.schemas import Page
 
 router = APIRouter()
-
-
-async def _check_mutation_rate_limit(user_id: uuid.UUID, now: datetime) -> None:
-    """Consume rate limits for authenticated mutations: 120/user/min (1000 in race profile)."""
-    settings = get_settings()
-    limit = 1000 if settings.TEST_PROFILE == "race" else 120
-
-    user_hash = hash_identity(str(user_id))
-    timestamp = int(now.timestamp())
-    window_seconds = 60
-    start_epoch = timestamp - (timestamp % window_seconds)
-    window_start = datetime.fromtimestamp(start_epoch, tz=timezone.utc)
-
-    buckets = [
-        RateLimitBucket(
-            scope="mutation:user",
-            identity_hash=user_hash,
-            window_start=window_start,
-            limit=limit,
-            window_seconds=60,
-        )
-    ]
-    await consume_rate_limits(buckets)
 
 
 @router.post("/bookings", status_code=201)
@@ -69,7 +45,7 @@ async def create_booking_endpoint(
     now = datetime.now(timezone.utc)
 
     # 2. Consume rate limits in its own short independent transaction BEFORE domain transaction
-    await _check_mutation_rate_limit(scope.principal_id, now=now)
+    await check_mutation_rate_limit(scope.principal_id, now)
 
     # 3. Revalidate user and acquire FOR SHARE lock inside domain session (Spec 3.4, 5.1)
     if scope.assert_current is not None:
@@ -153,4 +129,89 @@ async def create_booking_endpoint(
         status_code=stored.status,
         content=stored.body,
         headers=stored.headers,
+    )
+
+
+@router.get("/bookings", response_model=Page[BookingSchema])
+async def list_bookings_endpoint(
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    status: BookingStatusFilter | None = Query(default=None),
+    scope: AuthorizedScope = Depends(authorize(Policy.own_booking)),
+    session: AsyncSession = Depends(get_session),
+) -> Page[BookingSchema]:
+    """List the caller's own reservations, ordered by created_at descending then id.
+
+    The read budget for this route is consumed by the authorization dependency.
+    """
+    if scope.principal_id is None:
+        raise AuthRequiredError("Authentication required")
+
+    return await _list_own_bookings(
+        session,
+        scope=scope,
+        limit=limit,
+        offset=offset,
+        status=status,
+    )
+
+
+@router.get("/bookings/{id}", response_model=BookingSchema)
+async def get_booking_endpoint(
+    id: uuid.UUID,
+    response: Response,
+    scope: AuthorizedScope = Depends(authorize(Policy.own_booking)),
+    session: AsyncSession = Depends(get_session),
+) -> BookingSchema:
+    """Retrieve one of the caller's own reservations, emitting its version as an ETag.
+
+    The read budget for this route is consumed by the authorization dependency.
+    """
+    if scope.principal_id is None:
+        raise AuthRequiredError("Authentication required")
+
+    booking = await _get_own_booking(session, scope=scope)
+    response.headers["ETag"] = f'"{booking.version}"'
+    return booking
+
+
+@router.post("/bookings/{id}/cancel", response_model=None)
+async def cancel_booking_endpoint(
+    id: uuid.UUID,
+    body: Cancel,
+    scope: AuthorizedScope = Depends(authorize(Policy.own_booking)),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
+) -> Response:
+    """Cancel one of the caller's own reservations at the version pinned by If-Match.
+
+    The mutation budget for this route is consumed by the authorization dependency, in
+    its own transaction, before ownership is resolved.
+    """
+    if scope.principal_id is None:
+        raise AuthRequiredError("Authentication required")
+    if scope.object_id is None or scope.expected_version is None:
+        # The dependency always resolves both for a POST carrying a path id, so this is a
+        # server-side invariant failure rather than anything the caller can correct.
+        raise RuntimeError("own_booking scope for a cancel is missing its object identity")
+
+    now = datetime.now(timezone.utc)
+
+    # In-transaction policy revalidation locks the acting user FOR SHARE before the
+    # resource and booking rows (Spec 5.1 lock order).
+    if scope.assert_current is not None:
+        await scope.assert_current(session)
+
+    booking = await cancel_booking(
+        session,
+        scope=scope,
+        booking_id=scope.object_id,
+        expected_version=scope.expected_version,
+        reason=body.reason,
+        now=now,
+    )
+
+    return JSONResponse(
+        status_code=200,
+        content=booking.model_dump(mode="json"),
+        headers={"ETag": f'"{booking.version}"'},
     )

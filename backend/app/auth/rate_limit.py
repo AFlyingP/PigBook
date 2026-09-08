@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -107,6 +108,68 @@ async def consume_rate_limits(buckets: list[RateLimitBucket]) -> None:
 
     if max_retry_after is not None:
         raise RateLimitExceeded(retry_after=max_retry_after)
+
+
+def window_start_for(now: datetime, window_seconds: int = 60) -> datetime:
+    """Return the start of the fixed window containing `now`."""
+    timestamp = int(now.timestamp())
+    start_epoch = timestamp - (timestamp % window_seconds)
+    return datetime.fromtimestamp(start_epoch, tz=timezone.utc)
+
+
+async def consume_user_bucket(
+    user_id: uuid.UUID,
+    *,
+    bucket_scope: str,
+    limit: int,
+    now: datetime,
+) -> None:
+    """Consume one per-user fixed-window bucket in its own short transaction.
+
+    This runs before the domain transaction opens, so no rate-limit row is held while
+    user, idempotency or inventory locks are taken.
+    """
+    window_seconds = 60
+    buckets = [
+        RateLimitBucket(
+            scope=bucket_scope,
+            identity_hash=hash_identity(str(user_id)),
+            window_start=window_start_for(now, window_seconds),
+            limit=limit,
+            window_seconds=window_seconds,
+        )
+    ]
+    await consume_rate_limits(buckets)
+
+
+def mutation_limit() -> int:
+    """Authenticated mutation ceiling: 120/user/min, raised to 1000 under the race profile."""
+    return 1000 if get_settings().TEST_PROFILE == "race" else 120
+
+
+def read_limit() -> int:
+    """Authenticated read ceiling: 600/user/min, raised to 1000 under the race profile."""
+    return 1000 if get_settings().TEST_PROFILE == "race" else 600
+
+
+async def check_mutation_rate_limit(user_id: uuid.UUID, now: datetime) -> None:
+    """Consume the authenticated-mutation bucket for one user."""
+    await consume_user_bucket(
+        user_id,
+        bucket_scope="mutation:user",
+        limit=mutation_limit(),
+        now=now,
+    )
+
+
+async def check_read_rate_limit(user_id: uuid.UUID, now: datetime) -> None:
+    """Consume the authenticated-read bucket for one user."""
+    await consume_user_bucket(
+        user_id,
+        bucket_scope="read:user",
+        limit=read_limit(),
+        now=now,
+    )
 
 
 async def check_login_rate_limit(
