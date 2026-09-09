@@ -264,7 +264,7 @@ async def cancel_booking(
     await session.execute(lock_stmt)
 
     booking_predicates = scope.predicates.get("booking")
-    if not booking_predicates:
+    if booking_predicates is None:
         raise RuntimeError("Owner-scoped booking operation requires dependency-supplied predicate")
     if not isinstance(booking_predicates, (list, tuple)):
         booking_predicates = (booking_predicates,)
@@ -297,8 +297,12 @@ async def cancel_booking(
     if booking.status not in ("confirmed", "offered"):
         raise InvalidState(f"A booking in state '{booking.status}' cannot be cancelled")
 
-    if db_now >= booking.time_range.lower:
-        raise TooLate("A booking can only be cancelled before it starts")
+    if scope.predicates.get("allow_running", False):
+        if db_now >= booking.time_range.upper:
+            raise TooLate("A completed booking cannot be cancelled")
+    else:
+        if db_now >= booking.time_range.lower:
+            raise TooLate("A booking can only be cancelled before it starts")
 
     update_stmt = (
         update(Booking)
@@ -345,6 +349,24 @@ async def cancel_booking(
         booking=booking,
         now=db_now,
     )
+
+    if scope.predicates.get("audit"):
+        from app.admin.audit import append_audit_log
+
+        req_id = scope.predicates.get("request_id") or uuid.uuid4()
+        await append_audit_log(
+            session,
+            action="admin.booking_cancel",
+            target_type="booking",
+            target_id=booking_id,
+            actor_id=scope.principal_id,
+            request_id=req_id,
+            details={
+                "resource_id": str(scope.resource_id),
+                "reason_length": len(reason),
+            },
+            now=db_now,
+        )
 
     from app.waitlist.service import promote_waiters
 

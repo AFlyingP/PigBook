@@ -160,6 +160,16 @@ policy_registry: dict[str, Policy] = {
     "E14": Policy.own_waitlist,
     "E15": Policy.own_waitlist,
     "E16": Policy.own_waitlist,
+    "E17": Policy.admin,
+    "E18": Policy.admin,
+    "E19": Policy.admin,
+    "E20": Policy.admin,
+    "E21": Policy.admin,
+    "E22": Policy.admin,
+    "E23": Policy.admin,
+    "E24": Policy.admin,
+    "E25": Policy.admin,
+    "E26": Policy.admin,
     "E29": Policy.admin,
     "E35": Policy.public,
 }
@@ -312,6 +322,119 @@ async def _resolve_own_waitlist_scope(
     )
 
 
+async def _resolve_admin_scope(
+    request: Request,
+    session: AsyncSession,
+    *,
+    principal_id: uuid.UUID,
+    assert_current: Callable[[AsyncSession], Awaitable[None]],
+) -> AuthorizedScope:
+    """Resolve the administrative scope for E17–E34 routes.
+
+    Extracts path IDs, looks up linked resource IDs without row locks where required,
+    parses If-Match for mutating endpoints, and carries authorization predicates.
+    """
+    request_time = datetime.now(timezone.utc)
+    req_method = request.scope.get("method", "GET")
+    if req_method == "GET":
+        await check_read_rate_limit(principal_id, request_time)
+    else:
+        await check_mutation_rate_limit(principal_id, request_time)
+
+    raw_id = (
+        request.path_params.get("id")
+        if hasattr(request, "path_params") and request.path_params
+        else None
+    )
+    path = request.scope.get("path", "")
+    object_id: uuid.UUID | None = None
+    resource_id: uuid.UUID | None = None
+    expected_version: int | None = None
+    predicates: dict[Any, Any] = {}
+
+    req_id: uuid.UUID | None = None
+    if hasattr(request.state, "request_id") and request.state.request_id:
+        try:
+            req_id = uuid.UUID(str(request.state.request_id))
+        except (ValueError, TypeError):
+            pass
+
+    if raw_id is not None:
+        try:
+            parsed_id = uuid.UUID(str(raw_id))
+        except (ValueError, TypeError):
+            raise RequestValidationError(
+                [
+                    {
+                        "type": "uuid_parsing",
+                        "loc": ("path", "id"),
+                        "msg": "Input should be a valid UUID",
+                    }
+                ]
+            ) from None
+
+        if "/admin/resources/" in path:
+            object_id = parsed_id
+            resource_id = parsed_id
+        elif "/admin/blackouts/" in path:
+            object_id = parsed_id
+            try:
+                stmt = select(Booking.id, Booking.resource_id).where(
+                    Booking.id == parsed_id,
+                    Booking.kind == "blackout",
+                )
+                row = (await session.execute(stmt)).one_or_none()
+            finally:
+                await session.rollback()
+            if row is None:
+                raise ObjectNotFoundError("Blackout not found")
+            resource_id = row.resource_id
+        elif "/admin/bookings/" in path:
+            object_id = parsed_id
+            try:
+                stmt = select(Booking.id, Booking.resource_id).where(
+                    Booking.id == parsed_id,
+                    Booking.kind == "reservation",
+                )
+                row = (await session.execute(stmt)).one_or_none()
+            finally:
+                await session.rollback()
+            if row is None:
+                raise ObjectNotFoundError("Booking not found")
+            resource_id = row.resource_id
+            predicates = {
+                "booking": (),
+                "allow_running": True,
+                "audit": True,
+                "request_id": req_id,
+            }
+
+    requires_if_match = (req_method in ("PATCH", "DELETE") and raw_id is not None) or (
+        req_method == "POST" and path.endswith("/cancel")
+    )
+    if requires_if_match:
+        expected_version = _parse_if_match(request.headers.get("If-Match"))
+
+    if path.rstrip("/").endswith("/admin/bookings"):
+        predicates = {
+            "booking": (),
+            "allow_running": True,
+        }
+
+    if "request_id" not in predicates and req_id is not None:
+        predicates["request_id"] = req_id
+
+    return AuthorizedScope(
+        principal_id=principal_id,
+        policy=Policy.admin,
+        object_id=object_id,
+        resource_id=resource_id,
+        expected_version=expected_version,
+        assert_current=assert_current,
+        predicates=predicates,
+    )
+
+
 def authorize(
     policy: Policy,
 ) -> Callable[[Request, AsyncSession], Coroutine[Any, Any, AuthorizedScope]]:
@@ -422,6 +545,14 @@ def authorize(
                     principal_id=db_id,
                     assert_current=_assert_current,
                 )
+
+        if policy == Policy.admin:
+            return await _resolve_admin_scope(
+                request,
+                session,
+                principal_id=db_id,
+                assert_current=_assert_current,
+            )
 
         return AuthorizedScope(
             principal_id=db_id,

@@ -1,0 +1,18 @@
+{
+    "document_checks":  [
+
+                        ],
+    "ticket_id":  "T-021",
+    "vitest_paths":  [
+
+                     ],
+    "playwright_paths":  [
+
+                         ],
+    "pytest_paths":  [
+                         "backend/tests/integration/test_admin_resources.py",
+                         "backend/tests/integration/test_permissions.py",
+                         "backend/tests/integration/test_blackouts.py",
+                         "backend/tests/integration/test_admin_bookings.py"
+                     ]
+}

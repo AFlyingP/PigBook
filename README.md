@@ -102,4 +102,4 @@ Fresh verification of implementation source `8d46afaed5c3c211350ead66f29986264c7
 ## Known Limitations
 
 - Background worker daemon executes hold expiry, heartbeat monitoring, hourly database maintenance, and the outbox notification dispatcher; email delivery is wired but disabled by default until provider configuration is enabled.
-- Administrative management endpoints (resource creation, user modification, blackout scheduling) are not yet exposed.
+- Administrative user management endpoints (user modification, account disabling, role elevation) are not yet exposed; administrative resource management, blackout scheduling, and booking operations are fully available.
