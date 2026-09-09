@@ -7,7 +7,7 @@ Supervises independent asyncio tasks:
 - hold expiry scheduler (every 30 seconds)
 - heartbeat monitoring (every 10 seconds)
 - hourly maintenance (every 3600 seconds)
-- registered extension tasks (e.g. T-018 notification dispatcher)
+- the notification dispatcher
 
 Each operation owns its own AsyncSession; sessions are never shared across tasks.
 Tasks do not hold database sessions across long awaits.
@@ -20,12 +20,17 @@ import logging
 import signal
 import sys
 from collections.abc import Awaitable, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.config import Settings, get_settings
 from app.db.session import get_sessionmaker
+from app.notifications.adapters import ConsoleEmailAdapter, EmailAdapter
+from app.notifications.handler import dispatch_event
 from app.notifications.maintenance import run_maintenance
+from app.notifications.outbox import claim_batch, recover_stale_leases, renew_lease
 from app.waitlist.scheduler import HoldExpiryScheduler, record_heartbeat
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -35,6 +40,7 @@ SHUTDOWN_BUDGET_SECONDS: float = 25.0
 HEARTBEAT_INTERVAL_SECONDS: float = 10.0
 SCHEDULER_INTERVAL_SECONDS: float = 30.0
 MAINTENANCE_INTERVAL_SECONDS: float = 3600.0
+DISPATCHER_POLL_INTERVAL_SECONDS: float = 1.0
 
 TaskCallable = Callable[["WorkerSupervisor"], Awaitable[None]]
 
@@ -185,9 +191,99 @@ class WorkerSupervisor:
                 await asyncio.gather(*remaining, return_exceptions=True)
 
 
+class OutboxDispatcher:
+    """Outbox notification dispatcher polling and claiming due events (Spec 6.1, 13.4)."""
+
+    def __init__(
+        self,
+        sessionmaker: async_sessionmaker[AsyncSession],
+        adapter: EmailAdapter | None = None,
+        settings: Settings | None = None,
+        *,
+        poll_interval: float = DISPATCHER_POLL_INTERVAL_SECONDS,
+    ) -> None:
+        self.sessionmaker = sessionmaker
+        self.settings = settings or get_settings()
+        self.adapter = adapter
+        self.poll_interval = poll_interval
+
+    async def run(self, supervisor: WorkerSupervisor) -> None:
+        """Run the polling and dispatch loop supervised independently."""
+        email_enabled = getattr(self.settings, "EMAIL_ENABLED", False)
+        if not email_enabled:
+            logger.info(
+                "OutboxDispatcher: EMAIL_ENABLED=false; notification delivery disabled; "
+                "outbox rows stay pending"
+            )
+            while not supervisor.is_stopping:
+                if await supervisor._wait_or_stop(self.poll_interval):
+                    break
+            return
+
+        adapter = self.adapter
+        if adapter is None:
+            email_adapter_type = getattr(self.settings, "EMAIL_ADAPTER", "console")
+            if email_adapter_type == "smtp":
+                from app.notifications.adapters import SMTPEmailAdapter
+
+                adapter = SMTPEmailAdapter(self.settings)
+            else:
+                adapter = ConsoleEmailAdapter(self.settings)
+
+        logger.info("OutboxDispatcher: started with %s", type(adapter).__name__)
+        while not supervisor.is_stopping:
+            try:
+                now = datetime.now(timezone.utc)
+                # 1. Recover stale leases
+                async with self.sessionmaker() as session:
+                    await recover_stale_leases(session, now=now)
+
+                # 2. Claim at most one due row
+                async with self.sessionmaker() as session:
+                    leases = await claim_batch(session, now=now)
+
+                if not leases:
+                    if await supervisor._wait_or_stop(self.poll_interval):
+                        break
+                    continue
+
+                lease = leases[0]
+
+                # 3. Renew owned lease immediately before dispatch
+                renew_now = datetime.now(timezone.utc)
+                async with self.sessionmaker() as session:
+                    renewed = await renew_lease(session, lease=lease, now=renew_now)
+
+                if not renewed:
+                    logger.warning(
+                        "OutboxDispatcher: lost ownership of lease %s; skipping dispatch",
+                        lease.id,
+                    )
+                    continue
+
+                # 4. Dispatch outside transaction
+                await dispatch_event(
+                    lease,
+                    adapter,
+                    sessionmaker=self.sessionmaker,
+                    now=renew_now,
+                    settings=self.settings,
+                )
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("OutboxDispatcher cycle error: %s", exc, exc_info=True)
+                if await supervisor._wait_or_stop(self.poll_interval):
+                    break
+
+
 def main() -> None:
     """Entry point for the background worker daemon (Spec 3.4)."""
     supervisor = WorkerSupervisor()
+    settings = get_settings()
+    dispatcher = OutboxDispatcher(supervisor.sessionmaker, settings=settings)
+    supervisor.register_task(dispatcher.run)
 
     def _handle_signal(signum: int, frame: Any) -> None:
         logger.info("Signal %s received; initiating worker shutdown...", signum)
