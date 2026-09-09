@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DBAPIError
 
 from app.admin.router import router as admin_router
+from app.admin.service import ResourceInUse
 from app.auth.dependencies import (
     AuthRequiredError,
     ForbiddenError,
@@ -33,6 +34,7 @@ from app.bookings.router import router as bookings_router
 from app.bookings.service import (
     InvalidState,
     ResourceInactive,
+    SlotConflict,
     TooLate,
     VersionMismatch,
 )
@@ -304,6 +306,22 @@ def create_app() -> FastAPI:
         return make_error_response(
             status_code=409,
             code="RESOURCE_INACTIVE",
+            message=exc.message,
+        )
+
+    @app.exception_handler(ResourceInUse)
+    async def resource_in_use_handler(_request: Request, exc: ResourceInUse) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="RESOURCE_IN_USE",
+            message=exc.message,
+        )
+
+    @app.exception_handler(SlotConflict)
+    async def slot_conflict_handler(_request: Request, exc: SlotConflict) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="SLOT_CONFLICT",
             message=exc.message,
         )
 

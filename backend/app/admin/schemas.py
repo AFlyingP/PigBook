@@ -1,10 +1,30 @@
+from datetime import datetime
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import ConfigDict, field_validator
 
 from app.auth.schemas import BaseSchema, InvitationResult
+from app.resources.schemas import ResourceCreate, ResourcePatch
 
-__all__ = ["InviteCreate", "InvitationResult"]
+__all__ = [
+    "InviteCreate",
+    "InvitationResult",
+    "ResourceCreate",
+    "ResourcePatch",
+    "EmptyBody",
+    "BlackoutCreate",
+]
+
+
+class EmptyBody(BaseSchema):
+    model_config = ConfigDict(extra="forbid")
+
+
+class BlackoutCreate(BaseSchema):
+    starts_at: datetime
+    ends_at: datetime
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class InviteCreate(BaseSchema):

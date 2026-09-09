@@ -7,11 +7,11 @@ from datetime import datetime, timedelta, timezone
 import httpx
 import jwt
 import pytest
-from sqlalchemy import select
 
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import Range
 
 from app.auth.dependencies import Policy, policy_registry
@@ -132,6 +132,16 @@ def test_policy_metadata_coverage() -> None:
         "E14",
         "E15",
         "E16",
+        "E17",
+        "E18",
+        "E19",
+        "E20",
+        "E21",
+        "E22",
+        "E23",
+        "E24",
+        "E25",
+        "E26",
         "E29",
         "E35",
     }
@@ -151,6 +161,16 @@ def test_policy_metadata_coverage() -> None:
     assert policy_registry["E14"] == Policy.own_waitlist
     assert policy_registry["E15"] == Policy.own_waitlist
     assert policy_registry["E16"] == Policy.own_waitlist
+    assert policy_registry["E17"] == Policy.admin
+    assert policy_registry["E18"] == Policy.admin
+    assert policy_registry["E19"] == Policy.admin
+    assert policy_registry["E20"] == Policy.admin
+    assert policy_registry["E21"] == Policy.admin
+    assert policy_registry["E22"] == Policy.admin
+    assert policy_registry["E23"] == Policy.admin
+    assert policy_registry["E24"] == Policy.admin
+    assert policy_registry["E25"] == Policy.admin
+    assert policy_registry["E26"] == Policy.admin
     assert policy_registry["E29"] == Policy.admin
     assert policy_registry["E35"] == Policy.public
 
@@ -962,6 +982,252 @@ async def test_permission_matrix() -> None:
         )
         assert r_e16_adm_own.status_code == 200
         assert r_e16_adm_own.json()["status"] == "confirmed"
+
+        # Seed fixtures for E17–E26 admin permission matrix
+        admin_res = Resource(
+            id=uuid.uuid4(),
+            name=f"AdminPermRes_{uuid.uuid4().hex[:6]}",
+            description="Resource for admin permissions matrix",
+            location="Room 105",
+            active=True,
+            version=1,
+        )
+        admin_res_arch = Resource(
+            id=uuid.uuid4(),
+            name=f"AdminPermArch_{uuid.uuid4().hex[:6]}",
+            description="Resource to archive for admin permissions matrix",
+            location="Room 106",
+            active=True,
+            version=1,
+        )
+        admin_bkg = Booking(
+            id=uuid.uuid4(),
+            resource_id=admin_res.id,
+            user_id=member_user.id,
+            created_by=member_user.id,
+            kind="reservation",
+            time_range=Range(
+                slot_base + timedelta(hours=20),
+                slot_base + timedelta(hours=21),
+                bounds="[)",
+            ),
+            status="confirmed",
+            version=1,
+        )
+        admin_blackout = Booking(
+            id=uuid.uuid4(),
+            resource_id=admin_res.id,
+            user_id=None,
+            created_by=admin_user.id,
+            kind="blackout",
+            time_range=Range(
+                slot_base + timedelta(hours=22),
+                slot_base + timedelta(hours=23),
+                bounds="[)",
+            ),
+            status="confirmed",
+            version=1,
+        )
+        async with sessionmaker() as session:
+            async with session.begin():
+                session.add(admin_res)
+                session.add(admin_res_arch)
+                await session.flush()
+                session.add(admin_bkg)
+                session.add(admin_blackout)
+
+        h_dis = {"Authorization": f"Bearer {disabled_token}"}
+        h_mem = {"Authorization": f"Bearer {member_token}"}
+        h_adm = {"Authorization": f"Bearer {admin_token}"}
+        m_if1 = {"If-Match": '"1"'}
+
+        # 19. E17: GET /api/v1/admin/resources (Policy.admin)
+        assert (await client.get("/api/v1/admin/resources")).status_code == 401
+        assert (await client.get("/api/v1/admin/resources", headers=h_dis)).status_code == 401
+        assert (await client.get("/api/v1/admin/resources", headers=h_mem)).status_code == 403
+        r_e17_adm = await client.get("/api/v1/admin/resources", headers=h_adm)
+        assert r_e17_adm.status_code == 200
+
+        # 20. E18: POST /api/v1/admin/resources (Policy.admin)
+        valid_res_create = {"name": f"NewRes_{uuid.uuid4().hex[:6]}", "location": "Room 107"}
+        assert (
+            await client.post("/api/v1/admin/resources", json=valid_res_create)
+        ).status_code == 401
+        assert (
+            await client.post("/api/v1/admin/resources", json=valid_res_create, headers=h_dis)
+        ).status_code == 401
+        assert (
+            await client.post("/api/v1/admin/resources", json=valid_res_create, headers=h_mem)
+        ).status_code == 403
+        r_e18_adm = await client.post(
+            "/api/v1/admin/resources", json=valid_res_create, headers=h_adm
+        )
+        assert r_e18_adm.status_code == 201
+
+        # 21. E19: PATCH /api/v1/admin/resources/{id} (Policy.admin)
+        valid_res_patch = {"name": "PatchedName"}
+        assert (
+            await client.patch(
+                f"/api/v1/admin/resources/{admin_res.id}", json=valid_res_patch, headers=m_if1
+            )
+        ).status_code == 401
+        assert (
+            await client.patch(
+                f"/api/v1/admin/resources/{admin_res.id}",
+                json=valid_res_patch,
+                headers={**m_if1, **h_dis},
+            )
+        ).status_code == 401
+        assert (
+            await client.patch(
+                f"/api/v1/admin/resources/{admin_res.id}",
+                json=valid_res_patch,
+                headers={**m_if1, **h_mem},
+            )
+        ).status_code == 403
+        r_e19_adm = await client.patch(
+            f"/api/v1/admin/resources/{admin_res.id}",
+            json=valid_res_patch,
+            headers={**m_if1, **h_adm},
+        )
+        assert r_e19_adm.status_code == 200
+
+        # 22. E20: DELETE /api/v1/admin/resources/{id} (Policy.admin)
+        assert (
+            await client.delete(f"/api/v1/admin/resources/{admin_res_arch.id}", headers=m_if1)
+        ).status_code == 401
+        assert (
+            await client.delete(
+                f"/api/v1/admin/resources/{admin_res_arch.id}", headers={**m_if1, **h_dis}
+            )
+        ).status_code == 401
+        assert (
+            await client.delete(
+                f"/api/v1/admin/resources/{admin_res_arch.id}", headers={**m_if1, **h_mem}
+            )
+        ).status_code == 403
+        r_e20_adm = await client.delete(
+            f"/api/v1/admin/resources/{admin_res_arch.id}", headers={**m_if1, **h_adm}
+        )
+        assert r_e20_adm.status_code == 200
+
+        # 23. E21: GET /api/v1/admin/resources/{id}/blackouts (Policy.admin)
+        assert (
+            await client.get(f"/api/v1/admin/resources/{admin_res.id}/blackouts")
+        ).status_code == 401
+        assert (
+            await client.get(f"/api/v1/admin/resources/{admin_res.id}/blackouts", headers=h_dis)
+        ).status_code == 401
+        assert (
+            await client.get(f"/api/v1/admin/resources/{admin_res.id}/blackouts", headers=h_mem)
+        ).status_code == 403
+        r_e21_adm = await client.get(
+            f"/api/v1/admin/resources/{admin_res.id}/blackouts", headers=h_adm
+        )
+        assert r_e21_adm.status_code == 200
+
+        # 24. E22: POST /api/v1/admin/resources/{id}/blackouts (Policy.admin)
+        valid_bo_create = {
+            "starts_at": (slot_base + timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ends_at": (slot_base + timedelta(hours=25)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+        h_id_anon = {"Idempotency-Key": str(uuid.uuid4())}
+        h_id_dis = {"Idempotency-Key": str(uuid.uuid4()), **h_dis}
+        h_id_mem = {"Idempotency-Key": str(uuid.uuid4()), **h_mem}
+        h_id_adm = {"Idempotency-Key": str(uuid.uuid4()), **h_adm}
+
+        assert (
+            await client.post(
+                f"/api/v1/admin/resources/{admin_res.id}/blackouts",
+                json=valid_bo_create,
+                headers=h_id_anon,
+            )
+        ).status_code == 401
+        assert (
+            await client.post(
+                f"/api/v1/admin/resources/{admin_res.id}/blackouts",
+                json=valid_bo_create,
+                headers=h_id_dis,
+            )
+        ).status_code == 401
+        assert (
+            await client.post(
+                f"/api/v1/admin/resources/{admin_res.id}/blackouts",
+                json=valid_bo_create,
+                headers=h_id_mem,
+            )
+        ).status_code == 403
+        r_e22_adm = await client.post(
+            f"/api/v1/admin/resources/{admin_res.id}/blackouts",
+            json=valid_bo_create,
+            headers=h_id_adm,
+        )
+        assert r_e22_adm.status_code == 201
+
+        # 25. E23: DELETE /api/v1/admin/blackouts/{id} (Policy.admin)
+        assert (
+            await client.delete(f"/api/v1/admin/blackouts/{admin_blackout.id}", headers=m_if1)
+        ).status_code == 401
+        assert (
+            await client.delete(
+                f"/api/v1/admin/blackouts/{admin_blackout.id}", headers={**m_if1, **h_dis}
+            )
+        ).status_code == 401
+        assert (
+            await client.delete(
+                f"/api/v1/admin/blackouts/{admin_blackout.id}", headers={**m_if1, **h_mem}
+            )
+        ).status_code == 403
+        r_e23_adm = await client.delete(
+            f"/api/v1/admin/blackouts/{admin_blackout.id}", headers={**m_if1, **h_adm}
+        )
+        assert r_e23_adm.status_code == 200
+
+        # 26. E24: GET /api/v1/admin/bookings (Policy.admin)
+        assert (await client.get("/api/v1/admin/bookings")).status_code == 401
+        assert (await client.get("/api/v1/admin/bookings", headers=h_dis)).status_code == 401
+        assert (await client.get("/api/v1/admin/bookings", headers=h_mem)).status_code == 403
+        r_e24_adm = await client.get("/api/v1/admin/bookings", headers=h_adm)
+        assert r_e24_adm.status_code == 200
+
+        # 27. E25: GET /api/v1/admin/bookings/{id} (Policy.admin)
+        assert (await client.get(f"/api/v1/admin/bookings/{admin_bkg.id}")).status_code == 401
+        assert (
+            await client.get(f"/api/v1/admin/bookings/{admin_bkg.id}", headers=h_dis)
+        ).status_code == 401
+        assert (
+            await client.get(f"/api/v1/admin/bookings/{admin_bkg.id}", headers=h_mem)
+        ).status_code == 403
+        r_e25_adm = await client.get(f"/api/v1/admin/bookings/{admin_bkg.id}", headers=h_adm)
+        assert r_e25_adm.status_code == 200
+
+        # 28. E26: POST /api/v1/admin/bookings/{id}/cancel (Policy.admin)
+        cancel_b = {"reason": "matrix cancel"}
+        assert (
+            await client.post(
+                f"/api/v1/admin/bookings/{admin_bkg.id}/cancel", json=cancel_b, headers=m_if1
+            )
+        ).status_code == 401
+        assert (
+            await client.post(
+                f"/api/v1/admin/bookings/{admin_bkg.id}/cancel",
+                json=cancel_b,
+                headers={**m_if1, **h_dis},
+            )
+        ).status_code == 401
+        assert (
+            await client.post(
+                f"/api/v1/admin/bookings/{admin_bkg.id}/cancel",
+                json=cancel_b,
+                headers={**m_if1, **h_mem},
+            )
+        ).status_code == 403
+        r_e26_adm = await client.post(
+            f"/api/v1/admin/bookings/{admin_bkg.id}/cancel",
+            json=cancel_b,
+            headers={**m_if1, **h_adm},
+        )
+        assert r_e26_adm.status_code == 200
 
 
 @pytest.mark.asyncio

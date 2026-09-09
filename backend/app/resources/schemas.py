@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Generic, Literal, TypeVar
 
-from pydantic import ConfigDict, field_serializer
+from pydantic import ConfigDict, Field, field_serializer, model_validator
 
 from app.auth.schemas import BaseSchema
 
@@ -66,3 +66,33 @@ class Availability(BaseSchema):
         else:
             dt = dt.astimezone(timezone.utc)
         return dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+class ResourceCreate(BaseSchema):
+    name: str = Field(..., min_length=1, max_length=100)
+    description: str = Field(default="", max_length=2000)
+    location: str = Field(..., min_length=1, max_length=200)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ResourcePatch(BaseSchema):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=2000)
+    location: str | None = Field(default=None, min_length=1, max_length=200)
+    active: bool | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_patch_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        for field in ("name", "description", "location", "active"):
+            if field in data and data[field] is None:
+                raise ValueError(f"Field '{field}' cannot be null")
+        provided = [f for f in ("name", "description", "location", "active") if f in data]
+        if not provided:
+            raise ValueError("At least one field must be provided for update")
+        return data
