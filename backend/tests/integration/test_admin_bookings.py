@@ -500,3 +500,41 @@ async def test_admin_vs_member_routes_ownership_distinction() -> None:
                 headers={**h_mem, "If-Match": '"1"'},
             )
         ).status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_e26_nonexistent_booking_cancel_precondition_precedence() -> None:
+    admin = await create_user(role="admin")
+    admin_token = make_token(admin)
+    absent_id = uuid.uuid4()
+
+    async with make_client() as client:
+        h = {"Authorization": f"Bearer {admin_token}"}
+        valid_body = {"reason": "cancel test"}
+
+        # 1. Nonexistent booking + missing If-Match -> 428 PRECONDITION_REQUIRED
+        r_missing = await client.post(
+            f"/api/v1/admin/bookings/{absent_id}/cancel",
+            json=valid_body,
+            headers=h,
+        )
+        assert r_missing.status_code == 428
+        assert r_missing.json()["error"]["code"] == "PRECONDITION_REQUIRED"
+
+        # 2. Nonexistent booking + malformed If-Match -> 422 VALIDATION_ERROR
+        r_malformed = await client.post(
+            f"/api/v1/admin/bookings/{absent_id}/cancel",
+            json=valid_body,
+            headers={**h, "If-Match": "invalid-tag"},
+        )
+        assert r_malformed.status_code == 422
+        assert r_malformed.json()["error"]["code"] == "VALIDATION_ERROR"
+
+        # 3. Nonexistent booking + valid If-Match -> 404 NOT_FOUND
+        r_valid = await client.post(
+            f"/api/v1/admin/bookings/{absent_id}/cancel",
+            json=valid_body,
+            headers={**h, "If-Match": '"1"'},
+        )
+        assert r_valid.status_code == 404
+        assert r_valid.json()["error"]["code"] == "NOT_FOUND"

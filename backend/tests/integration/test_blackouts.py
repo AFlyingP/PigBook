@@ -544,3 +544,34 @@ async def test_e23_cannot_cancel_completed_blackout() -> None:
         res = await client.delete(f"/api/v1/admin/blackouts/{past_blackout.id}", headers=headers)
         assert res.status_code == 409
         assert res.json()["error"]["code"] == "TOO_LATE"
+
+
+@pytest.mark.asyncio
+async def test_e23_nonexistent_blackout_precondition_precedence() -> None:
+    admin = await create_user(role="admin")
+    admin_token = make_token(admin)
+    absent_id = uuid.uuid4()
+
+    async with make_client() as client:
+        h = {"Authorization": f"Bearer {admin_token}"}
+
+        # 1. Nonexistent blackout + missing If-Match -> 428 PRECONDITION_REQUIRED
+        r_missing = await client.delete(f"/api/v1/admin/blackouts/{absent_id}", headers=h)
+        assert r_missing.status_code == 428
+        assert r_missing.json()["error"]["code"] == "PRECONDITION_REQUIRED"
+
+        # 2. Nonexistent blackout + malformed If-Match -> 422 VALIDATION_ERROR
+        r_malformed = await client.delete(
+            f"/api/v1/admin/blackouts/{absent_id}",
+            headers={**h, "If-Match": "not-valid-etag"},
+        )
+        assert r_malformed.status_code == 422
+        assert r_malformed.json()["error"]["code"] == "VALIDATION_ERROR"
+
+        # 3. Nonexistent blackout + valid If-Match -> 404 NOT_FOUND
+        r_valid = await client.delete(
+            f"/api/v1/admin/blackouts/{absent_id}",
+            headers={**h, "If-Match": '"1"'},
+        )
+        assert r_valid.status_code == 404
+        assert r_valid.json()["error"]["code"] == "NOT_FOUND"

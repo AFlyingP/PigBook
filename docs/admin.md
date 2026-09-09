@@ -56,7 +56,7 @@ Administrative operations in CommonsBook provide inventory control, blackout sch
 - **Payload**: `ResourceCreate {name: str(1..100), description: str(0..2000, default ""), location: str(1..200)}`.
 - **Defaults**: New resources are initialized with `active=True` and `version=1`.
 - **Headers**: Emits `Location: /api/v1/admin/resources/{id}` and `ETag: "1"`.
-- **Audit**: Writes an audit log record with action `admin.resource_create` in the same transaction.
+- **Audit**: Writes an audit log record with action `admin.resource_create` recording bounded metadata only (`{"fields": ["description", "location", "name"]}`) without freeform text values.
 
 ### Guarded Resource Patch (E19)
 
@@ -76,7 +76,7 @@ Administrative operations in CommonsBook provide inventory control, blackout sch
   3. Any waitlist entry exists in `waiting` status for this resource.
   Past completed bookings (`upper(time_range) <= now`) do not block archival. When rejected, no resource fields are modified and no audit log is generated.
 - **Archive-vs-Create Race Serialization**: Booking creation acquires `Resource FOR SHARE`; resource archival acquires `Resource FOR UPDATE`. If creation commits first, archival observes the newly committed active booking and returns `409 RESOURCE_IN_USE`. If archival commits first, creation reads `active=False` and returns `409 RESOURCE_INACTIVE`. Both interleavings yield legal serial outcomes.
-- **Audit**: Successful archival emits `ETag: "<new_version>"` and records `admin.resource_archive`.
+- **Audit**: Successful archival emits `ETag: "<new_version>"` and records `admin.resource_archive` with `{"fields": ["active"], "new_active": false, "old_active": true}`.
 
 ---
 
@@ -166,14 +166,14 @@ All administrative mutations are recorded in the append-only `audit_log` table:
 
 | Action | Target Type | Target ID | Details Allowlist |
 |---|---|---|---|
-| `admin.resource_create` | `resource` | Resource UUID | `name`, `location`, `description` |
-| `admin.resource_patch` | `resource` | Resource UUID | Changed fields dictionary (`name`, `location`, `description`, `active`) |
-| `admin.resource_archive` | `resource` | Resource UUID | `{"active": false}` |
+| `admin.resource_create` | `resource` | Resource UUID | `{"fields": ["description", "location", "name"]}` |
+| `admin.resource_patch` | `resource` | Resource UUID | `{"fields": [...]}` plus `"old_active": bool, "new_active": bool` when active changes |
+| `admin.resource_archive` | `resource` | Resource UUID | `{"fields": ["active"], "new_active": false, "old_active": bool}` |
 | `admin.blackout_create` | `booking` | Blackout UUID | `resource_id`, `starts_at`, `ends_at` |
 | `admin.blackout_cancel` | `booking` | Blackout UUID | `resource_id` |
 | `admin.booking_cancel` | `booking` | Booking UUID | `resource_id`, `reason_length` |
 
-- **Security & Privacy**: Payloads never record raw passwords, tokens, full member email addresses, or un-redacted private messages. Free-text cancellation reasons record only character length (`reason_length`).
+- **Security & Privacy**: Payloads never record raw passwords, tokens, full member email addresses, user-entered resource text (`name`, `location`, `description`), or un-redacted private messages. Free-text cancellation reasons record only character length (`reason_length`). Resource creations and patches record only changed field names and safe boolean values.
 - **Atomic Commit**: The audit entry is created using the transaction session and commits atomically with domain entity changes; failure of either rolls back both.
 
 ---
@@ -214,4 +214,4 @@ All errors adhere to the standard CommonsBook error envelope:
 ## 8. Current Limitations
 
 - **Administrative User Management**: User modification, role elevation/demotion, and user disabling endpoints (`/api/v1/admin/users/*`) are scheduled for subsequent operational packages.
-- **Operational Outbox Management**: Outbox failure inspection and manual event retry (`/api/v1/admin/outbox/*`) are implemented in administrative operations tooling.
+- **Operational Outbox Management**: Outbox failure inspection and manual event retry endpoints (`/api/v1/admin/outbox/*`) are not yet exposed.

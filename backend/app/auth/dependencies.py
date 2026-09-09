@@ -359,6 +359,12 @@ async def _resolve_admin_scope(
         except (ValueError, TypeError):
             pass
 
+    requires_if_match = (req_method in ("PATCH", "DELETE") and raw_id is not None) or (
+        req_method == "POST" and path.endswith("/cancel")
+    )
+    if requires_if_match:
+        expected_version = _parse_if_match(request.headers.get("If-Match"))
+
     if raw_id is not None:
         try:
             parsed_id = uuid.UUID(str(raw_id))
@@ -408,12 +414,6 @@ async def _resolve_admin_scope(
                 "audit": True,
                 "request_id": req_id,
             }
-
-    requires_if_match = (req_method in ("PATCH", "DELETE") and raw_id is not None) or (
-        req_method == "POST" and path.endswith("/cancel")
-    )
-    if requires_if_match:
-        expected_version = _parse_if_match(request.headers.get("If-Match"))
 
     if path.rstrip("/").endswith("/admin/bookings"):
         predicates = {

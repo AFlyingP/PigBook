@@ -3,6 +3,7 @@ import hashlib
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import Range
@@ -137,11 +138,7 @@ async def create_resource(
         target_id=res_id,
         actor_id=scope.principal_id,
         request_id=req_id,
-        details={
-            "name": data.name,
-            "location": data.location,
-            "description": data.description,
-        },
+        details={"fields": ["description", "location", "name"]},
         now=now,
     )
     await session.flush()
@@ -175,6 +172,8 @@ async def update_resource(
     if resource.version != scope.expected_version:
         raise VersionMismatch("Resource has been modified by another request")
 
+    old_active = bool(resource.active)
+
     patch_dict = data.model_dump(exclude_unset=True)
     if not patch_dict:
         raise ValueError("At least one field must be provided for update")
@@ -205,6 +204,10 @@ async def update_resource(
         raise VersionMismatch("Resource has been modified by another request")
 
     req_id = scope.predicates.get("request_id") or uuid.uuid4()
+    audit_details: dict[str, Any] = {"fields": sorted(patch_dict.keys())}
+    if "active" in patch_dict:
+        audit_details["old_active"] = old_active
+        audit_details["new_active"] = patch_dict["active"]
     await append_audit_log(
         session,
         action="admin.resource_patch",
@@ -212,7 +215,7 @@ async def update_resource(
         target_id=resource_id,
         actor_id=scope.principal_id,
         request_id=req_id,
-        details={k: v for k, v in patch_dict.items()},
+        details=audit_details,
         now=db_now,
     )
     await session.flush()
@@ -246,6 +249,8 @@ async def archive_resource(
     if resource.version != scope.expected_version:
         raise VersionMismatch("Resource has been modified by another request")
 
+    old_active = bool(resource.active)
+
     db_clock = await session.scalar(select(func.clock_timestamp()))
     db_now = db_clock if db_clock is not None else now
 
@@ -277,7 +282,7 @@ async def archive_resource(
         target_id=resource_id,
         actor_id=scope.principal_id,
         request_id=req_id,
-        details={"active": False},
+        details={"fields": ["active"], "new_active": False, "old_active": old_active},
         now=db_now,
     )
     await session.flush()

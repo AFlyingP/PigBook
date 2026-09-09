@@ -210,8 +210,10 @@ async def test_e18_create_resource_success_and_audit() -> None:
             audit_entry = (await session.execute(stmt)).scalar_one()
             assert audit_entry.action == "admin.resource_create"
             assert audit_entry.actor_id == admin.id
-            assert audit_entry.details["name"] == body["name"]
-            assert audit_entry.details["location"] == body["location"]
+            assert audit_entry.details == {"fields": ["description", "location", "name"]}
+            # Explicitly prove sensitive/freeform values are absent
+            for sensitive_key in ("name", "location", "description"):
+                assert sensitive_key not in audit_entry.details
 
 
 @pytest.mark.asyncio
@@ -314,8 +316,93 @@ async def test_e19_patch_resource_guarded_optimistic_locking() -> None:
                 AuditLog.action == "admin.resource_patch",
             )
             audit_entry = (await session.execute(stmt)).scalar_one()
-            assert audit_entry.details["name"] == "Renamed Room"
-            assert audit_entry.details["location"] == "Floor 3"
+            assert audit_entry.details == {"fields": ["location", "name"]}
+            # Explicitly prove sensitive/freeform values are absent
+            for sensitive_key in ("name", "location", "description"):
+                assert sensitive_key not in audit_entry.details
+
+        # 7. Patch active status and verify safe old/new active values in audit details
+        res_act_patch = await client.patch(
+            f"/api/v1/admin/resources/{resource.id}",
+            json={"active": False},
+            headers={**headers, "If-Match": '"2"'},
+        )
+        assert res_act_patch.status_code == 200
+        assert res_act_patch.json()["active"] is False
+        assert res_act_patch.headers.get("ETag") == '"3"'
+
+        async with sessionmaker() as session:
+            stmt = (
+                select(AuditLog)
+                .where(
+                    AuditLog.target_type == "resource",
+                    AuditLog.target_id == resource.id,
+                    AuditLog.action == "admin.resource_patch",
+                )
+                .order_by(AuditLog.created_at.desc())
+            )
+            act_audit_entry = (await session.execute(stmt)).scalars().first()
+            assert act_audit_entry is not None
+            assert act_audit_entry.details == {
+                "fields": ["active"],
+                "new_active": False,
+                "old_active": True,
+            }
+            for sensitive_key in ("name", "location", "description"):
+                assert sensitive_key not in act_audit_entry.details
+
+
+@pytest.mark.asyncio
+async def test_e19_e20_nonexistent_resource_precondition_precedence() -> None:
+    admin = await create_user(role="admin")
+    admin_token = make_token(admin)
+    absent_id = uuid.uuid4()
+
+    async with make_client() as client:
+        h = {"Authorization": f"Bearer {admin_token}"}
+        valid_patch = {"name": "Patch Name"}
+
+        # PATCH nonexistent resource:
+        # Missing If-Match -> 428 PRECONDITION_REQUIRED
+        r_patch_missing = await client.patch(
+            f"/api/v1/admin/resources/{absent_id}", json=valid_patch, headers=h
+        )
+        assert r_patch_missing.status_code == 428
+
+        # Malformed If-Match -> 422 VALIDATION_ERROR
+        r_patch_malformed = await client.patch(
+            f"/api/v1/admin/resources/{absent_id}",
+            json=valid_patch,
+            headers={**h, "If-Match": "not-valid"},
+        )
+        assert r_patch_malformed.status_code == 422
+
+        # Valid If-Match -> 404 NOT_FOUND
+        r_patch_valid = await client.patch(
+            f"/api/v1/admin/resources/{absent_id}",
+            json=valid_patch,
+            headers={**h, "If-Match": '"1"'},
+        )
+        assert r_patch_valid.status_code == 404
+
+        # DELETE nonexistent resource:
+        # Missing If-Match -> 428 PRECONDITION_REQUIRED
+        r_del_missing = await client.delete(f"/api/v1/admin/resources/{absent_id}", headers=h)
+        assert r_del_missing.status_code == 428
+
+        # Malformed If-Match -> 422 VALIDATION_ERROR
+        r_del_malformed = await client.delete(
+            f"/api/v1/admin/resources/{absent_id}",
+            headers={**h, "If-Match": "not-valid"},
+        )
+        assert r_del_malformed.status_code == 422
+
+        # Valid If-Match -> 404 NOT_FOUND
+        r_del_valid = await client.delete(
+            f"/api/v1/admin/resources/{absent_id}",
+            headers={**h, "If-Match": '"1"'},
+        )
+        assert r_del_valid.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -489,7 +576,11 @@ async def test_e20_archive_resource_success_and_audit() -> None:
                 AuditLog.action == "admin.resource_archive",
             )
             audit_entry = (await session.execute(stmt)).scalar_one()
-            assert audit_entry.details == {"active": False}
+            assert audit_entry.details == {
+                "fields": ["active"],
+                "new_active": False,
+                "old_active": True,
+            }
             assert audit_entry.actor_id == admin.id
 
 
