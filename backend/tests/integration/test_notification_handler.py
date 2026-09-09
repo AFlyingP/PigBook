@@ -42,6 +42,22 @@ async def _cleanup_engine() -> Any:
         app.db.session._engine_url = None
 
 
+@pytest.fixture(autouse=True)
+async def _isolate_outbox() -> Any:
+    from sqlalchemy import delete
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        async with session.begin():
+            await session.execute(delete(NotificationDelivery))
+            await session.execute(delete(Outbox))
+    yield
+    async with sessionmaker() as session:
+        async with session.begin():
+            await session.execute(delete(NotificationDelivery))
+            await session.execute(delete(Outbox))
+
+
 class RecordingEmailAdapter:
     """Mock adapter recording sent messages and simulating latency or connection checks."""
 
@@ -162,7 +178,7 @@ async def test_crash_injected_after_send_allows_duplicate_email_no_domain_duplic
     user, resource = await _seed_user_and_resource()
     booking = await _seed_booking(user, resource)
     sessionmaker = get_sessionmaker()
-    now = datetime(2026, 9, 10, 10, 0, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
 
     async with sessionmaker() as session:
         async with session.begin():
@@ -207,7 +223,8 @@ async def test_crash_injected_after_send_allows_duplicate_email_no_domain_duplic
     # Advance time past lease expiration (61s) and run stale lease recovery
     now_recovered = now + timedelta(seconds=61)
     async with sessionmaker() as session:
-        await recover_stale_leases(session, now=now_recovered)
+        async with session.begin():
+            await recover_stale_leases(session, now=now_recovered)
 
     # Claim the lease again
     async with sessionmaker() as session:

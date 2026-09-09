@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, cast
 
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.auth.models import User
@@ -64,27 +65,34 @@ async def dispatch_event(
     # 1. Short transaction: get/create receipt, check skip criteria, load metadata
     async with sm() as session:
         async with session.begin():
-            stmt = select(NotificationDelivery).where(
-                NotificationDelivery.event_id == lease.id,
-                NotificationDelivery.recipient_id == recipient_id,
-                NotificationDelivery.channel == "email",
-            )
-            receipt = (await session.execute(stmt)).scalar_one_or_none()
-
-            if receipt is not None and receipt.state in ("sent", "skipped"):
-                await acknowledge(session, lease=lease, now=db_now)
-                return
-
-            if receipt is None:
-                receipt = NotificationDelivery(
+            # Concurrency-safe atomic get-or-create using ON CONFLICT DO NOTHING
+            stmt_ins = (
+                pg_insert(NotificationDelivery)
+                .values(
                     id=uuid.uuid4(),
                     event_id=lease.id,
                     recipient_id=recipient_id,
                     channel="email",
                     state="pending",
                 )
-                session.add(receipt)
-                await session.flush()
+                .on_conflict_do_nothing(index_elements=["event_id", "recipient_id", "channel"])
+            )
+            await session.execute(stmt_ins)
+
+            stmt = (
+                select(NotificationDelivery)
+                .where(
+                    NotificationDelivery.event_id == lease.id,
+                    NotificationDelivery.recipient_id == recipient_id,
+                    NotificationDelivery.channel == "email",
+                )
+                .with_for_update()
+            )
+            receipt = (await session.execute(stmt)).scalar_one()
+
+            if receipt.state in ("sent", "skipped"):
+                await acknowledge(session, lease=lease, now=db_now)
+                return
 
             # Check recipient enabled status
             user = await session.get(User, recipient_id)

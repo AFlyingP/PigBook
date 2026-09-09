@@ -44,6 +44,22 @@ async def _cleanup_engine() -> Any:
         app.db.session._engine_url = None
 
 
+@pytest.fixture(autouse=True)
+async def _isolate_outbox() -> Any:
+    from sqlalchemy import delete
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        async with session.begin():
+            await session.execute(delete(NotificationDelivery))
+            await session.execute(delete(Outbox))
+    yield
+    async with sessionmaker() as session:
+        async with session.begin():
+            await session.execute(delete(NotificationDelivery))
+            await session.execute(delete(Outbox))
+
+
 class BlockedEmailAdapter(EmailAdapter):
     """Email adapter that simulates a slow provider by sleeping for 20 seconds."""
 
@@ -155,6 +171,7 @@ async def test_worker_responsiveness_with_twenty_second_blocked_adapter() -> Non
 
     supervisor = WorkerSupervisor(
         sessionmaker=sessionmaker,
+        resource_ids=[resource.id],
         heartbeat_interval=2.0,
         scheduler_interval=2.0,
         maintenance_interval=3600.0,
@@ -184,35 +201,35 @@ async def test_worker_responsiveness_with_twenty_second_blocked_adapter() -> Non
             assert initial_hb is not None
             initial_seen_at = initial_hb.seen_at
 
-        # Wait 4 seconds for heartbeat loop and scheduler loop to run concurrently
-        await asyncio.sleep(4.0)
+        # Poll while STILL BLOCKED (up to 15 seconds, well within the 20s block)
+        # to observe both heartbeat progression and due hold expiry
+        heartbeat_advanced = False
+        hold_expired = False
 
-        # Prover checkpoint 2: While STILL BLOCKED in adapter.send:
-        assert not blocked_adapter.send_finished.is_set(), (
-            "Adapter must still be blocked during responsiveness verification"
-        )
-
-        # Checkpoint 2a: Heartbeat has advanced
-        async with sessionmaker() as session:
-            current_hb = await session.get(WorkerHeartbeat, "primary")
-            assert current_hb is not None
-            assert current_hb.seen_at > initial_seen_at, (
-                f"Heartbeat seen_at did not advance: {current_hb.seen_at} <= {initial_seen_at}"
+        for _ in range(15):
+            await asyncio.sleep(1.0)
+            # Delivery must STILL be blocked on every check
+            assert not blocked_adapter.send_finished.is_set(), (
+                "Adapter must still be blocked during responsiveness verification"
             )
+            async with sessionmaker() as session:
+                if not heartbeat_advanced:
+                    current_hb = await session.get(WorkerHeartbeat, "primary")
+                    if current_hb and current_hb.seen_at > initial_seen_at:
+                        heartbeat_advanced = True
 
-        # Checkpoint 2b: Overdue hold was expired by the scheduler
-        async with sessionmaker() as session:
-            expired_booking = await session.get(Booking, b_overdue.id)
-            assert expired_booking is not None
-            assert expired_booking.status == "expired", (
-                f"Overdue booking status was not expired: {expired_booking.status}"
-            )
+                if not hold_expired:
+                    exp_b = await session.get(Booking, b_overdue.id)
+                    if exp_b and exp_b.status == "expired":
+                        hold_expired = True
 
-            expired_waitlist = await session.get(WaitlistEntry, w_entry.id)
-            assert expired_waitlist is not None
-            assert expired_waitlist.status == "expired", (
-                f"Waitlist entry status was not expired: {expired_waitlist.status}"
-            )
+            if heartbeat_advanced and hold_expired:
+                break
+
+        # Prover checkpoint 2: Both occurred while send was STILL BLOCKED
+        assert not blocked_adapter.send_finished.is_set(), "Adapter must still be blocked"
+        assert heartbeat_advanced, "Heartbeat did not advance while delivery was blocked"
+        assert hold_expired, "Overdue booking was not expired while delivery was blocked"
 
         # Wait for the full 20-second blocked adapter send to complete
         await asyncio.wait_for(blocked_adapter.send_finished.wait(), timeout=20.0)

@@ -19,7 +19,8 @@ import asyncio
 import logging
 import signal
 import sys
-from collections.abc import Awaitable, Callable
+import uuid
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -57,12 +58,14 @@ class WorkerSupervisor:
         scheduler_interval: float = SCHEDULER_INTERVAL_SECONDS,
         maintenance_interval: float = MAINTENANCE_INTERVAL_SECONDS,
         registered_tasks: list[TaskCallable] | None = None,
+        resource_ids: Sequence[uuid.UUID] | None = None,
     ) -> None:
         self.sessionmaker = sessionmaker or get_sessionmaker()
         self.shutdown_budget = shutdown_budget
         self.heartbeat_interval = heartbeat_interval
         self.scheduler_interval = scheduler_interval
         self.maintenance_interval = maintenance_interval
+        self.resource_ids = resource_ids
 
         self._custom_tasks: list[TaskCallable] = list(registered_tasks or [])
         self._stopping = asyncio.Event()
@@ -110,7 +113,7 @@ class WorkerSupervisor:
 
     async def _run_scheduler_loop(self) -> None:
         """Run hold expiry and promotion cycle every 30 seconds."""
-        scheduler = HoldExpiryScheduler(self.sessionmaker)
+        scheduler = HoldExpiryScheduler(self.sessionmaker, resource_ids=self.resource_ids)
         if not self.is_stopping:
             await scheduler.run_cycle()
         while not self.is_stopping:
@@ -236,9 +239,10 @@ class OutboxDispatcher:
                 now = datetime.now(timezone.utc)
                 # 1. Recover stale leases
                 async with self.sessionmaker() as session:
-                    await recover_stale_leases(session, now=now)
+                    async with session.begin():
+                        await recover_stale_leases(session, now=now)
 
-                # 2. Claim at most one due row
+                # 2. Claim at most one due row (claim_batch commits before dispatch)
                 async with self.sessionmaker() as session:
                     leases = await claim_batch(session, now=now)
 
@@ -252,7 +256,8 @@ class OutboxDispatcher:
                 # 3. Renew owned lease immediately before dispatch
                 renew_now = datetime.now(timezone.utc)
                 async with self.sessionmaker() as session:
-                    renewed = await renew_lease(session, lease=lease, now=renew_now)
+                    async with session.begin():
+                        renewed = await renew_lease(session, lease=lease, now=renew_now)
 
                 if not renewed:
                     logger.warning(

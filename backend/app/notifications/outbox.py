@@ -142,23 +142,26 @@ async def claim_batch(
     new_attempts = int(r.attempts) + 1
     lease_until = now + timedelta(seconds=60)
 
-    r.status = "processing"
-    r.attempts = new_attempts
-    r.lease_token = new_token
-    r.lease_until = lease_until
+    stmt_update = (
+        update(Outbox)
+        .where(Outbox.id == row.id, Outbox.status == "pending")
+        .values(
+            status="processing",
+            attempts=new_attempts,
+            lease_token=new_token,
+            lease_until=lease_until,
+        )
+    )
+    await session.execute(stmt_update)
+    await session.commit()
 
     lease = OutboxLease(
-        id=uuid.UUID(str(r.id)),
+        id=uuid.UUID(str(row.id)),
         lease_token=new_token,
-        event_type=str(r.event_type),
-        payload=dict(r.payload),
+        event_type=str(row.event_type),
+        payload=dict(row.payload),
         attempts=new_attempts,
     )
-
-    try:
-        await session.commit()
-    except Exception:
-        await session.flush()
 
     return [lease]
 
@@ -191,13 +194,7 @@ async def renew_lease(
         )
     )
     result = await session.execute(stmt)
-    owned = getattr(result, "rowcount", None) == 1
-    if owned:
-        try:
-            await session.commit()
-        except Exception:
-            await session.flush()
-    return owned
+    return getattr(result, "rowcount", None) == 1
 
 
 async def acknowledge(
@@ -232,13 +229,7 @@ async def acknowledge(
         )
     )
     result = await session.execute(stmt)
-    owned = getattr(result, "rowcount", None) == 1
-    if owned:
-        try:
-            await session.commit()
-        except Exception:
-            await session.flush()
-    return owned
+    return getattr(result, "rowcount", None) == 1
 
 
 async def fail_lease(
@@ -286,13 +277,7 @@ async def fail_lease(
         )
     )
     result = await session.execute(stmt)
-    owned = getattr(result, "rowcount", None) == 1
-    if owned:
-        try:
-            await session.commit()
-        except Exception:
-            await session.flush()
-    return owned
+    return getattr(result, "rowcount", None) == 1
 
 
 async def recover_stale_leases(
@@ -304,7 +289,7 @@ async def recover_stale_leases(
 
     Processing rows with lease_until <= now return to 'pending'
     (unless attempts >= 8, which transition to 'dead').
-    Safe with concurrent workers using FOR UPDATE SKIP LOCKED.
+    Safe with concurrent workers.
     Returns the number of rows recovered.
     """
     if now.tzinfo is None:
@@ -312,34 +297,39 @@ async def recover_stale_leases(
     else:
         now = now.astimezone(timezone.utc)
 
-    stmt = (
-        select(Outbox)
+    # 1. Attempts >= 8 transition to dead
+    stmt_dead = (
+        update(Outbox)
         .where(
             Outbox.status == "processing",
             Outbox.lease_until <= now,
+            Outbox.attempts >= 8,
         )
-        .order_by(Outbox.lease_until.asc(), Outbox.id.asc())
-        .limit(100)
-        .with_for_update(skip_locked=True)
+        .values(
+            status="dead",
+            lease_token=None,
+            lease_until=None,
+        )
     )
-    rows = (await session.execute(stmt)).scalars().all()
-    if not rows:
-        return 0
+    res_dead = await session.execute(stmt_dead)
+    count_dead = int(getattr(res_dead, "rowcount", 0) or 0)
 
-    recovered_count = len(rows)
-    for row in rows:
-        r = cast(Any, row)
-        if int(r.attempts) >= 8:
-            r.status = "dead"
-        else:
-            r.status = "pending"
-            r.available_at = now
-        r.lease_token = None
-        r.lease_until = None
+    # 2. Attempts < 8 return to pending
+    stmt_pending = (
+        update(Outbox)
+        .where(
+            Outbox.status == "processing",
+            Outbox.lease_until <= now,
+            Outbox.attempts < 8,
+        )
+        .values(
+            status="pending",
+            lease_token=None,
+            lease_until=None,
+            available_at=now,
+        )
+    )
+    res_pending = await session.execute(stmt_pending)
+    count_pending = int(getattr(res_pending, "rowcount", 0) or 0)
 
-    try:
-        await session.commit()
-    except Exception:
-        await session.flush()
-
-    return recovered_count
+    return count_dead + count_pending

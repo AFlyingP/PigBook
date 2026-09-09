@@ -49,6 +49,24 @@ async def _cleanup_engine() -> Any:
         app.db.session._engine_url = None
 
 
+@pytest.fixture(autouse=True)
+async def _isolate_outbox() -> Any:
+    from sqlalchemy import delete
+
+    from app.notifications.models import NotificationDelivery
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        async with session.begin():
+            await session.execute(delete(NotificationDelivery))
+            await session.execute(delete(Outbox))
+    yield
+    async with sessionmaker() as session:
+        async with session.begin():
+            await session.execute(delete(NotificationDelivery))
+            await session.execute(delete(Outbox))
+
+
 async def _seed_user_and_resource() -> tuple[User, Resource]:
     sessionmaker = get_sessionmaker()
     async with sessionmaker() as session:
@@ -76,10 +94,10 @@ async def _seed_user_and_resource() -> tuple[User, Resource]:
     return user, resource
 
 
-async def _seed_booking(user: User, resource: Resource) -> Booking:
+async def _seed_booking(user: User, resource: Resource, offset_hours: int = 0) -> Booking:
     sessionmaker = get_sessionmaker()
     now = datetime.now(timezone.utc)
-    t_start = now + timedelta(days=1)
+    t_start = now + timedelta(days=1, hours=offset_hours)
     t_end = t_start + timedelta(hours=1)
     async with sessionmaker() as session:
         async with session.begin():
@@ -107,8 +125,8 @@ async def test_concurrent_claim_batch_disjoint_rows() -> None:
     # Create 5 bookings and 5 outbox events
     now = datetime.now(timezone.utc)
     outbox_ids = []
-    for _ in range(5):
-        booking = await _seed_booking(user, resource)
+    for i in range(5):
+        booking = await _seed_booking(user, resource, offset_hours=2 * i)
         async with sessionmaker() as session:
             async with session.begin():
                 eid = await append_event(
@@ -175,12 +193,19 @@ async def test_lost_ownership_acknowledge_returns_false() -> None:
     async with sessionmaker() as session:
         async with session.begin():
             await session.execute(
-                update(Outbox).where(Outbox.id == eid).values(lease_token=different_token)
+                update(Outbox)
+                .where(Outbox.id == eid)
+                .values(
+                    status="processing",
+                    lease_token=different_token,
+                    lease_until=now + timedelta(seconds=60),
+                )
             )
 
     # Original worker attempts to acknowledge with old token
     async with sessionmaker() as session:
-        ack_res = await acknowledge(session, lease=lease, now=now)
+        async with session.begin():
+            ack_res = await acknowledge(session, lease=lease, now=now)
 
     assert ack_res is False
 
@@ -217,12 +242,19 @@ async def test_lost_ownership_fail_lease_returns_false() -> None:
     async with sessionmaker() as session:
         async with session.begin():
             await session.execute(
-                update(Outbox).where(Outbox.id == eid).values(lease_token=different_token)
+                update(Outbox)
+                .where(Outbox.id == eid)
+                .values(
+                    status="processing",
+                    lease_token=different_token,
+                    lease_until=now + timedelta(seconds=60),
+                )
             )
 
     # Stale worker attempts fail_lease
     async with sessionmaker() as session:
-        fail_res = await fail_lease(session, lease=lease, error_category="transport", now=now)
+        async with session.begin():
+            fail_res = await fail_lease(session, lease=lease, error_category="transport", now=now)
 
     assert fail_res is False
 
@@ -241,7 +273,7 @@ async def test_process_crash_leaves_row_processing_until_stale_recovery() -> Non
     user, resource = await _seed_user_and_resource()
     booking = await _seed_booking(user, resource)
     sessionmaker = get_sessionmaker()
-    t0 = datetime(2026, 9, 10, 10, 0, 0, tzinfo=timezone.utc)
+    t0 = datetime.now(timezone.utc)
 
     async with sessionmaker() as session:
         async with session.begin():
@@ -262,15 +294,21 @@ async def test_process_crash_leaves_row_processing_until_stale_recovery() -> Non
         assert row.status == "processing"
         assert row.lease_token is not None
 
-    # Before lease expires (t0 + 30s), stale recovery does not touch it
+    # Before lease expires (t0 + 30s), stale recovery does not touch this row
     async with sessionmaker() as session:
-        recovered = await recover_stale_leases(session, now=t0 + timedelta(seconds=30))
-    assert recovered == 0
+        async with session.begin():
+            await recover_stale_leases(session, now=t0 + timedelta(seconds=30))
+        row_30 = await session.get(Outbox, eid)
+        assert row_30 is not None
+        assert row_30.status == "processing"
 
     # After lease expires (t0 + 61s), stale recovery resets it to pending
     async with sessionmaker() as session:
-        recovered = await recover_stale_leases(session, now=t0 + timedelta(seconds=61))
-    assert recovered >= 1
+        async with session.begin():
+            await recover_stale_leases(session, now=t0 + timedelta(seconds=61))
+        row_61 = await session.get(Outbox, eid)
+        assert row_61 is not None
+        assert row_61.status == "pending"
 
     # Row is now pending again, lease fields cleared, ready to be re-claimed
     async with sessionmaker() as session:
@@ -293,7 +331,7 @@ async def test_exhausted_retries_reach_dead_and_are_not_reclaimed() -> None:
     user, resource = await _seed_user_and_resource()
     booking = await _seed_booking(user, resource)
     sessionmaker = get_sessionmaker()
-    now = datetime(2026, 9, 10, 10, 0, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
 
     async with sessionmaker() as session:
         async with session.begin():
@@ -312,7 +350,8 @@ async def test_exhausted_retries_reach_dead_and_are_not_reclaimed() -> None:
 
     # Fail the lease at attempt 8
     async with sessionmaker() as session:
-        ok = await fail_lease(session, lease=lease, error_category="transport", now=now)
+        async with session.begin():
+            ok = await fail_lease(session, lease=lease, error_category="transport", now=now)
     assert ok is True
 
     # Row is now dead
@@ -347,7 +386,8 @@ async def test_exhausted_retries_reach_dead_and_are_not_reclaimed() -> None:
             )
 
     async with sessionmaker() as session:
-        recovered = await recover_stale_leases(session, now=now)
+        async with session.begin():
+            recovered = await recover_stale_leases(session, now=now)
         assert recovered >= 1
         stale_row = await session.get(Outbox, eid_stale)
         assert stale_row is not None
@@ -361,7 +401,7 @@ async def test_claim_commits_before_dispatch_recoverable_after_crash() -> None:
     user, resource = await _seed_user_and_resource()
     booking = await _seed_booking(user, resource)
     sessionmaker = get_sessionmaker()
-    now = datetime(2026, 9, 10, 10, 0, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
 
     async with sessionmaker() as session:
         async with session.begin():
@@ -395,7 +435,7 @@ async def test_transaction_durability_of_available_at() -> None:
     user, resource = await _seed_user_and_resource()
     booking = await _seed_booking(user, resource)
     sessionmaker = get_sessionmaker()
-    now = datetime(2026, 9, 10, 10, 0, 0, tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
 
     async with sessionmaker() as session:
         async with session.begin():
@@ -410,7 +450,8 @@ async def test_transaction_durability_of_available_at() -> None:
 
     # Fail attempt 1
     async with sessionmaker() as session:
-        ok = await fail_lease(session, lease=lease, error_category="timeout", now=now)
+        async with session.begin():
+            ok = await fail_lease(session, lease=lease, error_category="timeout", now=now)
     assert ok is True
 
     # In a fresh session, verify available_at matches the exact backoff formula
