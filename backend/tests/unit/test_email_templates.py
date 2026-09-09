@@ -115,3 +115,40 @@ def test_render_hold_expired() -> None:
     assert "Lab Bench A" in body
     assert "https://commonsbook.example.com/waitlist" in body
     assert not re.search(r"(?i)(token|bearer|password)", body)
+
+
+def test_render_templates_escape_crlf_header_injection() -> None:
+    """R2: CR/LF in resource name must never reach email Subject headers."""
+    malicious_resource = "Room\r\nBcc: evil@example.com\r\nX-Injected: attack"
+    starts = datetime(2026, 9, 10, 14, 0, 0, tzinfo=timezone.utc)
+    ends = datetime(2026, 9, 10, 16, 0, 0, tzinfo=timezone.utc)
+    expires = datetime(2026, 9, 10, 10, 15, 0, tzinfo=timezone.utc)
+
+    # 1. Booking confirmed
+    subj_conf, _ = render_booking_confirmed(
+        resource_name=malicious_resource, starts_at=starts, ends_at=ends
+    )
+    assert "\r" not in subj_conf
+    assert "\n" not in subj_conf
+    assert subj_conf == "Booking Confirmed: Room Bcc: evil@example.com X-Injected: attack"
+
+    # 2. Booking cancelled
+    subj_canc, _ = render_booking_cancelled(
+        resource_name=malicious_resource, starts_at=starts, ends_at=ends
+    )
+    assert "\r" not in subj_canc
+    assert "\n" not in subj_canc
+
+    # 3. Waitlist offered
+    subj_offered, _ = render_waitlist_offered(
+        resource_name=malicious_resource, starts_at=starts, ends_at=ends, expires_at=expires
+    )
+    assert "\r" not in subj_offered
+    assert "\n" not in subj_offered
+
+    # 4. Hold expired
+    subj_exp, _ = render_hold_expired(
+        resource_name=malicious_resource, starts_at=starts, ends_at=ends
+    )
+    assert "\r" not in subj_exp
+    assert "\n" not in subj_exp

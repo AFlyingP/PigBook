@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -27,7 +27,16 @@ from app.resources.models import Resource
 logger = logging.getLogger("notifications.handler")
 
 
-async def dispatch_event(
+async def dispatch_event(lease: OutboxLease, adapter: EmailAdapter) -> None:
+    """Dispatch an outbox event lease to the notification email adapter (Spec 3.4).
+
+    Fixed 2-parameter public interface. Seams for sessionmaker, timing, and settings
+    are provided via internal helper _dispatch_event.
+    """
+    await _dispatch_event(lease, adapter)
+
+
+async def _dispatch_event(
     lease: OutboxLease,
     adapter: EmailAdapter,
     *,
@@ -35,16 +44,7 @@ async def dispatch_event(
     now: datetime | None = None,
     settings: Settings | None = None,
 ) -> None:
-    """Dispatch an outbox event lease to the notification email adapter.
-
-    1. Get-or-create the notification_deliveries receipt keyed by (event, recipient, email).
-       If a sent or skipped receipt exists, skips sending and marks outbox delivered.
-    2. Check recipient status: disabled recipient -> skipped.
-    3. Check waitlist_offered: if linked booking is no longer offered -> skipped.
-    4. Release database connection.
-    5. Send email outside transaction with stable <event_id.recipient_id@...> Message-ID.
-    6. Transactionally mark receipt 'sent' and outbox row 'delivered'.
-    """
+    """Internal implementation of dispatch_event with dependency seams."""
     sm = sessionmaker or get_sessionmaker()
     cfg = settings or get_settings()
 
@@ -54,8 +54,10 @@ async def dispatch_event(
 
     recipient_id_str = lease.payload.get("recipient_id")
     if not recipient_id_str:
+        # R1: Commit lease transition on early exit
         async with sm() as session:
-            await acknowledge(session, lease=lease, now=db_now)
+            async with session.begin():
+                await acknowledge(session, lease=lease, now=db_now)
         return
 
     recipient_id = uuid.UUID(recipient_id_str)
@@ -65,6 +67,11 @@ async def dispatch_event(
     # 1. Short transaction: get/create receipt, check skip criteria, load metadata
     async with sm() as session:
         async with session.begin():
+            # R6: PostgreSQL clock_timestamp() is authoritative for deadline decisions
+            db_clock = await session.scalar(select(func.clock_timestamp()))
+            if db_clock is not None:
+                db_now = db_clock
+
             # Concurrency-safe atomic get-or-create using ON CONFLICT DO NOTHING
             stmt_ins = (
                 pg_insert(NotificationDelivery)
@@ -106,7 +113,7 @@ async def dispatch_event(
                 await acknowledge(session, lease=lease, now=db_now)
                 return
 
-            # Check waitlist_offered expiration / status
+            # Check waitlist_offered expiration / status using db_now
             if lease.event_type == "waitlist_offered":
                 booking = await session.get(Booking, booking_id)
                 if (
@@ -182,13 +189,17 @@ async def dispatch_event(
         provider_message_id = await adapter.send(message)
     except EmailDeliveryError as exc:
         logger.warning("Email adapter delivery failure for lease %s: %s", lease.id, exc.category)
+        # R1: Commit fail_lease transition
         async with sm() as session:
-            await fail_lease(session, lease=lease, error_category=exc.category, now=db_now)
+            async with session.begin():
+                await fail_lease(session, lease=lease, error_category=exc.category, now=db_now)
         return
     except Exception as exc:
         logger.warning("Unexpected error delivering notification for lease %s: %s", lease.id, exc)
+        # R1: Commit fail_lease transition
         async with sm() as session:
-            await fail_lease(session, lease=lease, error_category="transport", now=db_now)
+            async with session.begin():
+                await fail_lease(session, lease=lease, error_category="transport", now=db_now)
         return
 
     # Transactionally mark receipt 'sent' and outbox row 'delivered'

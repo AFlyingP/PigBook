@@ -89,6 +89,13 @@ class SMTPEmailAdapter:
         else:
             logger.info("Sending notification message %s", message.message_id)
 
+        # R2 security defense: reject header injection containing CR or LF
+        if any(bad in message.subject for bad in ("\r", "\n")) or any(
+            bad in message.to for bad in ("\r", "\n")
+        ):
+            logger.warning("SMTP header injection detected for message %s", message.message_id)
+            raise EmailDeliveryError("transport")
+
         mime_msg = PyEmailMessage()
         mime_msg["Message-ID"] = message.message_id
         mime_msg["To"] = message.to

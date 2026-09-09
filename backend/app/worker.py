@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.config import Settings, get_settings
 from app.db.session import get_sessionmaker
 from app.notifications.adapters import ConsoleEmailAdapter, EmailAdapter
-from app.notifications.handler import dispatch_event
+from app.notifications.handler import _dispatch_event
 from app.notifications.maintenance import run_maintenance
 from app.notifications.outbox import claim_batch, recover_stale_leases, renew_lease
 from app.waitlist.scheduler import HoldExpiryScheduler, record_heartbeat
@@ -211,18 +211,7 @@ class OutboxDispatcher:
         self.poll_interval = poll_interval
 
     async def run(self, supervisor: WorkerSupervisor) -> None:
-        """Run the polling and dispatch loop supervised independently."""
-        email_enabled = getattr(self.settings, "EMAIL_ENABLED", False)
-        if not email_enabled:
-            logger.info(
-                "OutboxDispatcher: EMAIL_ENABLED=false; notification delivery disabled; "
-                "outbox rows stay pending"
-            )
-            while not supervisor.is_stopping:
-                if await supervisor._wait_or_stop(self.poll_interval):
-                    break
-            return
-
+        """Run the polling and dispatch loop supervised independently (Spec 6.1, R5)."""
         adapter = self.adapter
         if adapter is None:
             email_adapter_type = getattr(self.settings, "EMAIL_ADAPTER", "console")
@@ -237,10 +226,16 @@ class OutboxDispatcher:
         while not supervisor.is_stopping:
             try:
                 now = datetime.now(timezone.utc)
-                # 1. Recover stale leases
+                # 1. Stale-lease recovery runs unconditionally (Spec 6.2, R5)
                 async with self.sessionmaker() as session:
                     async with session.begin():
                         await recover_stale_leases(session, now=now)
+
+                email_enabled = getattr(self.settings, "EMAIL_ENABLED", False)
+                if not email_enabled:
+                    if await supervisor._wait_or_stop(self.poll_interval):
+                        break
+                    continue
 
                 # 2. Claim at most one due row (claim_batch commits before dispatch)
                 async with self.sessionmaker() as session:
@@ -266,8 +261,8 @@ class OutboxDispatcher:
                     )
                     continue
 
-                # 4. Dispatch outside transaction
-                await dispatch_event(
+                # 4. Dispatch outside transaction using internal helper
+                await _dispatch_event(
                     lease,
                     adapter,
                     sessionmaker=self.sessionmaker,

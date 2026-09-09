@@ -22,6 +22,15 @@ def escape_control_characters(text: str) -> str:
     return cleaned.strip()
 
 
+def escape_header_value(text: str) -> str:
+    """Strip CR, LF, and all other control characters to prevent email header injection (R2)."""
+    if not text:
+        return ""
+    # Strip CR (\r), LF (\n), and all other control characters
+    cleaned = re.sub(r"[\r\n\x00-\x1f\x7f-\x9f]", " ", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 def format_time_pair(dt: datetime) -> tuple[str, str]:
     """Format datetime in UTC and America/New_York."""
     if dt.tzinfo is None:
@@ -42,8 +51,9 @@ def render_booking_confirmed(
     app_origin: str = "http://localhost:5173",
 ) -> tuple[str, str]:
     """Render subject and body for booking_confirmed notification."""
+    header_resource = escape_header_value(resource_name)
     safe_resource = escape_control_characters(resource_name)
-    subject = f"Booking Confirmed: {safe_resource}"
+    subject = f"Booking Confirmed: {header_resource}"
 
     start_utc, start_local = format_time_pair(starts_at)
     end_utc, end_local = format_time_pair(ends_at)
@@ -70,8 +80,9 @@ def render_booking_cancelled(
     app_origin: str = "http://localhost:5173",
 ) -> tuple[str, str]:
     """Render subject and body for booking_cancelled notification."""
+    header_resource = escape_header_value(resource_name)
     safe_resource = escape_control_characters(resource_name)
-    subject = f"Booking Cancelled: {safe_resource}"
+    subject = f"Booking Cancelled: {header_resource}"
 
     start_utc, start_local = format_time_pair(starts_at)
     end_utc, end_local = format_time_pair(ends_at)
@@ -96,8 +107,9 @@ def render_waitlist_offered(
     app_origin: str = "http://localhost:5173",
 ) -> tuple[str, str]:
     """Render subject and body for waitlist_offered notification."""
+    header_resource = escape_header_value(resource_name)
     safe_resource = escape_control_characters(resource_name)
-    subject = f"Waitlist Offer: {safe_resource}"
+    subject = f"Waitlist Offer: {header_resource}"
 
     start_utc, start_local = format_time_pair(starts_at)
     end_utc, end_local = format_time_pair(ends_at)
@@ -125,8 +137,9 @@ def render_hold_expired(
     app_origin: str = "http://localhost:5173",
 ) -> tuple[str, str]:
     """Render subject and body for hold_expired notification."""
+    header_resource = escape_header_value(resource_name)
     safe_resource = escape_control_characters(resource_name)
-    subject = f"Waitlist Hold Expired: {safe_resource}"
+    subject = f"Waitlist Hold Expired: {header_resource}"
 
     start_utc, start_local = format_time_pair(starts_at)
     end_utc, end_local = format_time_pair(ends_at)

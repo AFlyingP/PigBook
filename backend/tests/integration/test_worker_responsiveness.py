@@ -258,3 +258,120 @@ async def test_worker_responsiveness_with_twenty_second_blocked_adapter() -> Non
             await asyncio.wait_for(supervisor_task, timeout=10.0)
         except Exception:
             supervisor_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_disabled_email_leaves_outbox_pending_and_lifecycle_running() -> None:
+    """R4: EMAIL_ENABLED=false never invokes adapter, outbox stays pending, lifecycle runs."""
+    user, resource = await _seed_user_and_resource()
+    sessionmaker = get_sessionmaker()
+    now = datetime.now(timezone.utc)
+
+    # 1. Create a confirmed booking with an outbox event
+    t_start = now + timedelta(days=3)
+    t_end = t_start + timedelta(hours=1)
+    async with sessionmaker() as session:
+        async with session.begin():
+            booking = Booking(
+                id=uuid.uuid4(),
+                resource_id=resource.id,
+                user_id=user.id,
+                created_by=user.id,
+                kind="reservation",
+                time_range=Range(t_start, t_end, bounds="[)"),
+                status="confirmed",
+                expires_at=None,
+                version=1,
+            )
+            session.add(booking)
+            await session.flush()
+            outbox_id = await append_event(
+                session, event_type="booking_confirmed", booking=booking, now=now
+            )
+
+    # 2. Create overdue hold to verify scheduler runs concurrently
+    t_due_s = now + timedelta(days=4)
+    t_due_e = t_due_s + timedelta(hours=1)
+    async with sessionmaker() as session:
+        async with session.begin():
+            b_due = Booking(
+                id=uuid.uuid4(),
+                resource_id=resource.id,
+                user_id=user.id,
+                created_by=user.id,
+                kind="reservation",
+                time_range=Range(t_due_s, t_due_e, bounds="[)"),
+                status="offered",
+                expires_at=now - timedelta(seconds=10),
+                version=1,
+            )
+            session.add(b_due)
+
+    # 3. Create a tracking adapter that records invocations
+    class CallTrackingAdapter(EmailAdapter):
+        def __init__(self) -> None:
+            self.calls: list[EmailMessage] = []
+
+        async def send(self, message: EmailMessage) -> str:
+            self.calls.append(message)
+            return "tracking-msg-id"
+
+    tracking_adapter = CallTrackingAdapter()
+    disabled_settings = Settings(
+        APP_ENV="test",
+        EMAIL_ENABLED=False,
+        EMAIL_ADAPTER="console",
+    )
+
+    supervisor = WorkerSupervisor(
+        sessionmaker=sessionmaker,
+        resource_ids=[resource.id],
+        heartbeat_interval=0.5,
+        scheduler_interval=0.5,
+        maintenance_interval=3600.0,
+        shutdown_budget=5.0,
+    )
+
+    dispatcher = OutboxDispatcher(
+        sessionmaker=sessionmaker,
+        adapter=tracking_adapter,
+        settings=disabled_settings,
+        poll_interval=0.2,
+    )
+    supervisor.register_task(dispatcher.run)
+
+    supervisor_task = asyncio.create_task(supervisor.run())
+
+    try:
+        # Let supervisor and dispatcher run for multiple polling/heartbeat cycles
+        await asyncio.sleep(2.0)
+
+        # R4 Assertions:
+        # 1. Adapter was NEVER invoked
+        assert len(tracking_adapter.calls) == 0, (
+            "Adapter must not be called when EMAIL_ENABLED=false"
+        )
+
+        # 2. Outbox row remains in status='pending' with attempts=0
+        async with sessionmaker() as session:
+            outbox_row = await session.get(Outbox, outbox_id)
+            assert outbox_row is not None
+            assert outbox_row.status == "pending"
+            assert outbox_row.attempts == 0
+            assert outbox_row.lease_token is None
+
+            # 3. Heartbeat updated
+            hb = await session.get(WorkerHeartbeat, "primary")
+            assert hb is not None
+
+            # 4. Due hold was expired by the concurrently running scheduler
+            expired_booking = await session.get(Booking, b_due.id)
+            assert expired_booking is not None
+            assert expired_booking.status == "expired"
+
+    finally:
+        supervisor.request_shutdown()
+        try:
+            await asyncio.wait_for(supervisor_task, timeout=5.0)
+        except Exception:
+            supervisor_task.cancel()

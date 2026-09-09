@@ -23,10 +23,15 @@ from app.auth.passwords import hash_password
 from app.bookings.models import Booking
 from app.config import get_settings
 from app.db.session import get_sessionmaker
-from app.notifications.adapters import EmailAdapter, EmailMessage
-from app.notifications.handler import dispatch_event
+from app.notifications.adapters import EmailAdapter, EmailDeliveryError, EmailMessage
+from app.notifications.handler import _dispatch_event, dispatch_event
 from app.notifications.models import NotificationDelivery, Outbox
-from app.notifications.outbox import append_event, claim_batch, recover_stale_leases
+from app.notifications.outbox import (
+    append_event,
+    claim_batch,
+    compute_backoff_seconds,
+    recover_stale_leases,
+)
 from app.resources.models import Resource
 
 get_settings.cache_clear()
@@ -147,7 +152,7 @@ async def test_duplicate_delivery_after_sent_receipt_skips_send() -> None:
     lease = leases[0]
 
     adapter = RecordingEmailAdapter()
-    await dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
+    await _dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
 
     assert len(adapter.sent_messages) == 1
     assert adapter.sent_messages[0].to == user.email
@@ -168,7 +173,7 @@ async def test_duplicate_delivery_after_sent_receipt_skips_send() -> None:
         assert outbox_row.status == "delivered"
 
     # Redelivery attempt with the same lease: should skip send
-    await dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
+    await _dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
     assert len(adapter.sent_messages) == 1  # Still 1, not sent again!
 
 
@@ -209,7 +214,7 @@ async def test_crash_injected_after_send_allows_duplicate_email_no_domain_duplic
     crashing_adapter = CrashingAdapter(adapter)
 
     with pytest.raises(SystemExit):
-        await dispatch_event(lease, crashing_adapter, sessionmaker=sessionmaker, now=now)
+        await _dispatch_event(lease, crashing_adapter, sessionmaker=sessionmaker, now=now)
 
     # Message was sent to the provider
     assert len(adapter.sent_messages) == 1
@@ -233,7 +238,7 @@ async def test_crash_injected_after_send_allows_duplicate_email_no_domain_duplic
     reclaimed_lease = reclaimed_leases[0]
 
     # Dispatch again: now completes successfully
-    await dispatch_event(
+    await _dispatch_event(
         reclaimed_lease, crashing_adapter, sessionmaker=sessionmaker, now=now_recovered
     )
 
@@ -289,7 +294,7 @@ async def test_disabled_recipient_skipped() -> None:
     lease = leases[0]
 
     adapter = RecordingEmailAdapter()
-    await dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
+    await _dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
 
     # Email was NOT sent
     assert len(adapter.sent_messages) == 0
@@ -328,7 +333,7 @@ async def test_stale_or_expired_waitlist_offered_skipped() -> None:
     lease = leases[0]
 
     adapter = RecordingEmailAdapter()
-    await dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
+    await _dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
 
     # Email NOT sent because booking is not offered
     assert len(adapter.sent_messages) == 0
@@ -363,7 +368,7 @@ async def test_no_db_connection_held_during_smtp() -> None:
     lease = leases[0]
 
     adapter = RecordingEmailAdapter()
-    await dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
+    await _dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now)
 
     assert len(adapter.sent_messages) == 1
     # Check that checked-out connections count was 0 during adapter.send
@@ -392,8 +397,8 @@ async def test_receipt_uniqueness_under_concurrency() -> None:
 
     # Run two dispatch_event calls concurrently for the exact same lease
     await asyncio.gather(
-        dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now),
-        dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now),
+        _dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now),
+        _dispatch_event(lease, adapter, sessionmaker=sessionmaker, now=now),
     )
 
     # Exactly 1 receipt in notification_deliveries
@@ -409,3 +414,116 @@ async def test_receipt_uniqueness_under_concurrency() -> None:
         )
         assert len(receipts) == 1
         assert receipts[0].state == "sent"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_event_public_signature_two_args() -> None:
+    """Fixed Spec 3.4 public signature dispatch_event(lease, adapter) takes 2 args."""
+    user, resource = await _seed_user_and_resource()
+    booking = await _seed_booking(user, resource)
+    sessionmaker = get_sessionmaker()
+    now = datetime.now(timezone.utc)
+
+    async with sessionmaker() as session:
+        async with session.begin():
+            eid = await append_event(
+                session, event_type="booking_confirmed", booking=booking, now=now
+            )
+
+    async with sessionmaker() as session:
+        leases = await claim_batch(session, now=now)
+    lease = leases[0]
+
+    adapter = RecordingEmailAdapter()
+    # Call the exact public 2-argument signature
+    await dispatch_event(lease, adapter)
+
+    assert len(adapter.sent_messages) == 1
+    async with sessionmaker() as session:
+        outbox_row = await session.get(Outbox, eid)
+        assert outbox_row is not None
+        assert outbox_row.status == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_adapter_delivery_error_transitions_to_pending_with_backoff_and_last_error() -> None:
+    """R1: EmailDeliveryError commits transition to pending with backoff and last_error."""
+    user, resource = await _seed_user_and_resource()
+    booking = await _seed_booking(user, resource)
+    sessionmaker = get_sessionmaker()
+    now = datetime.now(timezone.utc)
+
+    async with sessionmaker() as session:
+        async with session.begin():
+            eid = await append_event(
+                session, event_type="booking_confirmed", booking=booking, now=now
+            )
+
+    async with sessionmaker() as session:
+        leases = await claim_batch(session, now=now)
+    lease = leases[0]
+
+    class FailingAdapter(EmailAdapter):
+        async def send(self, message: EmailMessage) -> str:
+            raise EmailDeliveryError("timeout")
+
+    failing_adapter = FailingAdapter()
+    await _dispatch_event(lease, failing_adapter, sessionmaker=sessionmaker, now=now)
+
+    # R1 assertion: Outbox row MUST NOT remain processing; it must be committed to 'pending'
+    async with sessionmaker() as session:
+        outbox_row = await session.get(Outbox, eid)
+        assert outbox_row is not None
+        assert outbox_row.status == "pending", (
+            f"Expected row to transition to pending, got {outbox_row.status}"
+        )
+        assert outbox_row.last_error == "timeout"
+        assert outbox_row.lease_token is None
+        assert outbox_row.lease_until is None
+
+        # Verify backoff availability (allowing subsecond DB clock skew from R6)
+        expected_backoff = compute_backoff_seconds(lease.id, lease.attempts)
+        expected_available = now + timedelta(seconds=expected_backoff)
+        assert abs((outbox_row.available_at - expected_available).total_seconds()) < 2.0
+
+        # Before expected_available, row is NOT claimed
+        early_leases = await claim_batch(session, now=now + timedelta(seconds=1))
+        assert not any(item.id == eid for item in early_leases)
+
+        # At available_at, row IS claimed
+        due_leases = await claim_batch(session, now=outbox_row.available_at)
+        assert any(item.id == eid for item in due_leases)
+
+
+@pytest.mark.asyncio
+async def test_adapter_unexpected_exception_transitions_to_pending_with_transport_error() -> None:
+    """R1: Unexpected adapter exception commits fail_lease transition with category='transport'."""
+    user, resource = await _seed_user_and_resource()
+    booking = await _seed_booking(user, resource)
+    sessionmaker = get_sessionmaker()
+    now = datetime.now(timezone.utc)
+
+    async with sessionmaker() as session:
+        async with session.begin():
+            eid = await append_event(
+                session, event_type="booking_confirmed", booking=booking, now=now
+            )
+
+    async with sessionmaker() as session:
+        leases = await claim_batch(session, now=now)
+    lease = leases[0]
+
+    class ExplodingAdapter(EmailAdapter):
+        async def send(self, message: EmailMessage) -> str:
+            raise RuntimeError("Unexpected network socket explosion")
+
+    exploding_adapter = ExplodingAdapter()
+    await _dispatch_event(lease, exploding_adapter, sessionmaker=sessionmaker, now=now)
+
+    async with sessionmaker() as session:
+        outbox_row = await session.get(Outbox, eid)
+        assert outbox_row is not None
+        assert outbox_row.status == "pending"
+        assert outbox_row.last_error == "transport"
+        assert outbox_row.lease_token is None
+        assert outbox_row.lease_until is None
