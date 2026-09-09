@@ -148,7 +148,7 @@ The worker process runs as an independent asyncio service supervising independen
 1. **Heartbeat Task**: Updates the primary heartbeat timestamp every 10 seconds.
 2. **Hold Expiry Scheduler**: Discovers overdue holds and waiting entries every 30 seconds.
 3. **Hourly Maintenance**: Deletes expired idempotency rows and stale rate-limit buckets every 3600 seconds.
-4. **Extension Tasks**: Clean registration seam for future background tasks (such as the T-018 notification dispatcher).
+4. **Notification Dispatcher**: Supervises the outbox polling loop, lease renewal, idempotent event delivery, and retry backoff.
 
 #### Session and Connection Invariants
 - Each task and operation owns its own `AsyncSession`; sessions are never shared across tasks.
@@ -192,6 +192,30 @@ Maintenance deletes **only** expired idempotency keys and old rate-limit buckets
 - Audit log entries
 - Outbox rows or delivery receipts
 - Refresh tokens or refresh token families (retained at least `family_expires_at + 30 days` for reuse detection)
+
+
+### Notification Dispatcher and Outbox Delivery (`app/notifications/`)
+
+#### Dispatcher Architecture and Polling Cadence
+- **Cadence**: Polls every 1 second when idle (`DISPATCHER_POLL_INTERVAL_SECONDS = 1.0`).
+- **Claim Batching**: Claims at most **one** due row per idle cycle using `SELECT ... FOR UPDATE SKIP LOCKED` ordered by `available_at, occurred_at, id`.
+- **Durability and Lease**: When claimed, the row status is set to `'processing'`, attempts are incremented (`attempts = attempts + 1`), a fresh UUID `lease_token` is generated, and `lease_until = now + 60s` is set. The claim transaction **commits to PostgreSQL before dispatch** so unexpected worker crashes leave the row durably leased.
+- **Pre-Dispatch Lease Renewal**: Immediately prior to external dispatch, the owned lease is renewed. If ownership is lost (e.g., due to local pause or lease expiration), dispatch is skipped.
+- **Connection Isolation**: The SMTP network transmission is executed strictly outside any database transaction, and no database connection or lock is held during email transmission.
+- **Token-Fenced Acknowledgment**: After successful delivery, the `notification_deliveries` receipt is marked `'sent'` and the outbox row is marked `'delivered'` within a single database transaction token-fenced on `id == lease.id AND lease_token == lease.lease_token AND status == 'processing'`.
+
+#### Stale Lease Recovery and Exponential Backoff
+- **Stale Lease Recovery**: In each dispatcher cycle, expired processing rows (`status = 'processing' AND lease_until <= now`) are recovered. Rows with `attempts < 8` return to `status = 'pending'` with cleared lease fields and `available_at = now`. Rows with `attempts >= 8` transition to `status = 'dead'`.
+- **Exponential Backoff with Deterministic Jitter**: Failed deliveries compute the next retry time as:
+  $$\text{available\_at} = \text{now} + \min(3600, 5 \times 2^{\text{attempt}-1}) + (\text{int}(\text{event\_id}) \bmod 5) \text{ seconds}$$
+- **Dead-Letter Threshold**: Upon reaching attempt 8 (`attempts >= 8`), the row transitions to `status = 'dead'`. Dead rows are excluded from the pending index and will not be claimed again automatically.
+- **Error Redaction and Length Cap**: The `last_error` field stores only safe, redacted error categories (such as `timeout`, `tls`, `authentication`, `recipient_rejected`, or `transport`) and is capped at 500 characters. Passwords, auth tokens, recipient addresses, and message bodies are strictly redacted.
+
+#### Initial Deployment and Default Behavior (`EMAIL_ENABLED=false`)
+- By default, `EMAIL_ENABLED=false`.
+- When disabled, the dispatcher loop logs this state and sleeps without invoking any adapter or querying for claims.
+- Outbox rows remain safely in `status = 'pending'`. The scheduler, heartbeat, and maintenance tasks continue uninterrupted.
+- Pending outbox records during initial deployment prior to provider configuration are expected and documented.
 
 ### Observability and Heartbeat Monitoring
 
@@ -244,4 +268,20 @@ WHERE name = 'primary';
    WHERE relation = 'resources'::regclass;
    ```
 3. The scheduler safely skips locked resources (`SKIP LOCKED`) and retries on subsequent passes. Long transactions holding resource locks should be investigated and terminated if unprompted.
+
+#### Symptom: Dead Outbox Records (`status='dead'`)
+1. Query dead outbox events:
+   ```sql
+   SELECT id, event_type, aggregate_id, attempts, occurred_at, last_error
+   FROM outbox
+   WHERE status = 'dead'
+   ORDER BY occurred_at DESC;
+   ```
+2. Inspect `last_error` for failure categories:
+   - `authentication`: Verify `SMTP_USERNAME` and `SMTP_PASSWORD` secrets in deployment settings.
+   - `tls`: Check SMTP host TLS certificate validity and port (fixed 587).
+   - `timeout`: Check network routing and firewall rules to the SMTP relay.
+   - `recipient_rejected`: Verify recipient email format and validity.
+3. Retrying a dead event is performed through the administrative outbox retry endpoint (`POST /api/v1/admin/outbox/{id}/retry`), which is part of the administrative endpoints package and is not yet exposed in this build. Until exposed, dead rows remain in `status = 'dead'` and must not be edited by hand without an approved operator procedure.
+
 

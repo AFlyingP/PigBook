@@ -18,6 +18,14 @@ class Settings(BaseSettings):
     RATE_LIMIT_HMAC_SECRET: str = ""
     TEST_PROFILE: str = "standard"
 
+    EMAIL_ADAPTER: Literal["console", "smtp"] = "console"
+    EMAIL_ENABLED: bool = False
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 587
+    SMTP_USERNAME: str = ""
+    SMTP_PASSWORD: str = ""
+    EMAIL_FROM: str = ""
+
     # Strict rejection of unknown application settings arrives with configuration tests.
     model_config = SettingsConfigDict(
         env_file=".env",
