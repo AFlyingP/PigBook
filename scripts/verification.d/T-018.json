@@ -1,0 +1,14 @@
+{
+  "ticket_id": "T-018",
+  "pytest_paths": [
+    "backend/tests/unit/test_backoff.py",
+    "backend/tests/integration/test_outbox_leases.py",
+    "backend/tests/integration/test_notification_handler.py",
+    "backend/tests/unit/test_email_templates.py",
+    "backend/tests/integration/test_worker_responsiveness.py",
+    "backend/tests/unit/test_smtp_adapter.py"
+  ],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}

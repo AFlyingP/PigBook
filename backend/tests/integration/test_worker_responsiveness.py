@@ -147,7 +147,7 @@ async def test_worker_responsiveness_with_twenty_second_blocked_adapter() -> Non
 
     # 3. Setup WorkerSupervisor with 20-second blocked email adapter
     blocked_adapter = BlockedEmailAdapter(block_seconds=20.0)
-    test_settings = Settings.model_construct(
+    test_settings = Settings(
         APP_ENV="test",
         EMAIL_ENABLED=True,
         EMAIL_ADAPTER="console",
