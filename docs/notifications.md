@@ -34,7 +34,7 @@ CommonsBook implements reliable, asynchronous email notification delivery using 
      $$\text{available\_at} = \text{now} + \min(3600, 5 \times 2^{\text{attempt}-1}) + (\text{int}(\text{event\_id}) \bmod 5) \text{ seconds}$$
    - When attempts reach 8 (`attempts >= 8`), the row transitions to `status = 'dead'`.
    - The `last_error` field stores only sanitized, redacted error categories (maximum 500 characters), ensuring no SMTP credentials, passwords, or message bodies are ever persisted.
-   - Dead outbox items can be retried by administrators via `POST /api/v1/admin/outbox/{id}/retry`.
+   - Retrying a dead event is performed through the administrative outbox retry endpoint, which is part of the administrative endpoints package and is not yet exposed in this build; until then, dead rows remain in `status = 'dead'`.
 
 ---
 

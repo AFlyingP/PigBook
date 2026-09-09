@@ -282,10 +282,6 @@ WHERE name = 'primary';
    - `tls`: Check SMTP host TLS certificate validity and port (fixed 587).
    - `timeout`: Check network routing and firewall rules to the SMTP relay.
    - `recipient_rejected`: Verify recipient email format and validity.
-3. Once the root cause is addressed, administrators can retry dead events via the administrative API:
-   ```bash
-   POST /api/v1/admin/outbox/{id}/retry
-   ```
-   This transitions the row from `'dead'` to `'pending'`, resets attempts to 0, sets `available_at = clock_timestamp()`, clears `last_error`, and records an audit entry.
+3. Retrying a dead event is performed through the administrative outbox retry endpoint (`POST /api/v1/admin/outbox/{id}/retry`), which is part of the administrative endpoints package and is not yet exposed in this build. Until exposed, dead rows remain in `status = 'dead'` and must not be edited by hand without an approved operator procedure.
 
 
