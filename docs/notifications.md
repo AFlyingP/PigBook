@@ -61,7 +61,7 @@ In accordance with Spec 13.4, email delivery is **disabled by default** on initi
 - **Pending Outbox Rows**: Domain events will be appended to the `outbox` table as reservations, cancellations, and waitlist offers occur. These rows will remain in `status = 'pending'`.
 - **Worker Behavior**: The background worker daemon supervises the outbox dispatcher alongside the hold expiry scheduler, heartbeat monitor, and hourly maintenance. When `EMAIL_ENABLED=false`, the dispatcher logs that delivery is disabled and sleeps during each cycle without claiming rows or attempting network connections.
 - **Normal Operation**: Pending outbox accumulation during initial deployment prior to provider credential provisioning is normal, expected, and documented.
-- **Safety**: No real recipient will receive unverified test emails, and no external provider accounts or secrets are created autonomously.
+- **Safety**: No real recipient receives unverified test email, and no provider account or secret exists before the operator runs the enablement checkpoint.
 
 ---
 
@@ -70,7 +70,7 @@ In accordance with Spec 13.4, email delivery is **disabled by default** on initi
 Prior to enabling live email delivery in a production or staging environment, the human operator must execute the **CP-EMAIL** enablement checkpoint:
 
 ### Step 1: Provision an Approved SMTP Provider
-The operator provisions an external SMTP service (such as Amazon SES, SendGrid, Mailgun, Postmark, or an organization-approved SMTP relay). Autonomous subagents must never register for external accounts or purchase services.
+The operator provisions an external SMTP service (such as Amazon SES, SendGrid, Mailgun, Postmark, or an organization-approved SMTP relay). The operator provisions the account and supplies the credentials; no automated process registers for external accounts or purchases services.
 
 ### Step 2: Configure and Verify Sender Domain
 - Configure DNS records (SPF, DKIM, DMARC) for the outbound sending domain to establish email deliverability and avoid spam filtering.
