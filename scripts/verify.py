@@ -18,6 +18,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Add scripts directory to sys.path for verification_cache import
@@ -88,6 +93,22 @@ def check_no_skips(stdout: str, tool: str) -> str | None:
             or "collected 0 items" in stdout
         ):
             return "Policy violation: 0 tests collected in vitest execution"
+
+    elif tool == "playwright":
+        skip_match = re.search(r"\b(\d+)\s+skipped\b", stdout)
+        if skip_match and int(skip_match.group(1)) > 0:
+            return f"Policy violation: {skip_match.group(1)} test(s) skipped in playwright"
+
+        if (
+            "0 passed" in stdout
+            or "No tests found" in stdout
+            or "no tests found" in stdout.lower()
+        ):
+            return "Policy violation: 0 tests collected in playwright execution"
+
+        pass_match = re.search(r"\b(\d+)\s+passed\b", stdout)
+        if not pass_match or int(pass_match.group(1)) == 0:
+            return "Policy violation: 0 tests passed in playwright execution"
 
     return None
 
@@ -160,6 +181,8 @@ def run_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env=env,
         )
         stdout_text = sanitize_text(proc.stdout, secrets_to_redact)
@@ -173,9 +196,17 @@ def run_command(
         return_code = 1
 
     if stdout_text:
-        print(stdout_text, end="")
+        try:
+            print(stdout_text, end="")
+        except UnicodeEncodeError:
+            enc = sys.stdout.encoding or "utf-8"
+            print(stdout_text.encode(enc, errors="replace").decode(enc), end="")
     if stderr_text:
-        print(stderr_text, end="", file=sys.stderr)
+        try:
+            print(stderr_text, end="", file=sys.stderr)
+        except UnicodeEncodeError:
+            enc = sys.stderr.encoding or "utf-8"
+            print(stderr_text.encode(enc, errors="replace").decode(enc), end="", file=sys.stderr)
 
     # If the process exited 0, check for skips or zero collected tests
     if return_code == 0 and check_tool:
@@ -201,6 +232,8 @@ def get_git_sha() -> str:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if proc.returncode == 0:
         return proc.stdout.strip()
@@ -404,6 +437,8 @@ class IsolatedDatabaseManager:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             env={
                 **os.environ,
                 "POSTGRES_DB": self.db_name,
@@ -459,6 +494,8 @@ class IsolatedDatabaseManager:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if command_log is not None:
             command_log.append(
@@ -1135,15 +1172,26 @@ def run_target(
         playwright_paths = fragment["playwright_paths"]
         doc_checks = fragment["document_checks"]
 
-        needs_db = any("integration" in p or "concurrency" in p for p in pytest_paths)
+        needs_db = (
+            any("integration" in p or "concurrency" in p for p in pytest_paths)
+            or bool(playwright_paths)
+        )
         db_mgr = (
             IsolatedDatabaseManager(evidence_dir=evidence_dir, run_id=run_id)
             if needs_db
             else None
         )
 
+        uvicorn_proc = None
+        uvicorn_stdout_f = None
+        uvicorn_stderr_f = None
+        vite_proc = None
+        vite_stdout_f = None
+        vite_stderr_f = None
+
         try:
             test_env = dict(os.environ)
+            database_url = ""
             if db_mgr:
                 database_url = db_mgr.start(command_log)
                 test_env["DATABASE_URL"] = database_url
@@ -1189,9 +1237,235 @@ def run_target(
                     return code
 
             if playwright_paths:
-                sys.exit(
-                    "Error: Playwright verification paths not implemented in this version"
+                # 1. Run alembic upgrade head against the isolated database
+                upgrade_cmd = [
+                    uv_bin,
+                    "run",
+                    "--project",
+                    "backend",
+                    "alembic",
+                    "-c",
+                    "backend/alembic.ini",
+                    "upgrade",
+                    "head",
+                ]
+                env_db = {
+                    **os.environ,
+                    "DATABASE_URL": database_url,
+                    "TEST_RUN_ID": db_mgr.test_run_id if db_mgr else "",
+                }
+                code = run_command(
+                    upgrade_cmd, evidence_dir, len(command_log) + 1, env=env_db
                 )
+                command_log.append({"cmd": upgrade_cmd, "exit_code": code})
+                if code != 0:
+                    return code
+
+                # 1b. Seed isolated database with initial test entities for Playwright verification
+                seed_code = (
+                    "import asyncio, sys, uuid, hashlib\n"
+                    "from datetime import datetime, timedelta, timezone\n"
+                    "sys.path.insert(0, 'backend')\n"
+                    "from app.auth.models import User, Invitation\n"
+                    "from app.auth.passwords import hash_password\n"
+                    "from app.resources.models import Resource\n"
+                    "from app.bookings.models import Booking\n"
+                    "from sqlalchemy.dialects.postgresql import Range\n"
+                    "from app.db.session import get_sessionmaker\n\n"
+                    "async def seed():\n"
+                    "    sm = get_sessionmaker()\n"
+                    "    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)\n"
+                    "    async with sm() as s:\n"
+                    "        async with s.begin():\n"
+                    "            admin = User(id=uuid.UUID('11111111-1111-4111-8111-111111111111'), email='admin@example.com', password_hash=hash_password('AdminPassword123!'), display_name='Admin User', role='admin', enabled=True, version=1)\n"
+                    "            member = User(id=uuid.UUID('22222222-2222-4222-8222-222222222222'), email='member@example.com', password_hash=hash_password('MemberPassword123!'), display_name='Member User', role='member', enabled=True, version=1)\n"
+                    "            member2 = User(id=uuid.UUID('22222222-2222-4222-8222-222222222223'), email='member2@example.com', password_hash=hash_password('MemberPassword123!'), display_name='Member Two', role='member', enabled=True, version=1)\n"
+                    "            member3 = User(id=uuid.UUID('22222222-2222-4222-8222-222222222224'), email='member3@example.com', password_hash=hash_password('MemberPassword123!'), display_name='Member Three', role='member', enabled=True, version=1)\n"
+                    "            disabled = User(id=uuid.UUID('33333333-3333-4333-8333-333333333333'), email='disabled@example.com', password_hash=hash_password('MemberPassword123!'), display_name='Disabled User', role='member', enabled=False, version=1)\n"
+                    "            s.add_all([admin, member, member2, member3, disabled])\n"
+                    "            await s.flush()\n"
+                    "            t_hash = hashlib.sha256('valid-pilot-invitation-token-123'.encode('utf-8')).hexdigest()\n"
+                    "            inv = Invitation(id=uuid.UUID('44444444-4444-4444-8444-444444444444'), email='invited@example.com', token_hash=t_hash, role='member', created_by=admin.id, created_at=now, expires_at=now + timedelta(days=7))\n"
+                    "            r1 = Resource(id=uuid.UUID('55555555-5555-4555-8555-555555555555'), name='Community Woodshop', description='Equipped with power saws and workbenches.', location='Workshop Bay B', active=True, version=1)\n"
+                    "            r2 = Resource(id=uuid.UUID('66666666-6666-4666-8666-666666666666'), name='Pottery Studio', description='Features pottery wheels and kiln.', location='Room 101', active=True, version=1)\n"
+                    "            r3 = Resource(id=uuid.UUID('77777777-7777-4777-8777-777777777777'), name='Old Darkroom', description='Closed for renovation.', location='Basement', active=False, version=1)\n"
+                    "            s.add_all([inv, r1, r2, r3])\n"
+                    "            await s.flush()\n"
+                    "            slot_start = (now + timedelta(days=1)).replace(hour=14, minute=0, second=0, microsecond=0)\n"
+                    "            s.add(Booking(id=uuid.UUID('88888888-8888-4888-8888-888888888888'), resource_id=r1.id, user_id=member.id, created_by=member.id, kind='reservation', time_range=Range(slot_start, slot_start + timedelta(hours=2), bounds='[)'), status='confirmed', version=1))\n\n"
+                    "asyncio.run(seed())\n"
+                )
+                seed_cmd = [uv_bin, "run", "--project", "backend", "python", "-c", seed_code]
+                code = run_command(seed_cmd, evidence_dir, len(command_log) + 1, env=env_db)
+                command_log.append({"cmd": seed_cmd, "exit_code": code})
+                if code != 0:
+                    return code
+
+                # 2. Allocate free ports for backend and frontend Vite server
+                backend_port = find_free_port(18100)
+                vite_port = find_free_port(backend_port + 1)
+                backend_url = f"http://127.0.0.1:{backend_port}"
+                vite_url = f"http://127.0.0.1:{vite_port}"
+
+                # 3. Start real Uvicorn server
+                backend_env = {
+                    **os.environ,
+                    "DATABASE_URL": database_url,
+                    "TEST_RUN_ID": db_mgr.test_run_id if db_mgr else "",
+                    "APP_ENV": "local",
+                    "APP_ORIGIN": vite_url,
+                    "JWT_SECRET": os.environ.get("JWT_SECRET")
+                    or "test-jwt-secret-minimum-32-bytes-long-12345678",
+                    "RATE_LIMIT_HMAC_SECRET": os.environ.get("RATE_LIMIT_HMAC_SECRET")
+                    or "test-hmac-secret-minimum-32-bytes-long-1234",
+                    "RELEASE_SHA": get_git_sha(),
+                    "PYTHONPATH": str(REPO_ROOT / "backend"),
+                }
+                backend_python = (
+                    REPO_ROOT
+                    / "backend"
+                    / ".venv"
+                    / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+                )
+                server_cmd = [
+                    str(backend_python),
+                    "-c",
+                    (
+                        "import sys; sys.path.insert(0, 'backend'); "
+                        "import uvicorn, app.db.session; "
+                        "from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker; "
+                        "from app.config import get_settings; "
+                        "url = get_settings().DATABASE_URL; "
+                        "engine = create_async_engine("
+                        "    url, pool_size=20, max_overflow=0, pool_timeout=30.0, "
+                        "    connect_args={'server_settings': {'timezone': 'UTC', 'lock_timeout': '15s', 'statement_timeout': '30s', 'idle_in_transaction_session_timeout': '30s'}}"
+                        "); "
+                        "app.db.session._engine = engine; "
+                        "app.db.session._engine_url = url; "
+                        "app.db.session._sessionmaker = async_sessionmaker(bind=engine, expire_on_commit=False); "
+                        f"uvicorn.run('app.main:app', host='127.0.0.1', port={backend_port}, log_level='warning')"
+                    ),
+                ]
+                print(f"Starting Uvicorn server on port {backend_port} for browser verification...")
+                uvicorn_stdout_f = open(evidence_dir / "uvicorn_stdout.txt", "w", encoding="utf-8")
+                uvicorn_stderr_f = open(evidence_dir / "uvicorn_stderr.txt", "w", encoding="utf-8")
+                uvicorn_proc = subprocess.Popen(
+                    server_cmd,
+                    cwd=REPO_ROOT,
+                    env=backend_env,
+                    stdout=uvicorn_stdout_f,
+                    stderr=uvicorn_stderr_f,
+                    text=True,
+                )
+
+                # 4. Start real Vite dev server
+                vite_env = {
+                    **os.environ,
+                    "VITE_API_TARGET": backend_url,
+                    "BACKEND_URL": backend_url,
+                }
+                node_bin = find_tool("node")
+                vite_js = REPO_ROOT / "frontend" / "node_modules" / "vite" / "bin" / "vite.js"
+                vite_cmd = [
+                    str(node_bin),
+                    str(vite_js),
+                    "--port",
+                    str(vite_port),
+                    "--strictPort",
+                    "--host",
+                    "127.0.0.1",
+                ]
+                print(f"Starting Vite dev server on port {vite_port} proxying to {backend_url}...")
+                vite_stdout_f = open(evidence_dir / "vite_stdout.txt", "w", encoding="utf-8")
+                vite_stderr_f = open(evidence_dir / "vite_stderr.txt", "w", encoding="utf-8")
+                vite_proc = subprocess.Popen(
+                    vite_cmd,
+                    cwd=REPO_ROOT / "frontend",
+                    env=vite_env,
+                    stdout=vite_stdout_f,
+                    stderr=vite_stderr_f,
+                    text=True,
+                )
+
+                # 5. Wait for both servers to become ready
+                uvicorn_ready = False
+                for _ in range(60):
+                    time.sleep(0.5)
+                    if uvicorn_proc.poll() is not None:
+                        break
+                    try:
+                        with urllib.request.urlopen(f"{backend_url}/healthz", timeout=1) as resp:
+                            if resp.status == 200:
+                                uvicorn_ready = True
+                                break
+                    except Exception:
+                        continue
+                if not uvicorn_ready:
+                    uvicorn_stdout_f.flush()
+                    uvicorn_stderr_f.flush()
+                    err_c = (evidence_dir / "uvicorn_stderr.txt").read_text(encoding="utf-8")
+                    out_c = (evidence_dir / "uvicorn_stdout.txt").read_text(encoding="utf-8")
+                    raise RuntimeError(f"Uvicorn failed to become ready on {backend_url}:\n{err_c}\n{out_c}")
+
+                vite_ready = False
+                for _ in range(60):
+                    time.sleep(0.5)
+                    if vite_proc.poll() is not None:
+                        break
+                    try:
+                        with urllib.request.urlopen(vite_url, timeout=1) as resp:
+                            if resp.status == 200:
+                                vite_ready = True
+                                break
+                    except Exception:
+                        continue
+                if not vite_ready:
+                    vite_stdout_f.flush()
+                    vite_stderr_f.flush()
+                    err_c = (evidence_dir / "vite_stderr.txt").read_text(encoding="utf-8")
+                    out_c = (evidence_dir / "vite_stdout.txt").read_text(encoding="utf-8")
+                    raise RuntimeError(f"Vite failed to become ready on {vite_url}:\n{err_c}\n{out_c}")
+
+                # 6. Execute Playwright tests
+                pw_env = {
+                    **os.environ,
+                    "COMMONSBOOK_BASE_URL": vite_url,
+                    "APP_ORIGIN": vite_url,
+                    "BACKEND_URL": backend_url,
+                    "DATABASE_URL": database_url,
+                    "TEST_RUN_ID": db_mgr.test_run_id if db_mgr else "",
+                    "JWT_SECRET": backend_env["JWT_SECRET"],
+                    "RATE_LIMIT_HMAC_SECRET": backend_env["RATE_LIMIT_HMAC_SECRET"],
+                    "EVIDENCE_DIR": str(evidence_dir),
+                }
+                transformed_pw_paths: list[str] = []
+                for pp in playwright_paths:
+                    p = Path(pp)
+                    if p.parts and p.parts[0] == "frontend":
+                        transformed_pw_paths.append(Path(*p.parts[1:]).as_posix())
+                    else:
+                        transformed_pw_paths.append(Path(pp).as_posix())
+
+                pw_cmd = [
+                    npm_bin,
+                    "--prefix",
+                    "frontend",
+                    "run",
+                    "e2e",
+                    "--",
+                    "--reporter=list",
+                ] + transformed_pw_paths
+
+                code = run_command(
+                    pw_cmd,
+                    evidence_dir,
+                    len(command_log) + 1,
+                    env=pw_env,
+                    check_tool="playwright",
+                )
+                command_log.append({"cmd": pw_cmd, "exit_code": code})
+                if code != 0:
+                    return code
 
             if doc_checks:
                 sys.exit(
@@ -1200,6 +1474,24 @@ def run_target(
 
             return 0
         finally:
+            def _kill_proc(proc, out_f, err_f):
+                if proc and proc.poll() is None:
+                    if os.name == "nt":
+                        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+                    else:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=2)
+                if out_f:
+                    out_f.close()
+                if err_f:
+                    err_f.close()
+
+            _kill_proc(vite_proc, vite_stdout_f, vite_stderr_f)
+            _kill_proc(uvicorn_proc, uvicorn_stdout_f, uvicorn_stderr_f)
             if db_mgr:
                 db_mgr.stop(command_log)
 

@@ -1,22 +1,29 @@
+import { RouterProvider } from "react-router-dom";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { ThemeProvider } from "@mui/material/styles";
 import CssBaseline from "@mui/material/CssBaseline";
-import Container from "@mui/material/Container";
-import Typography from "@mui/material/Typography";
-import Box from "@mui/material/Box";
+import { theme } from "./theme";
+import { AuthProvider } from "./features/auth/AuthContext";
+import { router } from "./routes";
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: false,
+      staleTime: 30000,
+    },
+  },
+});
 
 export default function App() {
   return (
-    <>
-      <CssBaseline />
-      <Container maxWidth="md">
-        <Box sx={{ my: 4 }}>
-          <Typography variant="h3" component="h1" gutterBottom>
-            CommonsBook
-          </Typography>
-          <Typography variant="body1">
-            Equipment and room reservations for a single community group; accounts are invitation-only.
-          </Typography>
-        </Box>
-      </Container>
-    </>
+    <QueryClientProvider client={queryClient}>
+      <ThemeProvider theme={theme}>
+        <CssBaseline />
+        <AuthProvider>
+          <RouterProvider router={router} />
+        </AuthProvider>
+      </ThemeProvider>
+    </QueryClientProvider>
   );
 }
