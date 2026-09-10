@@ -12,6 +12,7 @@ from app.admin.schemas import (
     InviteCreate,
     ResourceCreate,
     ResourcePatch,
+    UserPatch,
 )
 from app.admin.service import (
     archive_resource,
@@ -22,11 +23,14 @@ from app.admin.service import (
     get_admin_booking,
     list_admin_bookings,
     list_admin_resources,
+    list_admin_users,
     list_resource_blackouts,
     update_resource,
+    update_user,
 )
 from app.auth.dependencies import AuthorizedScope, Policy, authorize
 from app.auth.schemas import InvitationResult
+from app.auth.schemas import User as UserSchema
 from app.bookings.idempotency import _parse_idempotency_key, execute_create
 from app.bookings.schemas import Booking as BookingSchema
 from app.bookings.schemas import BookingStatusFilter, Cancel, StoredResponse
@@ -345,4 +349,48 @@ async def create_invitation_endpoint(
         now=now,
     )
     response.headers["Cache-Control"] = "no-store"
+    return result
+
+
+# --- Administrator User Management (E27, E28) ---
+
+
+@router.get("/admin/users", response_model=Page[UserSchema])
+async def list_admin_users_endpoint(
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    enabled: bool | None = Query(default=None),
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(get_session),
+) -> Page[UserSchema]:
+    """List users across the system with optional enabled filter (E27)."""
+    return await list_admin_users(
+        session,
+        scope=scope,
+        limit=limit,
+        offset=offset,
+        enabled=enabled,
+    )
+
+
+@router.patch("/admin/users/{id}", response_model=UserSchema)
+async def update_user_endpoint(
+    id: uuid.UUID,
+    body: UserPatch,
+    response: Response,
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
+) -> UserSchema:
+    """Guarded patch of a user with optimistic concurrency and last-admin check (E28)."""
+    now = datetime.now(timezone.utc)
+    if scope.assert_current is not None:
+        await scope.assert_current(session)
+
+    result = await update_user(
+        session,
+        scope=scope,
+        data=body,
+        now=now,
+    )
+    response.headers["ETag"] = f'"{result.version}"'
     return result

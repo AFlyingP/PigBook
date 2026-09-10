@@ -400,3 +400,28 @@ async def register(
     )
 
     return UserSchema.model_validate(new_user)
+
+
+async def revoke_user_refresh_tokens(
+    session: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    now: datetime,
+) -> int:
+    """Revoke all active refresh tokens for a user inside an existing transaction (Spec 8.1).
+
+    The user must already be locked FOR UPDATE before calling this function to prevent
+    the disable-versus-refresh race.
+    """
+    stmt = (
+        update(RefreshToken)
+        .where(
+            RefreshToken.user_id == user_id,
+            RefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    res = await session.execute(stmt)
+    await session.flush()
+    rc = getattr(res, "rowcount", 0)
+    return int(rc if rc is not None else 0)

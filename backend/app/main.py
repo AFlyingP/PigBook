@@ -17,6 +17,7 @@ from app.auth.dependencies import (
     InvalidIfMatchError,
     InvalidRefreshError,
     InvalidTokenError,
+    LastAdminError,
     ObjectNotFoundError,
     OriginRejectedError,
     PreconditionRequiredError,
@@ -314,6 +315,14 @@ def create_app() -> FastAPI:
         return make_error_response(
             status_code=409,
             code="RESOURCE_IN_USE",
+            message=exc.message,
+        )
+
+    @app.exception_handler(LastAdminError)
+    async def last_admin_handler(_request: Request, exc: LastAdminError) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="LAST_ADMIN",
             message=exc.message,
         )
 
