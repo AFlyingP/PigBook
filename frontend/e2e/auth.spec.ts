@@ -15,11 +15,39 @@ test.describe("Authentication E2E Flow (Spec 7.1, 7.2, 8.1)", () => {
     await expect(page.getByText("Member User")).toBeVisible();
     await expect(page.getByRole("button", { name: /sign out/i })).toBeVisible();
 
-    // Verify tokens never entered localStorage or sessionStorage (Spec 7.2)
-    const localToken = await page.evaluate(() => localStorage.getItem("token") || localStorage.getItem("access_token"));
-    const sessionToken = await page.evaluate(() => sessionStorage.getItem("token") || sessionStorage.getItem("access_token"));
-    expect(localToken).toBeNull();
-    expect(sessionToken).toBeNull();
+    // Exhaustive token persistence check (R5, Spec 7.2):
+    // localStorage must be completely empty, and neither localStorage nor sessionStorage
+    // may contain JWT-shaped tokens or bearer values.
+    const storageAudit = await page.evaluate(() => {
+      const jwtRegex = /^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$/;
+      const issues: string[] = [];
+
+      if (localStorage.length > 0) {
+        issues.push(`localStorage must be empty but has ${localStorage.length} item(s)`);
+      }
+
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i)!;
+        const v = localStorage.getItem(k) || "";
+        if (jwtRegex.test(v)) {
+          issues.push(`localStorage key '${k}' contains JWT`);
+        }
+      }
+
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const k = sessionStorage.key(i)!;
+        const v = sessionStorage.getItem(k) || "";
+        if (k !== "commonsbook_create_attempt") {
+          issues.push(`Unexpected sessionStorage key '${k}'`);
+        }
+        if (jwtRegex.test(v)) {
+          issues.push(`sessionStorage key '${k}' contains JWT`);
+        }
+      }
+
+      return issues;
+    });
+    expect(storageAudit).toEqual([]);
 
     // Reload page to verify cookie-based session restoration
     await page.reload();

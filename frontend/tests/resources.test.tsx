@@ -1,18 +1,20 @@
-import { render, screen, fireEvent } from "@testing-library/react";
+import React from "react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Routes, Route } from "react-router-dom";
 import {
   getNewYorkOffsetString,
   getNewYorkMidnightUtc,
+  getNewYorkInstantUtc,
   getSevenDayWindow,
   validateBookingWindow,
   checkSlotOccupancy,
 } from "../src/features/resources/timeUtils";
 import { ResourceList } from "../src/features/resources/ResourceList";
-import { ResourceDetail } from "../src/features/resources/ResourceDetail";
+import { ResourceDetail, type BookingLaunchContract } from "../src/features/resources/ResourceDetail";
 
-describe("Time & Timezone Utilities (Spec 1.2, 7.1)", () => {
+describe("Time & Timezone Utilities across DST Transitions (R2, Spec 1.2, 7.1)", () => {
   it("displays timezone America/New_York with visible offset", () => {
     const offset = getNewYorkOffsetString();
     expect(offset).toMatch(/^UTC[+-]\d{2}:\d{2}$/);
@@ -28,7 +30,37 @@ describe("Time & Timezone Utilities (Spec 1.2, 7.1)", () => {
     expect(winter).toBe("2026-01-15T05:00:00.000Z");
   });
 
-  it("computes 7-day schedule window bounded to <= 7 days duration", () => {
+  it("computes exact DST-aware UTC instants on spring-forward transition day (2026-03-08) (R2)", () => {
+    // 2026-03-08: Clocks spring forward at 02:00 EST (UTC-5) to 03:00 EDT (UTC-4)
+    // Boundary slot before transition: 01:30 local is EST (UTC-5) -> 06:30Z
+    const boundaryPre = getNewYorkInstantUtc("2026-03-08", 1, 30);
+    expect(boundaryPre).toBe("2026-03-08T06:30:00.000Z");
+
+    // Morning slot after transition: 08:00 local is EDT (UTC-4) -> 12:00Z
+    const morning = getNewYorkInstantUtc("2026-03-08", 8, 0);
+    expect(morning).toBe("2026-03-08T12:00:00.000Z");
+
+    // Afternoon slot after transition: 14:00 local is EDT (UTC-4) -> 18:00Z
+    const afternoon = getNewYorkInstantUtc("2026-03-08", 14, 0);
+    expect(afternoon).toBe("2026-03-08T18:00:00.000Z");
+  });
+
+  it("computes exact DST-aware UTC instants on fall-back transition day (2026-11-01) (R2)", () => {
+    // 2026-11-01: Clocks fall back at 02:00 EDT (UTC-4) to 01:00 EST (UTC-5)
+    // Boundary slot before transition: 01:30 local is EDT (UTC-4) -> 05:30Z
+    const boundaryPre = getNewYorkInstantUtc("2026-11-01", 1, 30);
+    expect(boundaryPre).toBe("2026-11-01T05:30:00.000Z");
+
+    // Morning slot after transition: 08:00 local is EST (UTC-5) -> 13:00Z
+    const morning = getNewYorkInstantUtc("2026-11-01", 8, 0);
+    expect(morning).toBe("2026-11-01T13:00:00.000Z");
+
+    // Afternoon slot after transition: 14:00 local is EST (UTC-5) -> 19:00Z
+    const afternoon = getNewYorkInstantUtc("2026-11-01", 14, 0);
+    expect(afternoon).toBe("2026-11-01T19:00:00.000Z");
+  });
+
+  it("computes 7-day schedule window bounded to <= 7 days duration across DST", () => {
     const window = getSevenDayWindow("2026-09-10");
     expect(window.days).toHaveLength(7);
     expect(window.starts_at).toBe("2026-09-10T04:00:00.000Z");
@@ -177,7 +209,6 @@ describe("Resource Catalog & Availability UI Components (Spec 7.1, 7.2)", () => 
     expect(await screen.findByText("Community Woodshop")).toBeInTheDocument();
     expect(screen.getByText("Quiet Meeting Room")).toBeInTheDocument();
 
-    // Client-side search for "Woodshop"
     const searchInput = screen.getByLabelText(/search page resources/i);
     fireEvent.change(searchInput, { target: { value: "Woodshop" } });
 
@@ -248,12 +279,10 @@ describe("Resource Catalog & Availability UI Components (Spec 7.1, 7.2)", () => 
     expect(screen.getByText(/Organization Timezone:/i)).toBeInTheDocument();
     expect(screen.getAllByText(/America\/New_York/i).length).toBeGreaterThan(0);
 
-    // Verify 7-Day Availability schedule is present
     expect(screen.getByText(/7-Day Availability Schedule/i)).toBeInTheDocument();
 
-    // Verify booking launch contract button is labeled unavailable until route feature registered
     const bookBtn = screen.getByRole("button", {
-      name: /booking dialog registration pending/i,
+      name: /booking unavailable/i,
     });
     expect(bookBtn).toBeDisabled();
     expect(bookBtn).toHaveTextContent(/feature registration pending/i);
@@ -320,7 +349,6 @@ describe("Resource Catalog & Availability UI Components (Spec 7.1, 7.2)", () => 
 
     await screen.findByText("Community Woodshop");
 
-    // Toggle to accessible list view
     const listToggle = screen.getByRole("button", { name: /accessible list view/i });
     fireEvent.click(listToggle);
 
@@ -328,7 +356,153 @@ describe("Resource Catalog & Availability UI Components (Spec 7.1, 7.2)", () => 
       screen.getByLabelText(/accessible 7-day availability schedule/i)
     ).toBeInTheDocument();
     expect(screen.getByText(/Reserved \(confirmed\)/i)).toBeInTheDocument();
-    // Confirms owner identity is NOT displayed (US-02)
     expect(screen.queryByText(/owned by/i)).not.toBeInTheDocument();
+  });
+
+  it("displays accessible inline error when invalid past slot is selected (R3)", async () => {
+    const mockResource = {
+      id: "r-1",
+      name: "Community Woodshop",
+      location: "Workshop Bay B",
+      description: "Equipped with power saws.",
+      active: true,
+      version: 1,
+      created_at: "2026-09-01T00:00:00Z",
+      updated_at: "2026-09-01T00:00:00Z",
+    };
+
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.includes("/availability")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            resource_id: "r-1",
+            starts_at: "2026-09-10T04:00:00Z",
+            ends_at: "2026-09-17T04:00:00Z",
+            timezone: "America/New_York",
+            occupied: [],
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ ETag: '"v1"' }),
+        json: async () => mockResource,
+      } as Response;
+    });
+
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/resources/r-1"]}>
+          <Routes>
+            <Route path="/resources/:id" element={<ResourceDetail />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await screen.findByText("Community Woodshop");
+    await screen.findByText(/Available & Occupied Slots/i);
+
+    // Click first slot on today (which is in the past)
+    const selectSlotBtn = screen.getAllByRole("button", { name: "Select Slot" })[0];
+    fireEvent.click(selectSlotBtn);
+
+    // Assert accessible inline error alert is displayed (R3)
+    await waitFor(() => {
+      const alert = screen.getByRole("alert");
+      expect(alert).toHaveAttribute("aria-live", "polite");
+      expect(alert).toHaveTextContent(/at least 15 minutes in the future/i);
+    });
+  });
+
+  it("passes typed launch contract without issuing any mutation (R4)", async () => {
+    const mockResource = {
+      id: "r-1",
+      name: "Community Woodshop",
+      location: "Workshop Bay B",
+      description: "Equipped with power saws.",
+      active: true,
+      version: 1,
+      created_at: "2026-09-01T00:00:00Z",
+      updated_at: "2026-09-01T00:00:00Z",
+    };
+
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.includes("/availability")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers(),
+          json: async () => ({
+            resource_id: "r-1",
+            starts_at: "2026-09-10T04:00:00Z",
+            ends_at: "2026-09-17T04:00:00Z",
+            timezone: "America/New_York",
+            occupied: [],
+          }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ ETag: '"v1"' }),
+        json: async () => mockResource,
+      } as Response;
+    });
+
+    const launchSpy = vi.fn();
+    const qc = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={qc}>
+        <MemoryRouter initialEntries={["/resources/r-1"]}>
+          <Routes>
+            <Route path="/resources/:id" element={<ResourceDetail onLaunchBooking={launchSpy} />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+
+    await screen.findByText("Community Woodshop");
+    await screen.findByText(/Available & Occupied Slots/i);
+
+    // Select tomorrow (day index 1)
+    const dayButtons = screen.getAllByRole("button").filter((b) => b.textContent?.includes(","));
+    if (dayButtons.length > 1) {
+      fireEvent.click(dayButtons[1]);
+    }
+
+    // Select an available future slot
+    await waitFor(() => {
+      const btns = screen.getAllByRole("button", { name: "Select Slot" });
+      expect(btns.length).toBeGreaterThan(0);
+      fireEvent.click(btns[0]);
+    });
+
+    // Verify typed contract passed to callback seam
+    expect(launchSpy).toHaveBeenCalledTimes(1);
+    const contract = launchSpy.mock.calls[0][0] as BookingLaunchContract;
+    expect(contract.resource.id).toBe("r-1");
+    expect(contract.window.starts_at).toBeDefined();
+    expect(contract.window.ends_at).toBeDefined();
+
+    // Verify NO mutation occurred (no POST /api/v1/bookings)
+    const calls = vi.mocked(fetch).mock.calls;
+    const bookingMutationCalls = calls.filter(([url, opts]) =>
+      String(url).includes("/bookings") && opts?.method === "POST"
+    );
+    expect(bookingMutationCalls).toHaveLength(0);
   });
 });

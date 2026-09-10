@@ -15,7 +15,6 @@ export function getNewYorkOffsetString(date: Date = new Date()): string {
     }).formatToParts(date);
     const tzPart = parts.find((p) => p.type === "timeZoneName");
     if (tzPart) {
-      // e.g. "GMT-4" or "GMT-5" -> "UTC-04:00"
       const match = tzPart.value.match(/GMT([+-])(\d+)(?::(\d+))?/);
       if (match) {
         const sign = match[1];
@@ -63,14 +62,20 @@ export function getTodayNewYorkString(now: Date = new Date()): string {
 }
 
 /**
- * Compute the UTC instant for midnight (00:00:00) in America/New_York for a given YYYY-MM-DD date.
- * Accurately handles DST transitions by verifying local hour/minute in America/New_York.
+ * Compute the UTC instant for a local wall-clock time (hour:minute) in America/New_York
+ * on a given YYYY-MM-DD date. Accurately handles DST transitions across spring-forward
+ * and fall-back dates (Spec 1.2).
  */
-export function getNewYorkMidnightUtc(dateStr: string): string {
+export function getNewYorkInstantUtc(
+  dateStr: string,
+  hour: number,
+  minute: number = 0
+): string {
   const [year, month, day] = dateStr.split("-").map(Number);
-  // America/New_York midnight is either 04:00 UTC (EDT) or 05:00 UTC (EST)
-  for (const hour of [4, 5, 3, 6]) {
-    const d = new Date(Date.UTC(year, month - 1, day, hour, 0, 0, 0));
+  // America/New_York offset is either UTC-4 (EDT) or UTC-5 (EST).
+  // Test plausible UTC offsets and verify against Intl in America/New_York.
+  for (const offsetHour of [4, 5, 3, 6]) {
+    const d = new Date(Date.UTC(year, month - 1, day, hour + offsetHour, minute, 0, 0));
     const parts = new Intl.DateTimeFormat("en-US", {
       timeZone: TIMEZONE,
       year: "numeric",
@@ -87,13 +92,26 @@ export function getNewYorkMidnightUtc(dateStr: string): string {
     const pHour = Number(parts.find((p) => p.type === "hour")?.value) % 24;
     const pMin = Number(parts.find((p) => p.type === "minute")?.value);
 
-    if (pYear === year && pMonth === month && pDay === day && pHour === 0 && pMin === 0) {
+    if (
+      pYear === year &&
+      pMonth === month &&
+      pDay === day &&
+      pHour === hour &&
+      pMin === minute
+    ) {
       return d.toISOString();
     }
   }
 
-  // Fallback EDT
-  return new Date(Date.UTC(year, month - 1, day, 4, 0, 0, 0)).toISOString();
+  // Fallback to EDT (UTC-4)
+  return new Date(Date.UTC(year, month - 1, day, hour + 4, minute, 0, 0)).toISOString();
+}
+
+/**
+ * Compute the UTC instant for midnight (00:00:00) in America/New_York for a given YYYY-MM-DD date.
+ */
+export function getNewYorkMidnightUtc(dateStr: string): string {
+  return getNewYorkInstantUtc(dateStr, 0, 0);
 }
 
 export interface DayInfo {
@@ -116,7 +134,6 @@ export function getSevenDayWindow(startDateStr: string): {
   const days: DayInfo[] = [];
 
   for (let i = 0; i < 7; i++) {
-    // Increment date
     const d = new Date(Date.UTC(year, month - 1, day + i, 12, 0, 0));
     const parts = new Intl.DateTimeFormat("en-US", {
       timeZone: TIMEZONE,
@@ -124,8 +141,7 @@ export function getSevenDayWindow(startDateStr: string): {
       month: "2-digit",
       day: "2-digit",
       weekday: "short",
-      monthName: "short",
-    } as Intl.DateTimeFormatOptions).formatToParts(d);
+    }).formatToParts(d);
 
     const y = parts.find((p) => p.type === "year")?.value;
     const m = parts.find((p) => p.type === "month")?.value;
@@ -133,8 +149,8 @@ export function getSevenDayWindow(startDateStr: string): {
     const weekday = parts.find((p) => p.type === "weekday")?.value || "";
     const dateKey = `${y}-${m}-${dt}`;
 
-    const dayStartUtc = getNewYorkMidnightUtc(dateKey);
-    // Next day midnight
+    const dayStartUtc = getNewYorkInstantUtc(dateKey, 0, 0);
+
     const nextD = new Date(Date.UTC(year, month - 1, day + i + 1, 12, 0, 0));
     const nextParts = new Intl.DateTimeFormat("en-US", {
       timeZone: TIMEZONE,
@@ -146,7 +162,7 @@ export function getSevenDayWindow(startDateStr: string): {
     const nm = nextParts.find((p) => p.type === "month")?.value;
     const ndt = nextParts.find((p) => p.type === "day")?.value;
     const nextDateKey = `${ny}-${nm}-${ndt}`;
-    const dayEndUtc = getNewYorkMidnightUtc(nextDateKey);
+    const dayEndUtc = getNewYorkInstantUtc(nextDateKey, 0, 0);
 
     days.push({
       dateStr: dateKey,
@@ -185,8 +201,6 @@ export function checkSlotOccupancy(
   for (const item of occupied) {
     const occStart = new Date(item.starts_at);
     const occEnd = new Date(item.ends_at);
-    // Half-open interval overlap: [slotStart, slotEnd) overlaps [occStart, occEnd)
-    // iff slotStart < occEnd && slotEnd > occStart
     if (slotStart < occEnd && slotEnd > occStart) {
       return { isOccupied: true, interval: item };
     }

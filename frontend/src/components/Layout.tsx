@@ -50,33 +50,6 @@ export function Layout() {
                 >
                   Resources
                 </Button>
-                <Button
-                  component={RouterLink}
-                  to="/my-bookings"
-                  color="inherit"
-                  size="small"
-                >
-                  My Bookings
-                </Button>
-                <Button
-                  component={RouterLink}
-                  to="/waitlist"
-                  color="inherit"
-                  size="small"
-                >
-                  Waitlist
-                </Button>
-                {user?.role === "admin" && (
-                  <Button
-                    component={RouterLink}
-                    to="/admin/resources"
-                    color="secondary"
-                    size="small"
-                    variant="outlined"
-                  >
-                    Admin
-                  </Button>
-                )}
               </Box>
             )}
           </Box>

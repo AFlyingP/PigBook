@@ -67,11 +67,9 @@ Routes are centralized exclusively in `src/routes.tsx`:
 | `/privacy` | `PrivacyPage` | Public | Plain-language versioned privacy notice (Spec 12.2) |
 | `/resources` | `ResourceList` | Authenticated (Member/Admin) | Resource catalog, search, pagination |
 | `/resources/:id` | `ResourceDetail` | Authenticated (Member/Admin) | Detail, locked timezone, 7-day occupancy grid & accessible list |
-| `/my-bookings` | Placeholder | Authenticated (Member/Admin) | Personal reservation management (Ticket T-030) |
-| `/waitlist` | Placeholder | Authenticated (Member/Admin) | Personal waitlist queue and offers (Ticket T-031) |
-| `/feedback` | Placeholder | Authenticated (Member/Admin) | Participant survey form (future milestone) |
-| `/admin/*` | Placeholders | Authenticated (Admin only) | Administrative management interfaces (Ticket T-032+) |
-| `*` | `NotFoundPage` | Public | Accessible 404 catch-all page |
+| `*` | `NotFoundPage` | Public | Accessible 404 catch-all page for unknown or unmounted paths |
+
+Unimplemented routes are handled by the accessible `NotFoundPage` catch-all rather than placeholder screens.
 
 ---
 
@@ -95,14 +93,14 @@ Routes are centralized exclusively in `src/routes.tsx`:
 ### 4.3 Seven-Day Availability Grid & Accessible List
 
 - `ResourceDetail` loads a 7-day window calculated by `getSevenDayWindow(startDateStr)`.
-- DST day boundary transitions (spring-forward 23h and fall-back 25h) are computed accurately using New York midnight instants, with maximum window duration strictly clamped to 7 days (168 hours) to satisfy backend validation.
+- Slot UTC timestamps on DST transition days (spring-forward 23h and fall-back 25h) are computed DST-aware using New York wall-clock conversion, with maximum window duration strictly clamped to 7 days (168 hours) to satisfy backend validation.
 - Half-open interval occupancy (`[starts_at, ends_at)`) ensures adjacent bookings do not produce false overlaps.
 - **Accessible List Alternative**: Users can toggle between the visual grid and an accessible list view (`<section aria-label="Accessible 7-day availability schedule">`). In accordance with Spec 7.1 and US-02, occupied intervals display slot kind and status without revealing owner identity.
 
 ### 4.4 Booking Launch Contract
 
-- In accordance with the Phase T-028 specification, the booking dialog launch contract passes the selected resource and window parameters without mutation.
-- Because the reservation dialog is scheduled for implementation in ticket T-029, the booking entry action is clearly labeled `Book Slot (Feature registration pending)` and disabled to avoid broken UX or placeholder mutations.
+- In accordance with the specification, the booking launch contract passes the selected resource and window parameters without mutation.
+- The booking entry action is labeled `Book Slot (Feature registration pending)` and disabled until the booking dialog feature is registered.
 
 ---
 
@@ -137,8 +135,8 @@ npm --prefix frontend test -- --run
 ```
 
 Covers:
-- `tests/auth.test.tsx`: In-memory auth, 401 retry, single-flight refresh, cross-tab BroadcastChannel, CreateAttempt isolation and 24h expiration, LoginForm accessible controls and keyboard operation, RegisterForm fragment erasure.
-- `tests/resources.test.tsx`: Timezone offset formatting, DST midnight calculations, 7-day window constraints, 30-minute alignment validation, half-open occupancy checking, ResourceList search filtering, ResourceDetail locked timezone and accessible list view.
+- `tests/auth.test.tsx`: In-memory auth, 401 retry, single-flight refresh, cross-tab BroadcastChannel, CreateAttempt isolation and 24h expiration, LoginForm accessible controls and keyboard operation, RegisterForm fragment erasure, role-guarded layout access control, and exhaustive token persistence checks.
+- `tests/resources.test.tsx`: Timezone offset formatting, DST transition wall-clock to UTC calculations (spring forward, fall back, boundary transitions), 7-day window constraints, 30-minute alignment validation, half-open occupancy checking, ResourceList search filtering, ResourceDetail locked timezone, accessible list view, accessible inline booking error validation, and non-mutating launch contract.
 
 ### 6.2 Playwright End-to-End Tests
 
@@ -149,5 +147,5 @@ python scripts/verify.py ticket --ticket T-027 --fresh
 ```
 
 Covers:
-- `e2e/auth.spec.ts`: Member sign-in, session restoration on reload, disabled user rejection with 401, single-use invitation fragment registration with URL bar cleanup, logout route protection, multi-tab logout synchronization.
-- `e2e/resources.spec.ts`: Catalog browsing with client-side search, resource detail with organization-locked timezone display, 7-day availability schedule, accessible list schedule alternative, booking launch contract validation, inactive resource archiving alerts.
+- `e2e/auth.spec.ts`: Member sign-in, session restoration on reload, disabled user rejection with 401, single-use invitation fragment registration with URL bar cleanup, logout route protection, multi-tab logout synchronization, and exhaustive storage token absence.
+- `e2e/resources.spec.ts`: Catalog browsing with client-side search, resource detail with organization-locked timezone display, 7-day availability schedule, accessible list schedule alternative, disabled booking entry action, and archived resource access handling.

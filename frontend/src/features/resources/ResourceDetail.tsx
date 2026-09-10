@@ -16,11 +16,6 @@ import {
   TextField,
   MenuItem,
   Card,
-  Dialog,
-  DialogTitle,
-  DialogContent,
-  DialogContentText,
-  DialogActions,
 } from "@mui/material";
 import { request } from "../../api/client";
 import type { components } from "../../api/schema";
@@ -29,6 +24,7 @@ import {
   getNewYorkOffsetString,
   getTodayNewYorkString,
   getSevenDayWindow,
+  getNewYorkInstantUtc,
   checkSlotOccupancy,
   formatInNewYork,
   validateBookingWindow,
@@ -49,12 +45,16 @@ export interface BookingLaunchContract {
   };
 }
 
-export function ResourceDetail() {
+export interface ResourceDetailProps {
+  onLaunchBooking?: (contract: BookingLaunchContract) => void;
+}
+
+export function ResourceDetail({ onLaunchBooking }: ResourceDetailProps = {}) {
   const { id } = useParams<{ id: string }>();
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
   const [selectedDayOffset, setSelectedDayOffset] = useState<number>(0);
   const [startDateStr, setStartDateStr] = useState<string>(() => getTodayNewYorkString());
-  const [activeContract, setActiveContract] = useState<BookingLaunchContract | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
 
   // Timezone display information (Spec 1.2, 7.1: locked to organization)
   const tzOffset = useMemo(() => getNewYorkOffsetString(), []);
@@ -102,18 +102,25 @@ export function ResourceDetail() {
     enabled: !!id && !!resource?.active,
   });
 
-  // Booking attempt handler demonstrating launch contract
+  // Booking attempt handler demonstrating launch contract seam
   const handleLaunchBooking = (startIso: string, endIso: string) => {
     if (!resource || !resource.active) return;
+    setValidationError(null);
+
     const val = validateBookingWindow(startIso, endIso);
     if (!val.valid) {
-      alert(val.error);
+      setValidationError(val.error || "Invalid booking window");
       return;
     }
-    setActiveContract({
+
+    const contract: BookingLaunchContract = {
       resource,
       window: { starts_at: startIso, ends_at: endIso },
-    });
+    };
+
+    if (onLaunchBooking) {
+      onLaunchBooking(contract);
+    }
   };
 
   if (isResourceError) {
@@ -274,6 +281,19 @@ export function ResourceDetail() {
           </Box>
         </Box>
 
+        {/* Accessible Inline Validation Error (Spec 7.2) */}
+        {validationError && (
+          <Alert
+            severity="error"
+            role="alert"
+            aria-live="polite"
+            onClose={() => setValidationError(null)}
+            sx={{ mb: 3 }}
+          >
+            {validationError}
+          </Alert>
+        )}
+
         {isAvailError && (
           <Alert
             severity="error"
@@ -298,7 +318,7 @@ export function ResourceDetail() {
         ) : availability && viewMode === "grid" ? (
           /* Grid View */
           <Box>
-            {/* Days Tabs / Headers */}
+            {/* Days Tabs */}
             <Box
               sx={{
                 display: "grid",
@@ -325,21 +345,21 @@ export function ResourceDetail() {
               ))}
             </Box>
 
-            {/* Slots for Selected Day */}
+            {/* Slots for Selected Day (DST-aware instant calculation per Spec 1.2) */}
             {(() => {
               const selectedDay = windowInfo.days[selectedDayOffset];
               if (!selectedDay) return null;
 
-              // Generate half-hour slots for the selected day in NY local time
-              // 08:00 to 20:00 typical daytime slots for UI grid (24 half-hour intervals)
               const slots = [];
-              const dayStartMs = new Date(selectedDay.starts_at).getTime();
-
               for (let h = 8; h < 20; h++) {
                 for (const m of [0, 30]) {
-                  // Offset from midnight in New York local day
-                  const slotStartUtc = new Date(dayStartMs + (h * 60 + m) * 60 * 1000);
-                  const slotEndUtc = new Date(slotStartUtc.getTime() + 30 * 60 * 1000);
+                  const slotStartUtcStr = getNewYorkInstantUtc(selectedDay.dateStr, h, m);
+                  const nextH = m === 30 ? h + 1 : h;
+                  const nextM = m === 30 ? 0 : 30;
+                  const slotEndUtcStr = getNewYorkInstantUtc(selectedDay.dateStr, nextH, nextM);
+
+                  const slotStartUtc = new Date(slotStartUtcStr);
+                  const slotEndUtc = new Date(slotEndUtcStr);
 
                   const occCheck = checkSlotOccupancy(
                     slotStartUtc,
@@ -349,8 +369,8 @@ export function ResourceDetail() {
 
                   slots.push({
                     timeLabel: `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}`,
-                    startIso: slotStartUtc.toISOString(),
-                    endIso: slotEndUtc.toISOString(),
+                    startIso: slotStartUtcStr,
+                    endIso: slotEndUtcStr,
                     isOccupied: occCheck.isOccupied,
                     interval: occCheck.interval,
                   });
@@ -475,7 +495,7 @@ export function ResourceDetail() {
           </Box>
         ) : null}
 
-        {/* Booking Launch Contract Section (Spec 7.1: labeled unavailable until route feature registered) */}
+        {/* Booking Launch Contract Section (Spec 7.1: labeled unavailable until dialog feature registered) */}
         <Box sx={{ mt: 5, p: 3, backgroundColor: "#f0f4f8", borderRadius: 2 }}>
           <Typography variant="h6" fontWeight="bold" gutterBottom>
             Reserve this Resource
@@ -488,52 +508,15 @@ export function ResourceDetail() {
             variant="contained"
             color="primary"
             disabled
-            aria-label="Booking dialog registration pending"
+            aria-label="Booking unavailable"
           >
             Book Slot (Feature registration pending)
           </Button>
           <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
-            Reservation creation dialog will be activated in ticket T-029. No broken action.
+            Reservation booking dialog will be available in an upcoming release.
           </Typography>
         </Box>
       </Paper>
-
-      {/* Contract Verification Dialog (Non-mutating verification) */}
-      {activeContract && (
-        <Dialog
-          open={!!activeContract}
-          onClose={() => setActiveContract(null)}
-          aria-labelledby="booking-contract-title"
-        >
-          <DialogTitle id="booking-contract-title">
-            Booking Launch Contract Initiated
-          </DialogTitle>
-          <DialogContent>
-            <DialogContentText paragraph>
-              The booking launch contract has been validated with resource and window parameters without mutation.
-            </DialogContentText>
-            <Card variant="outlined" sx={{ p: 2, backgroundColor: "#fafafa" }}>
-              <Typography variant="body2">
-                <strong>Resource:</strong> {activeContract.resource.name} ({activeContract.resource.id})
-              </Typography>
-              <Typography variant="body2">
-                <strong>Start Window:</strong> {activeContract.window.starts_at} (
-                {formatInNewYork(activeContract.window.starts_at, { hour: "2-digit", minute: "2-digit" })})
-              </Typography>
-              <Typography variant="body2">
-                <strong>End Window:</strong> {activeContract.window.ends_at} (
-                {formatInNewYork(activeContract.window.ends_at, { hour: "2-digit", minute: "2-digit" })})
-              </Typography>
-            </Card>
-            <Typography variant="caption" color="text.secondary" sx={{ mt: 2, display: "block" }}>
-              Booking dialog component registration is scheduled for ticket T-029.
-            </Typography>
-          </DialogContent>
-          <DialogActions>
-            <Button onClick={() => setActiveContract(null)}>Close</Button>
-          </DialogActions>
-        </Dialog>
-      )}
     </Box>
   );
 }

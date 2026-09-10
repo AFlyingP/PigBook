@@ -58,34 +58,40 @@ test.describe("Resource Catalog & Availability UI E2E (Spec 1.2, 7.1, 7.2)", () 
     await expect(page.getByText(/member2@example.com/i)).not.toBeVisible();
   });
 
-  test("validates booking launch contract and labels booking action unavailable pending feature registration", async ({
+  test("validates booking launch contract and labels booking action unavailable without mutation (R4)", async ({
     page,
   }) => {
+    // Track if any booking mutation is issued
+    let bookingMutationOccurred = false;
+    page.on("request", (req) => {
+      if (req.url().includes("/api/v1/bookings") && req.method() === "POST") {
+        bookingMutationOccurred = true;
+      }
+    });
+
     await page.goto("/resources/55555555-5555-4555-8555-555555555555");
     await expect(page.getByRole("heading", { name: "Community Woodshop" })).toBeVisible();
 
-    // Booking entry button must be labeled unavailable until route feature registered (Spec 7.1)
-    const bookEntry = page.getByRole("button", { name: /booking dialog registration pending/i });
+    // Booking entry button must be honestly labeled unavailable and disabled until dialog feature registered (R4)
+    const bookEntry = page.getByRole("button", { name: /booking unavailable/i });
     await expect(bookEntry).toBeDisabled();
     await expect(bookEntry).toHaveText("Book Slot (Feature registration pending)");
 
-    // Switch to tomorrow's date to select guaranteed future slots
+    // Switch to tomorrow's date to verify future available slot selection
     const dayButtons = page.locator('button:has-text(",")');
     if (await dayButtons.count() > 1) {
       await dayButtons.nth(1).click();
     }
 
-    // Test launch contract initiation from available future slot
     const selectSlotBtn = page.getByRole("button", { name: "Select Slot" }).first();
     await expect(selectSlotBtn).toBeVisible();
     await selectSlotBtn.click();
 
-    const dialog = page.getByRole("dialog");
-    await expect(dialog).toBeVisible();
-    await expect(dialog.getByText("Booking Launch Contract Initiated")).toBeVisible();
-    await expect(dialog.getByText(/Community Woodshop/)).toBeVisible();
-    await dialog.getByRole("button", { name: "Close" }).click();
-    await expect(dialog).not.toBeVisible();
+    // Ensure no dev/mock verification dialog is shown
+    await expect(page.getByRole("dialog")).not.toBeVisible();
+
+    // Ensure no mutation was issued to the backend
+    expect(bookingMutationOccurred).toBe(false);
   });
 
   test("displays archived resource notice preventing member access to inactive resources", async ({

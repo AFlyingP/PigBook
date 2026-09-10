@@ -73,10 +73,15 @@ export function RegisterForm({ onSuccess }: RegisterFormProps) {
     } else if (displayName.trim().length > 80) {
       newFieldErrors.displayName = "Display name must be 80 characters or fewer";
     }
+
+    // Enforce 12..128 Unicode codepoints per Spec 8.1
+    const passwordCodepoints = [...password].length;
     if (!password) {
       newFieldErrors.password = "Password is required";
-    } else if (password.length < 12) {
+    } else if (passwordCodepoints < 12) {
       newFieldErrors.password = "Password must be at least 12 characters long";
+    } else if (passwordCodepoints > 128) {
+      newFieldErrors.password = "Password must be 128 characters or fewer";
     }
 
     if (Object.keys(newFieldErrors).length > 0) {
@@ -93,7 +98,20 @@ export function RegisterForm({ onSuccess }: RegisterFormProps) {
     } catch (err) {
       if (err instanceof ApiError) {
         if (err.status === 422) {
-          setError("Invalid or expired invitation token.");
+          if (err.code === "INVALID_INVITATION") {
+            setError("Invalid or expired invitation token.");
+          } else if (err.code === "VALIDATION_ERROR") {
+            let detailMsg = "Validation error: please verify your email and display name.";
+            if (err.details && typeof err.details === "object") {
+              const entries = Object.entries(err.details);
+              if (entries.length > 0) {
+                detailMsg = `Validation error: ${entries.map(([k, v]) => `${k}: ${v}`).join(", ")}`;
+              }
+            }
+            setError(detailMsg);
+          } else {
+            setError(err.message || "Invalid registration request.");
+          }
         } else if (err.status === 409) {
           setError("An account with this email address already exists.");
         } else {
