@@ -21,6 +21,7 @@ from app.bookings.models import Booking
 from app.config import get_settings
 from app.db.session import get_sessionmaker
 from app.main import app
+from app.notifications.models import Outbox
 from app.resources.models import Resource
 from app.waitlist.models import WaitlistEntry
 
@@ -142,7 +143,14 @@ def test_policy_metadata_coverage() -> None:
         "E24",
         "E25",
         "E26",
+        "E27",
+        "E28",
         "E29",
+        "E30",
+        "E31",
+        "E32",
+        "E33",
+        "E34",
         "E35",
     }
     assert policy_registry["E01"] == Policy.public
@@ -171,7 +179,14 @@ def test_policy_metadata_coverage() -> None:
     assert policy_registry["E24"] == Policy.admin
     assert policy_registry["E25"] == Policy.admin
     assert policy_registry["E26"] == Policy.admin
+    assert policy_registry["E27"] == Policy.admin
+    assert policy_registry["E28"] == Policy.admin
     assert policy_registry["E29"] == Policy.admin
+    assert policy_registry["E30"] == Policy.admin
+    assert policy_registry["E31"] == Policy.admin
+    assert policy_registry["E32"] == Policy.admin
+    assert policy_registry["E33"] == Policy.authenticated
+    assert policy_registry["E34"] == Policy.admin
     assert policy_registry["E35"] == Policy.public
 
 
@@ -1228,6 +1243,120 @@ async def test_permission_matrix() -> None:
             headers={**m_if1, **h_adm},
         )
         assert r_e26_adm.status_code == 200
+
+        # 29. E27: GET /api/v1/admin/users (Policy.admin)
+        assert (await client.get("/api/v1/admin/users")).status_code == 401
+        assert (await client.get("/api/v1/admin/users", headers=h_dis)).status_code == 401
+        assert (await client.get("/api/v1/admin/users", headers=h_mem)).status_code == 403
+        r_e27_adm = await client.get("/api/v1/admin/users", headers=h_adm)
+        assert r_e27_adm.status_code == 200
+
+        # 30. E28: PATCH /api/v1/admin/users/{id} (Policy.admin)
+        target_perm_user = await create_user(role="member", enabled=True)
+        patch_user_body = {"role": "member"}
+        u_if = {"If-Match": f'"{target_perm_user.version}"'}
+        assert (
+            await client.patch(
+                f"/api/v1/admin/users/{target_perm_user.id}",
+                json=patch_user_body,
+                headers=u_if,
+            )
+        ).status_code == 401
+        assert (
+            await client.patch(
+                f"/api/v1/admin/users/{target_perm_user.id}",
+                json=patch_user_body,
+                headers={**u_if, **h_dis},
+            )
+        ).status_code == 401
+        assert (
+            await client.patch(
+                f"/api/v1/admin/users/{target_perm_user.id}",
+                json=patch_user_body,
+                headers={**u_if, **h_mem},
+            )
+        ).status_code == 403
+        r_e28_adm = await client.patch(
+            f"/api/v1/admin/users/{target_perm_user.id}",
+            json=patch_user_body,
+            headers={**u_if, **h_adm},
+        )
+        assert r_e28_adm.status_code == 200
+
+        # 31. E30: GET /api/v1/admin/audit (Policy.admin)
+        assert (await client.get("/api/v1/admin/audit")).status_code == 401
+        assert (await client.get("/api/v1/admin/audit", headers=h_dis)).status_code == 401
+        assert (await client.get("/api/v1/admin/audit", headers=h_mem)).status_code == 403
+        r_e30_adm = await client.get("/api/v1/admin/audit", headers=h_adm)
+        assert r_e30_adm.status_code == 200
+
+        # 32. E31: GET /api/v1/admin/outbox (Policy.admin)
+        assert (await client.get("/api/v1/admin/outbox")).status_code == 401
+        assert (await client.get("/api/v1/admin/outbox", headers=h_dis)).status_code == 401
+        assert (await client.get("/api/v1/admin/outbox", headers=h_mem)).status_code == 403
+        r_e31_adm = await client.get("/api/v1/admin/outbox", headers=h_adm)
+        assert r_e31_adm.status_code == 200
+
+        # 33. E32: POST /api/v1/admin/outbox/{id}/retry (Policy.admin)
+        dead_outbox_id = uuid.uuid4()
+        async with sessionmaker() as session:
+            async with session.begin():
+                dead_row = Outbox(
+                    id=dead_outbox_id,
+                    event_type="booking_confirmed",
+                    aggregate_id=admin_bkg.id,
+                    aggregate_version=99,
+                    payload={"schema_version": 1},
+                    status="dead",
+                    attempts=8,
+                    occurred_at=datetime.now(timezone.utc),
+                    available_at=datetime.now(timezone.utc),
+                    last_error="fatal",
+                )
+                session.add(dead_row)
+
+        assert (
+            await client.post(f"/api/v1/admin/outbox/{dead_outbox_id}/retry", json={})
+        ).status_code == 401
+        assert (
+            await client.post(
+                f"/api/v1/admin/outbox/{dead_outbox_id}/retry", json={}, headers=h_dis
+            )
+        ).status_code == 401
+        assert (
+            await client.post(
+                f"/api/v1/admin/outbox/{dead_outbox_id}/retry", json={}, headers=h_mem
+            )
+        ).status_code == 403
+        r_e32_adm = await client.post(
+            f"/api/v1/admin/outbox/{dead_outbox_id}/retry", json={}, headers=h_adm
+        )
+        assert r_e32_adm.status_code == 200
+
+        # 34. E33: POST /api/v1/feedback (Policy.authenticated)
+        fb_body = {
+            "rating": 5,
+            "task_completed": True,
+            "difficulty": "none",
+            "improvement": "none",
+            "consent_version": "2026-09-v1",
+            "consent": True,
+        }
+        assert (await client.post("/api/v1/feedback", json=fb_body)).status_code == 401
+        assert (
+            await client.post("/api/v1/feedback", json=fb_body, headers=h_dis)
+        ).status_code == 401
+        r_e33_mem = await client.post("/api/v1/feedback", json=fb_body, headers=h_mem)
+        assert r_e33_mem.status_code == 201
+        r_e33_adm = await client.post("/api/v1/feedback", json=fb_body, headers=h_adm)
+        assert r_e33_adm.status_code == 201
+
+        # 35. E34: GET /api/v1/admin/feedback (Policy.admin)
+        assert (await client.get("/api/v1/admin/feedback")).status_code == 401
+        assert (await client.get("/api/v1/admin/feedback", headers=h_dis)).status_code == 401
+        assert (await client.get("/api/v1/admin/feedback", headers=h_mem)).status_code == 403
+        r_e34_adm = await client.get("/api/v1/admin/feedback", headers=h_adm)
+        assert r_e34_adm.status_code == 200
 
 
 @pytest.mark.asyncio

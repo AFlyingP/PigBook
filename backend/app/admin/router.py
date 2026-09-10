@@ -6,15 +6,25 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.admin.feedback import (
+    ConsentRequiredError,
+    create_feedback,
+    list_feedback,
+)
 from app.admin.schemas import (
     Audit,
     BlackoutCreate,
     EmptyBody,
+    FeedbackCreate,
+    FeedbackCreateResult,
     InviteCreate,
     OutboxView,
     ResourceCreate,
     ResourcePatch,
     UserPatch,
+)
+from app.admin.schemas import (
+    Feedback as FeedbackSchema,
 )
 from app.admin.service import (
     archive_resource,
@@ -33,7 +43,13 @@ from app.admin.service import (
     update_resource,
     update_user,
 )
-from app.auth.dependencies import AuthorizedScope, Policy, authorize
+from app.auth.dependencies import (
+    AuthorizedScope,
+    AuthRequiredError,
+    Policy,
+    authorize,
+)
+from app.auth.rate_limit import check_mutation_rate_limit
 from app.auth.schemas import InvitationResult
 from app.auth.schemas import User as UserSchema
 from app.bookings.idempotency import _parse_idempotency_key, execute_create
@@ -458,4 +474,55 @@ async def retry_outbox_endpoint(
         scope=scope,
         data=body,
         now=now,
+    )
+
+
+# --- Consented Feedback (E33, E34) ---
+
+
+@router.post("/feedback", response_model=FeedbackCreateResult, status_code=201)
+async def create_feedback_endpoint(
+    body: FeedbackCreate,
+    scope: AuthorizedScope = Depends(authorize(Policy.authenticated)),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
+) -> FeedbackCreateResult:
+    """Submit consented feedback with 2026-09-v1 consent version (E33)."""
+    if scope.principal_id is None:
+        raise AuthRequiredError("Authentication required")
+
+    now = datetime.now(timezone.utc)
+
+    # Validate consent before rate limiting or domain transaction
+    if body.consent is not True or body.consent_version != "2026-09-v1":
+        raise ConsentRequiredError(
+            "Affirmative consent and consent_version '2026-09-v1' are required"
+        )
+
+    # Rate limiting on authenticated mutation path (same as E09)
+    await check_mutation_rate_limit(scope.principal_id, now)
+
+    if scope.assert_current is not None:
+        await scope.assert_current(session)
+
+    return await create_feedback(
+        session,
+        scope=scope,
+        data=body,
+        now=now,
+    )
+
+
+@router.get("/admin/feedback", response_model=Page[FeedbackSchema])
+async def list_admin_feedback_endpoint(
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(get_session),
+) -> Page[FeedbackSchema]:
+    """List participant feedback submissions for administrators (E34)."""
+    return await list_feedback(
+        session,
+        scope=scope,
+        limit=limit,
+        offset=offset,
     )

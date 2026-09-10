@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import ConfigDict, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from app.auth.schemas import BaseSchema, InvitationResult
 from app.resources.schemas import ResourceCreate, ResourcePatch
@@ -18,6 +18,9 @@ __all__ = [
     "UserPatch",
     "Audit",
     "OutboxView",
+    "FeedbackCreate",
+    "Feedback",
+    "FeedbackCreateResult",
     "SAFE_AUDIT_KEYS",
     "sanitize_audit_details",
     "extract_safe_error_category",
@@ -149,3 +152,34 @@ class OutboxView(BaseSchema):
         if isinstance(v, str):
             return extract_safe_error_category(v)
         return None
+
+
+class FeedbackCreate(BaseSchema):
+    rating: int = Field(..., ge=1, le=5)
+    task_completed: bool
+    difficulty: str = Field(default="", max_length=2000)
+    improvement: str = Field(default="", max_length=2000)
+    consent_version: str
+    consent: bool
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class Feedback(BaseSchema):
+    id: uuid.UUID
+    user_id: uuid.UUID
+    rating: int
+    task_completed: bool
+    difficulty: str
+    improvement: str
+    consent_version: str
+    created_at: datetime
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+
+class FeedbackCreateResult(BaseSchema):
+    id: uuid.UUID
+    created_at: datetime
+
+    model_config = ConfigDict(extra="forbid")
