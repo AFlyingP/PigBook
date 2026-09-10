@@ -1,0 +1,13 @@
+{
+  "ticket_id": "T-027",
+  "pytest_paths": [],
+  "vitest_paths": [
+    "frontend/tests/auth.test.tsx",
+    "frontend/tests/resources.test.tsx"
+  ],
+  "playwright_paths": [
+    "frontend/e2e/auth.spec.ts",
+    "frontend/e2e/resources.spec.ts"
+  ],
+  "document_checks": []
+}
