@@ -847,8 +847,6 @@ async def list_outbox_events(
     """List outbox events with optional status filter and redacted category (E31)."""
     conditions = []
     if status is not None:
-        if status not in ("pending", "processing", "delivered", "dead"):
-            raise ValueError(f"Invalid outbox status: {status}")
         conditions.append(Outbox.status == status)
 
     count_stmt = select(func.count(Outbox.id)).where(*conditions)

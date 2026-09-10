@@ -259,6 +259,14 @@ async def test_admin_outbox_listing_and_error_redaction() -> None:
         assert "super_secret" not in (target_dead["last_error"] or "")
         assert target_dead["last_error"] == "smtp_auth_failure"
 
+        # Invalid status filter -> 422 VALIDATION_ERROR (R1 HTTP contract)
+        r_bogus = await client.get(
+            "/api/v1/admin/outbox?status=bogus",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_bogus.status_code == 422
+        assert r_bogus.json()["error"]["code"] == "VALIDATION_ERROR"
+
 
 @pytest.mark.asyncio
 async def test_admin_outbox_retry_dead_only_and_repeat_rejection() -> None:

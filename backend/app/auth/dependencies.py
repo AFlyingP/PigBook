@@ -432,76 +432,26 @@ async def _resolve_admin_scope(
         elif "/admin/users/" in path:
             object_id = parsed_id
             if req_method == "PATCH":
-                # E28 serialization: transactional advisory lock 714001 FIRST (Spec 5.1).
-                # Then lock actor and target users in UUID order.
-                # The last-active-admin rule is enforced in the dependency.
-                patch_role: str | None = None
-                patch_enabled: bool | None = None
                 try:
-                    raw_body = await request.json()
-                    if isinstance(raw_body, dict):
-                        patch_role = raw_body.get("role")
-                        patch_enabled = raw_body.get("enabled")
-                except Exception:
-                    pass
-
-                try:
-                    # 1. Take advisory lock 714001 first
-                    await session.execute(text("SELECT pg_advisory_xact_lock(714001)"))
-
-                    # 2. Lock actor and target users in UUID order
-                    actor_id = principal_id
-                    target_id = parsed_id
-
-                    if actor_id == target_id:
-                        target_stmt = select(User).where(User.id == target_id).with_for_update()
-                        target_user = (await session.execute(target_stmt)).scalar_one_or_none()
-                    elif actor_id < target_id:
-                        actor_stmt = (
-                            select(User).where(User.id == actor_id).with_for_update(read=True)
-                        )
-                        await session.execute(actor_stmt)
-                        target_stmt = select(User).where(User.id == target_id).with_for_update()
-                        target_user = (await session.execute(target_stmt)).scalar_one_or_none()
-                    else:
-                        target_stmt = select(User).where(User.id == target_id).with_for_update()
-                        target_user = (await session.execute(target_stmt)).scalar_one_or_none()
-                        actor_stmt = (
-                            select(User).where(User.id == actor_id).with_for_update(read=True)
-                        )
-                        await session.execute(actor_stmt)
-
-                    if target_user is None:
-                        raise ObjectNotFoundError("User not found")
-
-                    # Stale version check strictly precedes state checks
-                    if expected_version is not None and target_user.version != expected_version:
-                        from app.bookings.service import VersionMismatch
-
-                        raise VersionMismatch("User version mismatch")
-
-                    # Enforce last-active-admin rule in dependency
-                    is_active_admin = target_user.role == "admin" and target_user.enabled is True
-                    will_remain = True
-                    if patch_role is not None and patch_role != "admin":
-                        will_remain = False
-                    if patch_enabled is not None and patch_enabled is False:
-                        will_remain = False
-
-                    if is_active_admin and not will_remain:
-                        count_stmt = select(func.count(User.id)).where(
-                            User.role == "admin", User.enabled.is_(True)
-                        )
-                        active_admin_count = (await session.execute(count_stmt)).scalar_one()
-                        if active_admin_count <= 1:
-                            raise LastAdminError(
-                                "Cannot demote or disable the last active administrator"
-                            )
+                    user_lookup_stmt = select(User.id, User.version).where(User.id == parsed_id)
+                    u_row = (await session.execute(user_lookup_stmt)).one_or_none()
                 finally:
                     await session.rollback()
 
+                if u_row is None:
+                    raise ObjectNotFoundError("User not found")
+
+                # Stale version check strictly precedes state checks
+                if expected_version is not None and u_row[1] != expected_version:
+                    from app.bookings.service import VersionMismatch
+
+                    raise VersionMismatch("User version mismatch")
+
+                actor_id = principal_id
+                target_id = parsed_id
+
                 async def _assert_current_user_e28(target_session: AsyncSession) -> None:
-                    # 1. Transactional advisory lock 714001 FIRST
+                    # 1. Transactional advisory lock 714001 FIRST (Spec 5.1)
                     await target_session.execute(text("SELECT pg_advisory_xact_lock(714001)"))
 
                     # 2. Lock actor and target in UUID order
@@ -531,6 +481,12 @@ async def _resolve_admin_scope(
 
                         raise VersionMismatch("User version mismatch")
 
+                    body_json = await request.json()
+                    patch_role = body_json.get("role") if isinstance(body_json, dict) else None
+                    patch_enabled = (
+                        body_json.get("enabled") if isinstance(body_json, dict) else None
+                    )
+
                     is_act_admin = t_user.role == "admin" and t_user.enabled is True
                     rem_admin = True
                     if patch_role is not None and patch_role != "admin":
@@ -551,11 +507,11 @@ async def _resolve_admin_scope(
                 assert_current = _assert_current_user_e28
             else:
                 try:
-                    user_lookup_stmt = select(User.id).where(User.id == parsed_id)
-                    u_row = (await session.execute(user_lookup_stmt)).one_or_none()
+                    user_get_stmt = select(User.id).where(User.id == parsed_id)
+                    get_row = (await session.execute(user_get_stmt)).one_or_none()
                 finally:
                     await session.rollback()
-                if u_row is None:
+                if get_row is None:
                     raise ObjectNotFoundError("User not found")
         elif "/admin/outbox/" in path:
             object_id = parsed_id

@@ -150,6 +150,26 @@ async def test_feedback_creation_and_consent_requirement() -> None:
         assert r_no_consent.status_code == 422
         assert r_no_consent.json()["error"]["code"] == "CONSENT_REQUIRED"
 
+        # R5: Omitted consent key -> 422 CONSENT_REQUIRED
+        omitted_consent_payload = {k: v for k, v in valid_payload.items() if k != "consent"}
+        r_omitted_consent = await client.post(
+            "/api/v1/feedback",
+            json=omitted_consent_payload,
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_omitted_consent.status_code == 422
+        assert r_omitted_consent.json()["error"]["code"] == "CONSENT_REQUIRED"
+
+        # R5: Omitted consent_version key -> 422 CONSENT_REQUIRED
+        omitted_ver_payload = {k: v for k, v in valid_payload.items() if k != "consent_version"}
+        r_omitted_ver = await client.post(
+            "/api/v1/feedback",
+            json=omitted_ver_payload,
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+        assert r_omitted_ver.status_code == 422
+        assert r_omitted_ver.json()["error"]["code"] == "CONSENT_REQUIRED"
+
         # 5. Mismatched consent_version -> 422 CONSENT_REQUIRED
         wrong_ver_payload = dict(valid_payload, consent_version="2025-01-v1")
         r_wrong_ver = await client.post(
@@ -260,16 +280,34 @@ async def test_retention_dry_run_default_and_apply_refusal_without_approval(tmp_
         assert u_after.email == old_user.email
         assert u_after.enabled is True
 
-    # 2. Apply without approval file -> SystemExit (exit 1)
+    # 2. Apply without target scope -> SystemExit (exit 1)
     with pytest.raises(SystemExit) as exc_info:
-        await run_retention(apply=True, approval_file=None, backup_ref="backup-123")
+        await run_retention(
+            apply=True, target_scope=None, approval_file="app.txt", backup_ref="b.gz"
+        )
     assert exc_info.value.code == 1
 
-    # 3. Apply without backup ref -> SystemExit (exit 1)
-    approval_file = tmp_path / "approval.txt"
-    approval_file.write_text("APPROVE_RETENTION_TEST", encoding="utf-8")
+    # 3. Apply without approval file -> SystemExit (exit 1)
     with pytest.raises(SystemExit) as exc_info:
-        await run_retention(apply=True, approval_file=str(approval_file), backup_ref=None)
+        await run_retention(apply=True, target_scope="pilot", approval_file=None, backup_ref="b.gz")
+    assert exc_info.value.code == 1
+
+    # 4. Apply with mismatched approval token -> SystemExit (exit 1)
+    bad_approval = tmp_path / "bad_approval.txt"
+    bad_approval.write_text("APPROVE_RETENTION:wrong_scope", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc_info:
+        await run_retention(
+            apply=True, target_scope="pilot", approval_file=str(bad_approval), backup_ref="b.gz"
+        )
+    assert exc_info.value.code == 1
+
+    # 5. Apply without backup ref -> SystemExit (exit 1)
+    good_approval = tmp_path / "good_approval.txt"
+    good_approval.write_text("APPROVE_RETENTION:pilot", encoding="utf-8")
+    with pytest.raises(SystemExit) as exc_info:
+        await run_retention(
+            apply=True, target_scope="pilot", approval_file=str(good_approval), backup_ref=None
+        )
     assert exc_info.value.code == 1
 
 
@@ -343,12 +381,13 @@ async def test_retention_age_cutoff_anonymization_and_booking_preservation(tmp_p
             )
             session.add_all([fb_old, fb_recent])
 
-    # Run retention with valid approval and backup ref
+    # Run retention with valid target scope, approval, and backup ref
     approval_file = tmp_path / "approved.txt"
-    approval_file.write_text("APPROVED_RETENTION_RUN", encoding="utf-8")
+    approval_file.write_text("APPROVE_RETENTION:pilot", encoding="utf-8")
     backup_ref = "s3://backups/commonsbook-2026-09-10.tar.gz"
 
     result = await run_retention(
+        target_scope="pilot",
         account_cutoff_days=180,
         feedback_cutoff_days=90,
         apply=True,
@@ -365,7 +404,9 @@ async def test_retention_age_cutoff_anonymization_and_booking_preservation(tmp_p
         assert anon_user.email == f"{old_user.id}@deleted.invalid"
         assert anon_user.display_name == "Deleted participant"
         assert anon_user.enabled is False
-        assert anon_user.password_hash.startswith("$argon2id$v=19$m=65536,t=3,p=2$invalid$")
+        # R4: Freshly generated random unusable Argon2id hash (not constant)
+        assert anon_user.password_hash.startswith("$argon2id$v=19$m=65536,t=3,p=2$")
+        assert "$invalid$anonymized" not in anon_user.password_hash
 
         # Booking owner UUID is preserved
         b_stmt = select(Booking).where(Booking.id == booking_id)
@@ -386,9 +427,29 @@ async def test_retention_age_cutoff_anonymization_and_booking_preservation(tmp_p
         fb_rec_stmt = select(Feedback).where(Feedback.id == recent_fb_id)
         assert (await session.execute(fb_rec_stmt)).scalar_one_or_none() is not None
 
-        # Audit log entry exists
+        # Audit log entry exists in DB
         audit_stmt = select(AuditLog).where(AuditLog.action == "operator.retention")
         audit_row = (await session.execute(audit_stmt)).scalar_one_or_none()
         assert audit_row is not None
-        assert audit_row.details["backup_ref"] == backup_ref
-        assert audit_row.details["account_cutoff_days"] == 180
+        assert audit_row.details["target_scope"] == "pilot"
+
+    # R4: Verify operator.retention audit entry is inspectable via GET /api/v1/admin/audit
+    admin = await create_user(role="admin", enabled=True)
+    admin_token = make_token(admin)
+    client_ip = f"10.5.{uuid.uuid4().int % 250}.{uuid.uuid4().int % 250}"
+    async with make_client(ip=client_ip) as client:
+        r_audit = await client.get(
+            "/api/v1/admin/audit",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        assert r_audit.status_code == 200
+        ret_entries = [e for e in r_audit.json()["items"] if e["action"] == "operator.retention"]
+        assert len(ret_entries) >= 1
+        ret_det = ret_entries[0]["details"]
+        assert "accounts_anonymized" in ret_det
+        assert "feedback_deleted" in ret_det
+        assert "account_cutoff_days" in ret_det
+        assert "feedback_cutoff_days" in ret_det
+        assert "target_scope" in ret_det
+        # Ensure free-text backup_ref is not exposed in public details
+        assert "backup_ref" not in ret_det

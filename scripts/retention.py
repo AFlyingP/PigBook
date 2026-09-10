@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import os
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -15,11 +16,13 @@ from sqlalchemy import delete, func, select, update
 from app.admin.audit import append_audit_log
 from app.admin.models import Feedback
 from app.auth.models import RefreshToken, User
+from app.auth.passwords import hash_password
 from app.db.session import get_sessionmaker
 
 
 async def run_retention(
     *,
+    target_scope: str | None = None,
     account_cutoff_days: int = 180,
     feedback_cutoff_days: int = 90,
     apply: bool = False,
@@ -52,10 +55,14 @@ async def run_retention(
         if not apply:
             print(f"DRY-RUN: Eligible accounts for anonymization (older than {account_cutoff_days} days): {account_count}")
             print(f"DRY-RUN: Eligible feedback entries for deletion (older than {feedback_cutoff_days} days): {feedback_count}")
-            print("DRY-RUN: No changes made to the database. Provide --apply, --approval-file and --backup-ref to apply.")
+            print("DRY-RUN: No changes made to the database. Provide --apply, --target-scope, --approval-file and --backup-ref to apply.")
             return {"accounts_anonymized": account_count, "feedback_deleted": feedback_count}
 
-        # Apply mode validations
+        # Apply mode validations: target-scoped and approval-bound
+        if not target_scope:
+            print("Error: --target-scope is required when applying retention changes.", file=sys.stderr)
+            sys.exit(1)
+
         if not approval_file:
             print("Error: --approval-file is required when applying retention changes.", file=sys.stderr)
             sys.exit(1)
@@ -66,8 +73,12 @@ async def run_retention(
             sys.exit(1)
 
         approval_content = approval_path.read_text(encoding="utf-8").strip()
-        if not approval_content:
-            print("Error: Approval file is empty.", file=sys.stderr)
+        expected_token = f"APPROVE_RETENTION:{target_scope}"
+        if approval_content != expected_token:
+            print(
+                f"Error: Approval file content does not match required authorization token '{expected_token}'.",
+                file=sys.stderr,
+            )
             sys.exit(1)
 
         if not backup_ref:
@@ -89,7 +100,8 @@ async def run_retention(
                 user_uuid = locked_u.id
                 locked_u.email = f"{user_uuid}@deleted.invalid"
                 locked_u.display_name = "Deleted participant"
-                locked_u.password_hash = "$argon2id$v=19$m=65536,t=3,p=2$invalid$anonymized"
+                # Freshly generated random unusable Argon2id digest
+                locked_u.password_hash = hash_password(os.urandom(32).hex())
                 locked_u.enabled = False
                 locked_u.version += 1
                 locked_u.updated_at = now
@@ -127,6 +139,7 @@ async def run_retention(
                     "accounts_anonymized": anonymized_count,
                     "feedback_deleted": total_feedback_deleted,
                     "backup_ref": backup_ref,
+                    "target_scope": target_scope,
                     "account_cutoff_days": account_cutoff_days,
                     "feedback_cutoff_days": feedback_cutoff_days,
                 },
@@ -134,14 +147,15 @@ async def run_retention(
             )
 
             print(
-                f"Successfully applied retention: {anonymized_count} accounts anonymized, "
+                f"Successfully applied retention for scope '{target_scope}': {anonymized_count} accounts anonymized, "
                 f"{total_feedback_deleted} feedback records deleted. Backup ref: {backup_ref}"
             )
             return {"accounts_anonymized": anonymized_count, "feedback_deleted": total_feedback_deleted}
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Retention and account anonymization tool")
+    parser = argparse.ArgumentParser(description="Target-scoped retention and account anonymization tool")
+    parser.add_argument("--target-scope", type=str, help="Target scope for retention apply (e.g. 'pilot')")
     parser.add_argument("--account-cutoff-days", type=int, default=180, help="Account age cutoff in days (default: 180)")
     parser.add_argument("--feedback-cutoff-days", type=int, default=90, help="Feedback age cutoff in days (default: 90)")
     parser.add_argument("--apply", action="store_true", help="Apply retention changes (mutating)")
@@ -151,6 +165,7 @@ def main() -> None:
     args = parser.parse_args()
     asyncio.run(
         run_retention(
+            target_scope=args.target_scope,
             account_cutoff_days=args.account_cutoff_days,
             feedback_cutoff_days=args.feedback_cutoff_days,
             apply=args.apply,

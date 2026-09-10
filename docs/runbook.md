@@ -301,17 +301,17 @@ WHERE name = 'primary';
 
 ### Purpose and Scope
 Data retention maintenance is managed via `scripts/retention.py` in accordance with Spec 12.2:
-- Inactive pilot accounts (>180 days) are pseudonymized and disabled.
+- Inactive pilot accounts (>180 days) are pseudonymized and disabled. The 180-day cutoff uses account creation date (`created_at`) as the inactivity proxy because no last-activity column exists in the pilot schema.
 - Pilot feedback rows (>90 days after pilot completion) are purged.
 - Refresh tokens are revoked to terminate active sessions.
 - Historical booking owner UUIDs are preserved for referential integrity.
 
 ### Operational Invariants
 1. **Dry-Run by Default**: Executing `scripts/retention.py` without `--apply` performs a non-mutating preview, reporting candidate accounts and feedback entries eligible for retention.
-2. **Approval File Required on Apply**: When running with `--apply`, the operator must provide `--approval-file <path>` containing authorized approval tokens. Missing, empty, or mismatched files result in immediate process exit (exit 1).
+2. **Target Scope and Approval Binding**: When running with `--apply`, the operator must provide both `--target-scope <scope>` (e.g. `--target-scope pilot`) and `--approval-file <path>`. The approval file must contain the exact token `APPROVE_RETENTION:<scope>` naming the operation and target scope. Missing, empty, or mismatched files result in immediate process exit (exit 1).
 3. **Backup Reference Required**: Mutating runs require `--backup-ref <id>` documenting a verified, intact database snapshot taken prior to execution.
-4. **Referential Integrity**: Anonymization replaces the user email with `<uuid>@deleted.invalid`, sets `display_name = 'Deleted participant'`, replaces the password hash with an unusable random Argon2id hash, disables the account, and revokes all refresh tokens. The user UUID on booking records is preserved.
-5. **Audit Trail**: Every applied retention run records an audit record in `audit_log` with action `operator.retention`, recording affected counts and backup reference.
+4. **Referential Integrity**: Anonymization replaces the user email with `<uuid>@deleted.invalid`, sets `display_name = 'Deleted participant'`, replaces the password hash with a freshly generated random unusable Argon2id digest (`hash_password(os.urandom(32).hex())`), disables the account, and revokes all refresh tokens. The user UUID on booking records is preserved.
+5. **Audit Trail**: Every applied retention run records an audit record in `audit_log` with action `operator.retention`, recording affected counts, cutoff parameters, target scope, and backup reference.
 
 ### Procedure
 
@@ -325,20 +325,21 @@ Output:
 Request ID: <request-uuid>
 DRY-RUN: Eligible accounts for anonymization (older than 180 days): <N>
 DRY-RUN: Eligible feedback entries for deletion (older than 90 days): <M>
-DRY-RUN: No changes made to the database. Provide --apply, --approval-file and --backup-ref to apply.
+DRY-RUN: No changes made to the database. Provide --apply, --target-scope, --approval-file and --backup-ref to apply.
 ```
 
 #### Step 2: Verification and Approval File
 1. Take and verify a database backup snapshot. Note its identifier or URI.
-2. Prepare the approval file containing approval confirmation:
+2. Prepare the approval file containing authorization matching the target scope:
    ```bash
-   echo "APPROVED_RETENTION_$(date +%Y%m%d)" > approval_retention.txt
+   echo "APPROVE_RETENTION:pilot" > approval_retention.txt
    ```
 
 #### Step 3: Apply Retention
-Execute with `--apply`, `--approval-file`, and `--backup-ref`:
+Execute with `--apply`, `--target-scope`, `--approval-file`, and `--backup-ref`:
 ```bash
 python scripts/retention.py \
+  --target-scope pilot \
   --account-cutoff-days 180 \
   --feedback-cutoff-days 90 \
   --apply \
@@ -348,7 +349,7 @@ python scripts/retention.py \
 Output:
 ```text
 Request ID: <request-uuid>
-Successfully applied retention: <N> accounts anonymized, <M> feedback records deleted. Backup ref: s3://...
+Successfully applied retention for scope 'pilot': <N> accounts anonymized, <M> feedback records deleted. Backup ref: s3://...
 ```
 
 3. Clean up the local approval file:

@@ -18,6 +18,7 @@ from app.admin.schemas import (
     FeedbackCreate,
     FeedbackCreateResult,
     InviteCreate,
+    OutboxStatusFilter,
     OutboxView,
     ResourceCreate,
     ResourcePatch,
@@ -442,7 +443,7 @@ async def list_admin_audit_endpoint(
 async def list_admin_outbox_endpoint(
     limit: int = Query(default=25, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=10000),
-    status: str | None = Query(default=None),
+    status: OutboxStatusFilter | None = Query(default=None),
     scope: AuthorizedScope = Depends(authorize(Policy.admin)),
     session: AsyncSession = Depends(get_session),
 ) -> Page[OutboxView]:
@@ -452,7 +453,7 @@ async def list_admin_outbox_endpoint(
         scope=scope,
         limit=limit,
         offset=offset,
-        status=status,
+        status=status.value if status is not None else None,
     )
 
 

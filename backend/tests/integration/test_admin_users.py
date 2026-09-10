@@ -227,34 +227,65 @@ async def test_last_admin_rejection_and_self_demotion_with_another_admin() -> No
     admin1_token = make_token(admin1)
 
     client_ip = f"10.8.{uuid.uuid4().int % 250}.{uuid.uuid4().int % 250}"
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        async with session.begin():
+            existing_admins_stmt = select(User).where(User.role == "admin", User.enabled.is_(True))
+            existing = (await session.execute(existing_admins_stmt)).scalars().all()
+            for u in existing:
+                u.enabled = False
+
+    admin1 = await create_user(role="admin", enabled=True)
+    admin1_token = make_token(admin1)
+
+    client_ip = f"10.8.{uuid.uuid4().int % 250}.{uuid.uuid4().int % 250}"
     async with make_client(ip=client_ip) as client:
-        sessionmaker = get_sessionmaker()
-        async with sessionmaker() as session:
-            count_stmt = select(User).where(User.role == "admin", User.enabled.is_(True))
-            admins = (await session.execute(count_stmt)).scalars().all()
+        # R2: Against last active admin, invalid role returns 422 VALIDATION_ERROR
+        r_invalid_role = await client.patch(
+            f"/api/v1/admin/users/{admin1.id}",
+            json={"role": "superuser"},
+            headers={
+                "Authorization": f"Bearer {admin1_token}",
+                "If-Match": f'"{admin1.version}"',
+            },
+        )
+        assert r_invalid_role.status_code == 422
+        assert r_invalid_role.json()["error"]["code"] == "VALIDATION_ERROR"
 
-        if len(admins) == 1:
-            r_demote_last = await client.patch(
-                f"/api/v1/admin/users/{admin1.id}",
-                json={"role": "member"},
-                headers={
-                    "Authorization": f"Bearer {admin1_token}",
-                    "If-Match": f'"{admin1.version}"',
-                },
-            )
-            assert r_demote_last.status_code == 409
-            assert r_demote_last.json()["error"]["code"] == "LAST_ADMIN"
+        # R2: Against last active admin, overposted extra field returns 422 VALIDATION_ERROR
+        r_overpost = await client.patch(
+            f"/api/v1/admin/users/{admin1.id}",
+            json={"enabled": False, "extra_junk": 123},
+            headers={
+                "Authorization": f"Bearer {admin1_token}",
+                "If-Match": f'"{admin1.version}"',
+            },
+        )
+        assert r_overpost.status_code == 422
+        assert r_overpost.json()["error"]["code"] == "VALIDATION_ERROR"
 
-            r_disable_last = await client.patch(
-                f"/api/v1/admin/users/{admin1.id}",
-                json={"enabled": False},
-                headers={
-                    "Authorization": f"Bearer {admin1_token}",
-                    "If-Match": f'"{admin1.version}"',
-                },
-            )
-            assert r_disable_last.status_code == 409
-            assert r_disable_last.json()["error"]["code"] == "LAST_ADMIN"
+        # R3: Unconditional last admin rejection
+        r_demote_last = await client.patch(
+            f"/api/v1/admin/users/{admin1.id}",
+            json={"role": "member"},
+            headers={
+                "Authorization": f"Bearer {admin1_token}",
+                "If-Match": f'"{admin1.version}"',
+            },
+        )
+        assert r_demote_last.status_code == 409
+        assert r_demote_last.json()["error"]["code"] == "LAST_ADMIN"
+
+        r_disable_last = await client.patch(
+            f"/api/v1/admin/users/{admin1.id}",
+            json={"enabled": False},
+            headers={
+                "Authorization": f"Bearer {admin1_token}",
+                "If-Match": f'"{admin1.version}"',
+            },
+        )
+        assert r_disable_last.status_code == 409
+        assert r_disable_last.json()["error"]["code"] == "LAST_ADMIN"
 
         # Now add second admin
         await create_user(role="admin", enabled=True)

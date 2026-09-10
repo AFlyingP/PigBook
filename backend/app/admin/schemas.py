@@ -1,6 +1,7 @@
 import re
 import uuid
 from datetime import datetime
+from enum import Enum
 from typing import Any, Literal
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
@@ -18,6 +19,7 @@ __all__ = [
     "UserPatch",
     "Audit",
     "OutboxView",
+    "OutboxStatusFilter",
     "FeedbackCreate",
     "Feedback",
     "FeedbackCreateResult",
@@ -43,6 +45,11 @@ SAFE_AUDIT_KEYS = {
     "resource_id",
     "booking_id",
     "target_id",
+    "accounts_anonymized",
+    "feedback_deleted",
+    "account_cutoff_days",
+    "feedback_cutoff_days",
+    "target_scope",
 }
 
 
@@ -134,6 +141,13 @@ class Audit(BaseSchema):
         return {}
 
 
+class OutboxStatusFilter(str, Enum):
+    pending = "pending"
+    processing = "processing"
+    delivered = "delivered"
+    dead = "dead"
+
+
 class OutboxView(BaseSchema):
     id: uuid.UUID
     event_type: str
@@ -159,8 +173,8 @@ class FeedbackCreate(BaseSchema):
     task_completed: bool
     difficulty: str = Field(default="", max_length=2000)
     improvement: str = Field(default="", max_length=2000)
-    consent_version: str
-    consent: bool
+    consent_version: str | None = None
+    consent: bool | None = None
 
     model_config = ConfigDict(extra="forbid")
 
