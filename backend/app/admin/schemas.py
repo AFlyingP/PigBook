@@ -1,5 +1,7 @@
+import re
+import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import ConfigDict, field_validator, model_validator
 
@@ -14,7 +16,56 @@ __all__ = [
     "EmptyBody",
     "BlackoutCreate",
     "UserPatch",
+    "Audit",
+    "OutboxView",
+    "SAFE_AUDIT_KEYS",
+    "sanitize_audit_details",
+    "extract_safe_error_category",
 ]
+
+SAFE_AUDIT_KEYS = {
+    "fields",
+    "old_role",
+    "new_role",
+    "old_enabled",
+    "new_enabled",
+    "old_active",
+    "new_active",
+    "revoked_count",
+    "previous_status",
+    "attempts",
+    "event_category",
+    "reason_length",
+    "user_id",
+    "resource_id",
+    "booking_id",
+    "target_id",
+}
+
+
+def sanitize_audit_details(details: dict[str, Any] | None) -> dict[str, Any]:
+    if not details:
+        return {}
+    sanitized: dict[str, Any] = {}
+    for k, v in details.items():
+        if k in SAFE_AUDIT_KEYS:
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                sanitized[k] = v
+            elif isinstance(v, list) and all(isinstance(item, (str, int)) for item in v):
+                sanitized[k] = v
+    return sanitized
+
+
+def extract_safe_error_category(last_error: str | None) -> str | None:
+    if not last_error:
+        return None
+    cleaned = last_error.strip()
+    if ":" in cleaned:
+        category = cleaned.split(":", 1)[0].strip()
+    else:
+        category = cleaned
+    safe = re.sub(r"[^a-zA-Z0-9_\-]", "", category)
+    return safe[:50] or "unknown_error"
 
 
 class EmptyBody(BaseSchema):
@@ -58,3 +109,43 @@ class UserPatch(BaseSchema):
         if self.role is None and self.enabled is None:
             raise ValueError("At least one of role or enabled must be provided")
         return self
+
+
+class Audit(BaseSchema):
+    id: uuid.UUID
+    actor_id: uuid.UUID | None = None
+    action: str
+    target_type: str
+    target_id: uuid.UUID | None = None
+    request_id: uuid.UUID
+    details: dict[str, Any]
+    created_at: datetime
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    @field_validator("details", mode="before")
+    @classmethod
+    def validate_details(cls, v: Any) -> dict[str, Any]:
+        if isinstance(v, dict):
+            return sanitize_audit_details(v)
+        return {}
+
+
+class OutboxView(BaseSchema):
+    id: uuid.UUID
+    event_type: str
+    aggregate_id: uuid.UUID
+    status: str
+    attempts: int
+    occurred_at: datetime
+    available_at: datetime
+    last_error: str | None = None
+
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
+
+    @field_validator("last_error", mode="before")
+    @classmethod
+    def validate_last_error(cls, v: Any) -> str | None:
+        if isinstance(v, str):
+            return extract_safe_error_category(v)
+        return None

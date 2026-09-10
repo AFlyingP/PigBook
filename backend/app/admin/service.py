@@ -11,10 +11,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.audit import append_audit_log
+from app.admin.models import AuditLog
 from app.admin.schemas import (
+    Audit,
     BlackoutCreate,
     EmptyBody,
     InviteCreate,
+    OutboxView,
     ResourceCreate,
     ResourcePatch,
     UserPatch,
@@ -39,6 +42,7 @@ from app.bookings.service import (
     InvalidWindowError as BookingInvalidWindowError,
 )
 from app.config import get_settings
+from app.notifications.models import Outbox
 from app.resources.models import Resource as ResourceModel
 from app.resources.schemas import Page, Resource
 from app.resources.service import NotFoundError
@@ -802,3 +806,108 @@ async def update_user(
     setattr(user, "updated_at", now)
 
     return UserSchema.model_validate(user)
+
+
+async def list_audit_logs(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    limit: int = 25,
+    offset: int = 0,
+    target_id: uuid.UUID | None = None,
+) -> Page[Audit]:
+    """List audit entries with optional target_id filter, redacted details, stable order (E30)."""
+    conditions = []
+    if target_id is not None:
+        conditions.append(AuditLog.target_id == target_id)
+
+    count_stmt = select(func.count(AuditLog.id)).where(*conditions)
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    stmt = (
+        select(AuditLog)
+        .where(*conditions)
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    items = [Audit.model_validate(row) for row in rows]
+    return Page[Audit](items=items, total=total, limit=limit, offset=offset)
+
+
+async def list_outbox_events(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    limit: int = 25,
+    offset: int = 0,
+    status: str | None = None,
+) -> Page[OutboxView]:
+    """List outbox events with optional status filter and redacted category (E31)."""
+    conditions = []
+    if status is not None:
+        if status not in ("pending", "processing", "delivered", "dead"):
+            raise ValueError(f"Invalid outbox status: {status}")
+        conditions.append(Outbox.status == status)
+
+    count_stmt = select(func.count(Outbox.id)).where(*conditions)
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    stmt = (
+        select(Outbox)
+        .where(*conditions)
+        .order_by(Outbox.occurred_at.desc(), Outbox.id.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    items = [OutboxView.model_validate(row) for row in rows]
+    return Page[OutboxView](items=items, total=total, limit=limit, offset=offset)
+
+
+async def retry_event(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    data: EmptyBody,
+    now: datetime,
+) -> OutboxView:
+    """Retry a dead outbox event atomically (E32)."""
+    if scope.object_id is None:
+        raise NotFoundError("Outbox event not found")
+
+    event_id = scope.object_id
+
+    stmt = select(Outbox).where(Outbox.id == event_id).with_for_update()
+    res = await session.execute(stmt)
+    event = res.scalar_one_or_none()
+    if event is None:
+        raise NotFoundError("Outbox event not found")
+
+    if event.status != "dead":
+        raise InvalidState(
+            f"Only dead outbox events can be retried (current status: {event.status})"
+        )
+
+    setattr(event, "status", "pending")
+    setattr(event, "attempts", 0)
+    setattr(event, "available_at", now)
+    setattr(event, "last_error", None)
+    setattr(event, "lease_token", None)
+    setattr(event, "lease_until", None)
+
+    req_id = scope.predicates.get("request_id") or uuid.uuid4()
+    await append_audit_log(
+        session,
+        action="admin.outbox_retry",
+        target_type="outbox",
+        target_id=event.id,  # type: ignore[arg-type]
+        actor_id=scope.principal_id,
+        request_id=req_id,
+        details={"previous_status": "dead", "attempts": 0},
+        now=now,
+    )
+    await session.flush()
+
+    return OutboxView.model_validate(event)

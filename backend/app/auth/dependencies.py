@@ -181,6 +181,9 @@ policy_registry: dict[str, Policy] = {
     "E27": Policy.admin,
     "E28": Policy.admin,
     "E29": Policy.admin,
+    "E30": Policy.admin,
+    "E31": Policy.admin,
+    "E32": Policy.admin,
     "E35": Policy.public,
 }
 
@@ -552,6 +555,8 @@ async def _resolve_admin_scope(
                     await session.rollback()
                 if u_row is None:
                     raise ObjectNotFoundError("User not found")
+        elif "/admin/outbox/" in path:
+            object_id = parsed_id
 
     if path.rstrip("/").endswith("/admin/bookings"):
         predicates = {

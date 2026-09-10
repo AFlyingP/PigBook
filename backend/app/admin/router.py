@@ -7,9 +7,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.schemas import (
+    Audit,
     BlackoutCreate,
     EmptyBody,
     InviteCreate,
+    OutboxView,
     ResourceCreate,
     ResourcePatch,
     UserPatch,
@@ -24,7 +26,10 @@ from app.admin.service import (
     list_admin_bookings,
     list_admin_resources,
     list_admin_users,
+    list_audit_logs,
+    list_outbox_events,
     list_resource_blackouts,
+    retry_event,
     update_resource,
     update_user,
 )
@@ -394,3 +399,63 @@ async def update_user_endpoint(
     )
     response.headers["ETag"] = f'"{result.version}"'
     return result
+
+
+# --- Operations: Audit and Outbox (E30–E32) ---
+
+
+@router.get("/admin/audit", response_model=Page[Audit])
+async def list_admin_audit_endpoint(
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    target_id: uuid.UUID | None = Query(default=None),
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(get_session),
+) -> Page[Audit]:
+    """List audit entries with optional target_id filter (E30)."""
+    return await list_audit_logs(
+        session,
+        scope=scope,
+        limit=limit,
+        offset=offset,
+        target_id=target_id,
+    )
+
+
+@router.get("/admin/outbox", response_model=Page[OutboxView])
+async def list_admin_outbox_endpoint(
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    status: str | None = Query(default=None),
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(get_session),
+) -> Page[OutboxView]:
+    """List outbox events with optional status filter (E31)."""
+    return await list_outbox_events(
+        session,
+        scope=scope,
+        limit=limit,
+        offset=offset,
+        status=status,
+    )
+
+
+@router.post("/admin/outbox/{id}/retry", response_model=OutboxView)
+async def retry_outbox_endpoint(
+    id: uuid.UUID,
+    body: EmptyBody,
+    response: Response,
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
+) -> OutboxView:
+    """Retry a dead outbox event atomically (E32)."""
+    now = datetime.now(timezone.utc)
+    if scope.assert_current is not None:
+        await scope.assert_current(session)
+
+    return await retry_event(
+        session,
+        scope=scope,
+        data=body,
+        now=now,
+    )
