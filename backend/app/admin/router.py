@@ -6,12 +6,26 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.admin.feedback import (
+    ConsentRequiredError,
+    create_feedback,
+    list_feedback,
+)
 from app.admin.schemas import (
+    Audit,
     BlackoutCreate,
     EmptyBody,
+    FeedbackCreate,
+    FeedbackCreateResult,
     InviteCreate,
+    OutboxStatusFilter,
+    OutboxView,
     ResourceCreate,
     ResourcePatch,
+    UserPatch,
+)
+from app.admin.schemas import (
+    Feedback as FeedbackSchema,
 )
 from app.admin.service import (
     archive_resource,
@@ -22,11 +36,23 @@ from app.admin.service import (
     get_admin_booking,
     list_admin_bookings,
     list_admin_resources,
+    list_admin_users,
+    list_audit_logs,
+    list_outbox_events,
     list_resource_blackouts,
+    retry_event,
     update_resource,
+    update_user,
 )
-from app.auth.dependencies import AuthorizedScope, Policy, authorize
+from app.auth.dependencies import (
+    AuthorizedScope,
+    AuthRequiredError,
+    Policy,
+    authorize,
+)
+from app.auth.rate_limit import check_mutation_rate_limit
 from app.auth.schemas import InvitationResult
+from app.auth.schemas import User as UserSchema
 from app.bookings.idempotency import _parse_idempotency_key, execute_create
 from app.bookings.schemas import Booking as BookingSchema
 from app.bookings.schemas import BookingStatusFilter, Cancel, StoredResponse
@@ -346,3 +372,158 @@ async def create_invitation_endpoint(
     )
     response.headers["Cache-Control"] = "no-store"
     return result
+
+
+# --- Administrator User Management (E27, E28) ---
+
+
+@router.get("/admin/users", response_model=Page[UserSchema])
+async def list_admin_users_endpoint(
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    enabled: bool | None = Query(default=None),
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(get_session),
+) -> Page[UserSchema]:
+    """List users across the system with optional enabled filter (E27)."""
+    return await list_admin_users(
+        session,
+        scope=scope,
+        limit=limit,
+        offset=offset,
+        enabled=enabled,
+    )
+
+
+@router.patch("/admin/users/{id}", response_model=UserSchema)
+async def update_user_endpoint(
+    id: uuid.UUID,
+    body: UserPatch,
+    response: Response,
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
+) -> UserSchema:
+    """Guarded patch of a user with optimistic concurrency and last-admin check (E28)."""
+    now = datetime.now(timezone.utc)
+    if scope.assert_current is not None:
+        await scope.assert_current(session)
+
+    result = await update_user(
+        session,
+        scope=scope,
+        data=body,
+        now=now,
+    )
+    response.headers["ETag"] = f'"{result.version}"'
+    return result
+
+
+# --- Operations: Audit and Outbox (E30–E32) ---
+
+
+@router.get("/admin/audit", response_model=Page[Audit])
+async def list_admin_audit_endpoint(
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    target_id: uuid.UUID | None = Query(default=None),
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(get_session),
+) -> Page[Audit]:
+    """List audit entries with optional target_id filter (E30)."""
+    return await list_audit_logs(
+        session,
+        scope=scope,
+        limit=limit,
+        offset=offset,
+        target_id=target_id,
+    )
+
+
+@router.get("/admin/outbox", response_model=Page[OutboxView])
+async def list_admin_outbox_endpoint(
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    status: OutboxStatusFilter | None = Query(default=None),
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(get_session),
+) -> Page[OutboxView]:
+    """List outbox events with optional status filter (E31)."""
+    return await list_outbox_events(
+        session,
+        scope=scope,
+        limit=limit,
+        offset=offset,
+        status=status.value if status is not None else None,
+    )
+
+
+@router.post("/admin/outbox/{id}/retry", response_model=OutboxView)
+async def retry_outbox_endpoint(
+    id: uuid.UUID,
+    body: EmptyBody,
+    response: Response,
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
+) -> OutboxView:
+    """Retry a dead outbox event atomically (E32)."""
+    now = datetime.now(timezone.utc)
+    if scope.assert_current is not None:
+        await scope.assert_current(session)
+
+    return await retry_event(
+        session,
+        scope=scope,
+        data=body,
+        now=now,
+    )
+
+
+# --- Consented Feedback (E33, E34) ---
+
+
+@router.post("/feedback", response_model=FeedbackCreateResult, status_code=201)
+async def create_feedback_endpoint(
+    body: FeedbackCreate,
+    scope: AuthorizedScope = Depends(authorize(Policy.authenticated)),
+    session: AsyncSession = Depends(transaction_dependency, scope="function"),
+) -> FeedbackCreateResult:
+    """Submit consented feedback with 2026-09-v1 consent version (E33)."""
+    if scope.principal_id is None:
+        raise AuthRequiredError("Authentication required")
+
+    now = datetime.now(timezone.utc)
+
+    # Validate consent before rate limiting or domain transaction
+    if body.consent is not True or body.consent_version != "2026-09-v1":
+        raise ConsentRequiredError(
+            "Affirmative consent and consent_version '2026-09-v1' are required"
+        )
+
+    # Rate limiting on authenticated mutation path (same as E09)
+    await check_mutation_rate_limit(scope.principal_id, now)
+
+    if scope.assert_current is not None:
+        await scope.assert_current(session)
+
+    return await create_feedback(
+        session,
+        scope=scope,
+        data=body,
+        now=now,
+    )
+
+
+@router.get("/admin/feedback", response_model=Page[FeedbackSchema])
+async def list_admin_feedback_endpoint(
+    limit: int = Query(default=25, ge=1, le=100),
+    offset: int = Query(default=0, ge=0, le=10000),
+    scope: AuthorizedScope = Depends(authorize(Policy.admin)),
+    session: AsyncSession = Depends(get_session),
+) -> Page[FeedbackSchema]:
+    """List participant feedback submissions for administrators (E34)."""
+    return await list_feedback(
+        session,
+        scope=scope,
+        limit=limit,
+        offset=offset,
+    )

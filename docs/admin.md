@@ -38,6 +38,12 @@ Administrative operations in CommonsBook provide inventory control, blackout sch
 | **E24** | `GET /api/v1/admin/bookings` | `Policy.admin` | None (Query: filters, `starts_at`, `ends_at`) | `200 Page<Booking>` | 401; 403; 422 `INVALID_WINDOW` / validation | Reservations only |
 | **E25** | `GET /api/v1/admin/bookings/{id}` | `Policy.admin` | None | `200 Booking` | 404 `NOT_FOUND` (absent or blackout); 401; 403 | Header: `ETag: "<version>"` |
 | **E26** | `POST /api/v1/admin/bookings/{id}/cancel` | `Policy.admin` | Header: `If-Match`; Body: `Cancel {reason}` | `200 Booking` | 404 `NOT_FOUND`; 409 `TOO_LATE`, `INVALID_STATE`; 412 `VERSION_MISMATCH`; 428 | Precondition: `If-Match: "<version>"` |
+| **E27** | `GET /api/v1/admin/users` | `Policy.admin` | None (Query: `limit`, `offset`, `enabled`) | `200 Page<User>` | 401 `AUTH_REQUIRED` / `INVALID_TOKEN`; 403 `FORBIDDEN`; 422 validation | Standard pagination |
+| **E28** | `PATCH /api/v1/admin/users/{id}` | `Policy.admin` | Header: `If-Match`; Body: `UserPatch` | `200 User` | 401; 403; 404; 409 `LAST_ADMIN`; 412 `VERSION_MISMATCH`; 422; 428 | Precondition: `If-Match: "<version>"`, Header: `ETag` |
+| **E30** | `GET /api/v1/admin/audit` | `Policy.admin` | None (Query: `limit`, `offset`, `target_id`) | `200 Page<Audit>` | 401; 403; 422 | Redacted details |
+| **E31** | `GET /api/v1/admin/outbox` | `Policy.admin` | None (Query: `limit`, `offset`, `status`) | `200 Page<OutboxView>` | 401; 403; 422 | Redacted error category |
+| **E32** | `POST /api/v1/admin/outbox/{id}/retry` | `Policy.admin` | Body: `EmptyBody {}` | `200 OutboxView` | 401; 403; 404; 409 `INVALID_STATE` | Retries dead event atomically |
+| **E34** | `GET /api/v1/admin/feedback` | `Policy.admin` | None (Query: `limit`, `offset`) | `200 Page<Feedback>` | 401; 403; 422 | Feedback restricted to admin |
 
 ---
 
@@ -158,9 +164,59 @@ Blackouts represent administrator-mandated maintenance or facility closures.
   5. Invokes `promote_waiters` to offer released capacity to the next eligible waiter in the queue.
   All five mutations commit together in a single transaction.
 
+
+
 ---
 
-## 6. Audit Logging and Security Controls
+## 6. Administrator User Lifecycle Management (E27–E28)
+
+### User Directory Listing (E27)
+
+`GET /api/v1/admin/users` lists user accounts across the system.
+- **Ordering**: Deterministic order by `created_at` descending, then `id` ascending.
+- **Filtering**: Optional query parameter `enabled=true` or `enabled=false`.
+- **Pagination**: Standard pagination with `limit` (1..100, default 25) and `offset` (0..10000, default 0).
+
+### Guarded User Patch and Session Revocation (E28)
+
+`PATCH /api/v1/admin/users/{id}` modifies user account role or active status.
+- **Precondition**: Requires an `If-Match` header pinning the expected user version. Missing header returns 428 `PRECONDITION_REQUIRED`; malformed format returns 422 `VALIDATION_ERROR`; stale version returns 412 `VERSION_MISMATCH` strictly evaluated before state checks.
+- **Payload**: `UserPatch` permits updating `role` (`member` or `admin`) and `enabled` (`true` or `false`). At least one field must be supplied; explicit null values or extra properties are rejected with 422.
+- **Concurrency & Serialization**: Mutating user requests take transactional advisory lock `714001` first in the authorization dependency before acquiring any user row lock. Actor and target users are then locked in strict UUID order.
+- **Last Active Administrator Protection**: Attempting to demote or disable the last active administrator returns 409 `LAST_ADMIN`. Concurrent demotions serialize on advisory lock 714001, ensuring that one succeeds and the second fails closed.
+- **Session Revocation on Disable**: Disabling an account (`enabled=False`) immediately revokes all active refresh tokens and token families for that user within the same database transaction. The user's historical reservations, blackouts, and waitlist entries are preserved intact.
+- **Stale Privilege Invalidation**: User role and enabled status are reloaded from PostgreSQL on every request. Tokens minted prior to demotion or disabling immediately lose privilege.
+- **Audit Logging**: Successful updates record `admin.user_update` with details restricted to changed field names and safe old/new role and enabled values.
+
+---
+
+## 7. Operations: Audit and Dead-Letter Operations (E30–E32)
+
+### Audit Trail Inspection (E30)
+
+`GET /api/v1/admin/audit` retrieves immutable system audit logs.
+- **Ordering**: Deterministic order by `created_at` descending, then `id` ascending.
+- **Filtering**: Optional query parameter `target_id` (UUID).
+- **Details Redaction**: Audit `details` are sanitized using a strict allowlist. Raw passwords, authentication tokens, cookies, invitation links, or un-redacted user content are never exposed.
+- **Immutability Invariant**: The runtime database user holds `SELECT` and `INSERT` privileges only on `audit_log`; update and deletion operations are rejected by database permissions.
+
+### Outbox and Dead-Letter Monitoring (E31)
+
+`GET /api/v1/admin/outbox` exposes notification background delivery status.
+- **Ordering**: Deterministic order by `occurred_at` descending, then `id` ascending.
+- **Filtering**: Optional query parameter `status` (`pending`, `processing`, `delivered`, or `dead`).
+- **Error Redaction**: The `last_error` field is exposed only as a sanitized error category (e.g. `connection_timeout`, `smtp_error`), preventing credential or message body leakage.
+
+### Dead-Letter Retry (E32)
+
+`POST /api/v1/admin/outbox/{id}/retry` retries a failed notification event.
+- **State Invariant**: Only events currently in `dead` status may be retried. Attempting to retry an event in `pending`, `processing`, or `delivered` status returns 409 `INVALID_STATE`.
+- **Atomic Transition**: Atomically resets status from `dead` to `pending`, sets `attempts = 0`, sets `available_at = clock_timestamp()`, clears `last_error`, and records an `admin.outbox_retry` audit entry within the same transaction.
+- **Delivery Receipt Preservation**: The event ID and any recorded delivery receipt in `notification_deliveries` are retained, preventing already-dispatched emails from being re-sent.
+
+---
+
+## 8. Audit Logging and Security Controls
 
 All administrative mutations are recorded in the append-only `audit_log` table:
 
@@ -178,7 +234,7 @@ All administrative mutations are recorded in the append-only `audit_log` table:
 
 ---
 
-## 7. Error Envelopes and Status Codes
+## 9. Error Envelopes and Status Codes
 
 All errors adhere to the standard CommonsBook error envelope:
 
@@ -200,7 +256,8 @@ All errors adhere to the standard CommonsBook error envelope:
 - `409 RESOURCE_INACTIVE`: Blackout creation rejected because the target resource is archived.
 - `409 SLOT_CONFLICT`: Blackout overlaps an existing confirmed reservation, offered hold, or blackout.
 - `409 TOO_LATE`: Attempted cancellation of an already completed reservation or blackout.
-- `409 INVALID_STATE`: Object is in a terminal state that cannot be transitioned.
+- `409 INVALID_STATE`: Object is in a state that cannot be transitioned (e.g. retrying a non-dead outbox event).
+- `409 LAST_ADMIN`: Operation rejected because it would demote or disable the last active administrator.
 - `412 VERSION_MISMATCH`: Precondition version in `If-Match` does not match stored row version (evaluated before state checks).
 - `422 VALIDATION_ERROR`: Schema validation failure, null patch fields, or malformed `If-Match` format.
 - `422 IDEMPOTENCY_KEY_REQUIRED` / `IDEMPOTENCY_KEY_INVALID`: Missing or non-UUID-v4 idempotency key.
@@ -211,7 +268,6 @@ All errors adhere to the standard CommonsBook error envelope:
 
 ---
 
-## 8. Current Limitations
+## 10. Current Limitations
 
-- **Administrative User Management**: User modification, role elevation/demotion, and user disabling endpoints (`/api/v1/admin/users/*`) are scheduled for subsequent operational packages.
-- **Operational Outbox Management**: Outbox failure inspection and manual event retry endpoints (`/api/v1/admin/outbox/*`) are not yet exposed.
+- **Self-Service Password Recovery**: Password reset via email is excluded for this invitation-only pilot. Account recovery is performed via operator CLI tooling (`scripts/reset_password.py`).

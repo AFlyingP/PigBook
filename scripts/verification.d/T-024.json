@@ -1,0 +1,12 @@
+{
+  "ticket_id": "T-024",
+  "pytest_paths": [
+    "backend/tests/integration/test_admin_users.py",
+    "backend/tests/integration/test_admin_operations.py",
+    "backend/tests/integration/test_feedback.py",
+    "backend/tests/integration/test_permissions.py"
+  ],
+  "vitest_paths": [],
+  "playwright_paths": [],
+  "document_checks": []
+}

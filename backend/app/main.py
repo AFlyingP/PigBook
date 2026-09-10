@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import DBAPIError
 
+from app.admin.feedback import ConsentRequiredError
 from app.admin.router import router as admin_router
 from app.admin.service import ResourceInUse
 from app.auth.dependencies import (
@@ -17,6 +18,7 @@ from app.auth.dependencies import (
     InvalidIfMatchError,
     InvalidRefreshError,
     InvalidTokenError,
+    LastAdminError,
     ObjectNotFoundError,
     OriginRejectedError,
     PreconditionRequiredError,
@@ -314,6 +316,24 @@ def create_app() -> FastAPI:
         return make_error_response(
             status_code=409,
             code="RESOURCE_IN_USE",
+            message=exc.message,
+        )
+
+    @app.exception_handler(LastAdminError)
+    async def last_admin_handler(_request: Request, exc: LastAdminError) -> JSONResponse:
+        return make_error_response(
+            status_code=409,
+            code="LAST_ADMIN",
+            message=exc.message,
+        )
+
+    @app.exception_handler(ConsentRequiredError)
+    async def consent_required_handler(
+        _request: Request, exc: ConsentRequiredError
+    ) -> JSONResponse:
+        return make_error_response(
+            status_code=422,
+            code="CONSENT_REQUIRED",
             message=exc.message,
         )
 

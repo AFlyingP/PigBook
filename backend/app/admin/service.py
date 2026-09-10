@@ -11,18 +11,23 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.audit import append_audit_log
+from app.admin.models import AuditLog
 from app.admin.schemas import (
+    Audit,
     BlackoutCreate,
     EmptyBody,
     InviteCreate,
+    OutboxView,
     ResourceCreate,
     ResourcePatch,
+    UserPatch,
 )
 from app.auth.dependencies import AuthorizedScope, PreconditionRequiredError
 from app.auth.models import Invitation, User
 from app.auth.passwords import normalize_email
 from app.auth.schemas import InvitationResult
-from app.auth.service import EmailExistsError
+from app.auth.schemas import User as UserSchema
+from app.auth.service import EmailExistsError, revoke_user_refresh_tokens
 from app.bookings.models import Booking
 from app.bookings.schemas import Booking as BookingSchema
 from app.bookings.schemas import BookingStatusFilter
@@ -37,6 +42,7 @@ from app.bookings.service import (
     InvalidWindowError as BookingInvalidWindowError,
 )
 from app.config import get_settings
+from app.notifications.models import Outbox
 from app.resources.models import Resource as ResourceModel
 from app.resources.schemas import Page, Resource
 from app.resources.service import NotFoundError
@@ -690,3 +696,216 @@ async def create_invitation(
         expires_at=expires_at,
         invitation_url=invitation_url,
     )
+
+
+async def list_admin_users(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    limit: int = 25,
+    offset: int = 0,
+    enabled: bool | None = None,
+) -> Page[UserSchema]:
+    """List all users in the system with optional enabled filter (E27)."""
+    conditions = []
+    if enabled is not None:
+        conditions.append(User.enabled == enabled)
+
+    count_stmt = select(func.count(User.id)).where(*conditions)
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    stmt = (
+        select(User)
+        .where(*conditions)
+        .order_by(User.created_at.desc(), User.id.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    users = (await session.execute(stmt)).scalars().all()
+    items = [UserSchema.model_validate(u) for u in users]
+    return Page[UserSchema](items=items, total=total, limit=limit, offset=offset)
+
+
+async def update_user(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    data: UserPatch,
+    now: datetime,
+) -> UserSchema:
+    """Guarded patch of a user with optimistic concurrency (E28)."""
+    if scope.object_id is None:
+        raise NotFoundError("User not found")
+    if scope.expected_version is None:
+        raise PreconditionRequiredError("If-Match header is required")
+
+    user_id = scope.object_id
+    expected_version = scope.expected_version
+
+    stmt = select(User).where(User.id == user_id).with_for_update()
+    res = await session.execute(stmt)
+    user = res.scalar_one_or_none()
+    if user is None:
+        raise NotFoundError("User not found")
+
+    if user.version != expected_version:
+        raise VersionMismatch("User version mismatch")
+
+    patch_dict = data.model_dump(exclude_unset=True)
+    if not patch_dict:
+        raise ValueError("At least one field must be provided for update")
+
+    old_role = str(user.role)
+    old_enabled = bool(user.enabled)
+
+    new_role = patch_dict.get("role", user.role)
+    new_enabled = patch_dict.get("enabled", user.enabled)
+
+    update_stmt = (
+        update(User)
+        .where(User.id == user_id, User.version == expected_version)
+        .values(
+            role=new_role,
+            enabled=new_enabled,
+            version=user.version + 1,
+            updated_at=now,
+        )
+    )
+    update_res = await session.execute(update_stmt)
+    if getattr(update_res, "rowcount", None) != 1:
+        raise VersionMismatch("User version mismatch")
+
+    if old_enabled is True and new_enabled is False:
+        await revoke_user_refresh_tokens(session, user_id=user_id, now=now)
+
+    changed_fields = sorted(list(patch_dict.keys()))
+    details: dict[str, Any] = {"fields": changed_fields}
+    if "role" in patch_dict:
+        details["old_role"] = old_role
+        details["new_role"] = new_role
+    if "enabled" in patch_dict:
+        details["old_enabled"] = old_enabled
+        details["new_enabled"] = new_enabled
+
+    req_id = scope.predicates.get("request_id") or uuid.uuid4()
+    await append_audit_log(
+        session,
+        action="admin.user_update",
+        target_type="user",
+        target_id=user_id,
+        actor_id=scope.principal_id,
+        request_id=req_id,
+        details=details,
+        now=now,
+    )
+    await session.flush()
+
+    setattr(user, "role", new_role)
+    setattr(user, "enabled", new_enabled)
+    setattr(user, "version", expected_version + 1)
+    setattr(user, "updated_at", now)
+
+    return UserSchema.model_validate(user)
+
+
+async def list_audit_logs(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    limit: int = 25,
+    offset: int = 0,
+    target_id: uuid.UUID | None = None,
+) -> Page[Audit]:
+    """List audit entries with optional target_id filter, redacted details, stable order (E30)."""
+    conditions = []
+    if target_id is not None:
+        conditions.append(AuditLog.target_id == target_id)
+
+    count_stmt = select(func.count(AuditLog.id)).where(*conditions)
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    stmt = (
+        select(AuditLog)
+        .where(*conditions)
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    items = [Audit.model_validate(row) for row in rows]
+    return Page[Audit](items=items, total=total, limit=limit, offset=offset)
+
+
+async def list_outbox_events(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    limit: int = 25,
+    offset: int = 0,
+    status: str | None = None,
+) -> Page[OutboxView]:
+    """List outbox events with optional status filter and redacted category (E31)."""
+    conditions = []
+    if status is not None:
+        conditions.append(Outbox.status == status)
+
+    count_stmt = select(func.count(Outbox.id)).where(*conditions)
+    total = (await session.execute(count_stmt)).scalar_one()
+
+    stmt = (
+        select(Outbox)
+        .where(*conditions)
+        .order_by(Outbox.occurred_at.desc(), Outbox.id.asc())
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    items = [OutboxView.model_validate(row) for row in rows]
+    return Page[OutboxView](items=items, total=total, limit=limit, offset=offset)
+
+
+async def retry_event(
+    session: AsyncSession,
+    *,
+    scope: AuthorizedScope,
+    data: EmptyBody,
+    now: datetime,
+) -> OutboxView:
+    """Retry a dead outbox event atomically (E32)."""
+    if scope.object_id is None:
+        raise NotFoundError("Outbox event not found")
+
+    event_id = scope.object_id
+
+    stmt = select(Outbox).where(Outbox.id == event_id).with_for_update()
+    res = await session.execute(stmt)
+    event = res.scalar_one_or_none()
+    if event is None:
+        raise NotFoundError("Outbox event not found")
+
+    if event.status != "dead":
+        raise InvalidState(
+            f"Only dead outbox events can be retried (current status: {event.status})"
+        )
+
+    setattr(event, "status", "pending")
+    setattr(event, "attempts", 0)
+    setattr(event, "available_at", now)
+    setattr(event, "last_error", None)
+    setattr(event, "lease_token", None)
+    setattr(event, "lease_until", None)
+
+    req_id = scope.predicates.get("request_id") or uuid.uuid4()
+    await append_audit_log(
+        session,
+        action="admin.outbox_retry",
+        target_type="outbox",
+        target_id=event.id,  # type: ignore[arg-type]
+        actor_id=scope.principal_id,
+        request_id=req_id,
+        details={"previous_status": "dead", "attempts": 0},
+        now=now,
+    )
+    await session.flush()
+
+    return OutboxView.model_validate(event)

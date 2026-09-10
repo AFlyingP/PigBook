@@ -9,7 +9,7 @@ from typing import Any
 import jwt
 from fastapi import Depends, Request
 from fastapi.exceptions import RequestValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.models import User
@@ -76,6 +76,14 @@ class InvalidIfMatchError(Exception):
     """Raised when an If-Match header is present but not a single strong entity tag."""
 
     def __init__(self, message: str = "If-Match header is malformed") -> None:
+        self.message = message
+        super().__init__(message)
+
+
+class LastAdminError(Exception):
+    def __init__(
+        self, message: str = "Cannot demote or disable the last active administrator"
+    ) -> None:
         self.message = message
         super().__init__(message)
 
@@ -170,7 +178,14 @@ policy_registry: dict[str, Policy] = {
     "E24": Policy.admin,
     "E25": Policy.admin,
     "E26": Policy.admin,
+    "E27": Policy.admin,
+    "E28": Policy.admin,
     "E29": Policy.admin,
+    "E30": Policy.admin,
+    "E31": Policy.admin,
+    "E32": Policy.admin,
+    "E33": Policy.authenticated,
+    "E34": Policy.admin,
     "E35": Policy.public,
 }
 
@@ -414,6 +429,92 @@ async def _resolve_admin_scope(
                 "audit": True,
                 "request_id": req_id,
             }
+        elif "/admin/users/" in path:
+            object_id = parsed_id
+            if req_method == "PATCH":
+                try:
+                    user_lookup_stmt = select(User.id, User.version).where(User.id == parsed_id)
+                    u_row = (await session.execute(user_lookup_stmt)).one_or_none()
+                finally:
+                    await session.rollback()
+
+                if u_row is None:
+                    raise ObjectNotFoundError("User not found")
+
+                # Stale version check strictly precedes state checks
+                if expected_version is not None and u_row[1] != expected_version:
+                    from app.bookings.service import VersionMismatch
+
+                    raise VersionMismatch("User version mismatch")
+
+                actor_id = principal_id
+                target_id = parsed_id
+
+                async def _assert_current_user_e28(target_session: AsyncSession) -> None:
+                    # 1. Transactional advisory lock 714001 FIRST (Spec 5.1)
+                    await target_session.execute(text("SELECT pg_advisory_xact_lock(714001)"))
+
+                    # 2. Lock actor and target in UUID order
+                    if actor_id == target_id:
+                        stmt = select(User).where(User.id == target_id).with_for_update()
+                        t_user = (await target_session.execute(stmt)).scalar_one_or_none()
+                        a_user = t_user
+                    elif actor_id < target_id:
+                        a_stmt = select(User).where(User.id == actor_id).with_for_update(read=True)
+                        a_user = (await target_session.execute(a_stmt)).scalar_one_or_none()
+                        t_stmt = select(User).where(User.id == target_id).with_for_update()
+                        t_user = (await target_session.execute(t_stmt)).scalar_one_or_none()
+                    else:
+                        t_stmt = select(User).where(User.id == target_id).with_for_update()
+                        t_user = (await target_session.execute(t_stmt)).scalar_one_or_none()
+                        a_stmt = select(User).where(User.id == actor_id).with_for_update(read=True)
+                        a_user = (await target_session.execute(a_stmt)).scalar_one_or_none()
+
+                    if a_user is None or not a_user.enabled or a_user.role != "admin":
+                        raise InvalidTokenError("Invalid or expired token")
+
+                    if t_user is None:
+                        raise ObjectNotFoundError("User not found")
+
+                    if expected_version is not None and t_user.version != expected_version:
+                        from app.bookings.service import VersionMismatch
+
+                        raise VersionMismatch("User version mismatch")
+
+                    body_json = await request.json()
+                    patch_role = body_json.get("role") if isinstance(body_json, dict) else None
+                    patch_enabled = (
+                        body_json.get("enabled") if isinstance(body_json, dict) else None
+                    )
+
+                    is_act_admin = t_user.role == "admin" and t_user.enabled is True
+                    rem_admin = True
+                    if patch_role is not None and patch_role != "admin":
+                        rem_admin = False
+                    if patch_enabled is not None and patch_enabled is False:
+                        rem_admin = False
+
+                    if is_act_admin and not rem_admin:
+                        c_stmt = select(func.count(User.id)).where(
+                            User.role == "admin", User.enabled.is_(True)
+                        )
+                        cnt = (await target_session.execute(c_stmt)).scalar_one()
+                        if cnt <= 1:
+                            raise LastAdminError(
+                                "Cannot demote or disable the last active administrator"
+                            )
+
+                assert_current = _assert_current_user_e28
+            else:
+                try:
+                    user_get_stmt = select(User.id).where(User.id == parsed_id)
+                    get_row = (await session.execute(user_get_stmt)).one_or_none()
+                finally:
+                    await session.rollback()
+                if get_row is None:
+                    raise ObjectNotFoundError("User not found")
+        elif "/admin/outbox/" in path:
+            object_id = parsed_id
 
     if path.rstrip("/").endswith("/admin/bookings"):
         predicates = {
