@@ -416,11 +416,15 @@ export function ResourceDetail({ onLaunchBooking }: ResourceDetailProps = {}) {
                             size="small"
                             variant="outlined"
                             fullWidth
-                            disabled={s.isOccupied || !resource?.active}
+                            disabled={s.isOccupied || !resource?.active || !onLaunchBooking}
                             onClick={() => handleLaunchBooking(s.startIso, s.endIso)}
                             sx={{ fontSize: "0.7rem", py: 0.25 }}
                           >
-                            {s.isOccupied ? "Occupied" : "Select Slot"}
+                            {s.isOccupied
+                              ? "Occupied"
+                              : onLaunchBooking
+                              ? "Select Slot"
+                              : "Available"}
                           </Button>
                         </Card>
                       </Grid>

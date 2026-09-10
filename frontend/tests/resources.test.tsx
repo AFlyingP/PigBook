@@ -359,7 +359,81 @@ describe("Resource Catalog & Availability UI Components (Spec 7.1, 7.2)", () => 
     expect(screen.queryByText(/owned by/i)).not.toBeInTheDocument();
   });
 
-  it("displays accessible inline error when invalid past slot is selected (R3)", async () => {
+  it("displays accessible inline error when invalid past slot is selected deterministically (R3, R8)", async () => {
+    // Control the clock so 08:00 local EDT (12:00 UTC) is deterministically in the past (R8)
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-10T20:00:00Z")); // 16:00 local EDT
+
+    try {
+      const mockResource = {
+        id: "r-1",
+        name: "Community Woodshop",
+        location: "Workshop Bay B",
+        description: "Equipped with power saws.",
+        active: true,
+        version: 1,
+        created_at: "2026-09-01T00:00:00Z",
+        updated_at: "2026-09-01T00:00:00Z",
+      };
+
+      vi.mocked(fetch).mockImplementation(async (url) => {
+        const u = String(url);
+        if (u.includes("/availability")) {
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers(),
+            json: async () => ({
+              resource_id: "r-1",
+              starts_at: "2026-09-10T04:00:00Z",
+              ends_at: "2026-09-17T04:00:00Z",
+              timezone: "America/New_York",
+              occupied: [],
+            }),
+          } as Response;
+        }
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ ETag: '"v1"' }),
+          json: async () => mockResource,
+        } as Response;
+      });
+
+      const qc = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+
+      // Pass onLaunchBooking seam to enable the slot control for test validation (R7, R8)
+      render(
+        <QueryClientProvider client={qc}>
+          <MemoryRouter initialEntries={["/resources/r-1"]}>
+            <Routes>
+              <Route path="/resources/:id" element={<ResourceDetail onLaunchBooking={vi.fn()} />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>
+      );
+
+      await screen.findByText("Community Woodshop");
+      await screen.findByText(/Available & Occupied Slots/i);
+
+      // Click first slot on today (which is 08:00 EDT = 12:00 UTC, deterministically in the past)
+      const selectSlotBtn = screen.getAllByRole("button", { name: "Select Slot" })[0];
+      fireEvent.click(selectSlotBtn);
+
+      // Assert accessible inline error alert is displayed (R3)
+      await waitFor(() => {
+        const alert = screen.getByRole("alert");
+        expect(alert).toHaveAttribute("aria-live", "polite");
+        expect(alert).toHaveTextContent(/at least 15 minutes in the future/i);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("ensures shipped availability grid is honestly read-only when onLaunchBooking is absent (R7)", async () => {
     const mockResource = {
       id: "r-1",
       name: "Community Woodshop",
@@ -399,6 +473,7 @@ describe("Resource Catalog & Availability UI Components (Spec 7.1, 7.2)", () => 
       defaultOptions: { queries: { retry: false } },
     });
 
+    // Shipped app has no onLaunchBooking prop
     render(
       <QueryClientProvider client={qc}>
         <MemoryRouter initialEntries={["/resources/r-1"]}>
@@ -412,16 +487,15 @@ describe("Resource Catalog & Availability UI Components (Spec 7.1, 7.2)", () => 
     await screen.findByText("Community Woodshop");
     await screen.findByText(/Available & Occupied Slots/i);
 
-    // Click first slot on today (which is in the past)
-    const selectSlotBtn = screen.getAllByRole("button", { name: "Select Slot" })[0];
-    fireEvent.click(selectSlotBtn);
-
-    // Assert accessible inline error alert is displayed (R3)
-    await waitFor(() => {
-      const alert = screen.getByRole("alert");
-      expect(alert).toHaveAttribute("aria-live", "polite");
-      expect(alert).toHaveTextContent(/at least 15 minutes in the future/i);
+    // Verify all available slot buttons are disabled with label "Available" (R7)
+    const availableBtns = screen.getAllByRole("button", { name: "Available" });
+    expect(availableBtns.length).toBeGreaterThan(0);
+    availableBtns.forEach((btn) => {
+      expect(btn).toBeDisabled();
     });
+
+    // Verify no enabled "Select Slot" control exists in shipped app
+    expect(screen.queryByRole("button", { name: "Select Slot" })).not.toBeInTheDocument();
   });
 
   it("passes typed launch contract without issuing any mutation (R4)", async () => {

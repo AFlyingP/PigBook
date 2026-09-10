@@ -16,6 +16,43 @@ interface RegisterFormProps {
   onSuccess?: () => void;
 }
 
+function formatValidationError(details: unknown): string {
+  if (!details || typeof details !== "object") {
+    return "Validation error: please check your input.";
+  }
+
+  const rec = details as Record<string, unknown>;
+
+  // Real backend shape: { details: { errors: [{ loc: [...], msg: "...", type: "..." }] } }
+  if (Array.isArray(rec.errors) && rec.errors.length > 0) {
+    const messages = rec.errors
+      .map((errItem: unknown) => {
+        if (!errItem || typeof errItem !== "object") return null;
+        const errObj = errItem as { loc?: unknown[]; msg?: string };
+        const fieldName = Array.isArray(errObj.loc)
+          ? errObj.loc.filter((part) => part !== "body").join(".")
+          : "";
+        const msg = errObj.msg || "Invalid value";
+        return fieldName ? `${fieldName}: ${msg}` : msg;
+      })
+      .filter(Boolean);
+
+    if (messages.length > 0) {
+      return `Validation error: ${messages.join("; ")}`;
+    }
+  }
+
+  // Fallback for flat key-value dictionary where values are strings
+  const stringEntries = Object.entries(rec).filter(
+    ([, v]) => typeof v === "string" || typeof v === "number"
+  );
+  if (stringEntries.length > 0) {
+    return `Validation error: ${stringEntries.map(([k, v]) => `${k}: ${v}`).join(", ")}`;
+  }
+
+  return "Validation error: please verify your email and display name.";
+}
+
 export function RegisterForm({ onSuccess }: RegisterFormProps) {
   const { register } = useAuth();
   const [token, setToken] = useState<string | null>(null);
@@ -101,14 +138,7 @@ export function RegisterForm({ onSuccess }: RegisterFormProps) {
           if (err.code === "INVALID_INVITATION") {
             setError("Invalid or expired invitation token.");
           } else if (err.code === "VALIDATION_ERROR") {
-            let detailMsg = "Validation error: please verify your email and display name.";
-            if (err.details && typeof err.details === "object") {
-              const entries = Object.entries(err.details);
-              if (entries.length > 0) {
-                detailMsg = `Validation error: ${entries.map(([k, v]) => `${k}: ${v}`).join(", ")}`;
-              }
-            }
-            setError(detailMsg);
+            setError(formatValidationError(err.details));
           } else {
             setError(err.message || "Invalid registration request.");
           }

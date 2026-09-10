@@ -58,10 +58,9 @@ test.describe("Resource Catalog & Availability UI E2E (Spec 1.2, 7.1, 7.2)", () 
     await expect(page.getByText(/member2@example.com/i)).not.toBeVisible();
   });
 
-  test("validates booking launch contract and labels booking action unavailable without mutation (R4)", async ({
+  test("validates availability view is read-only and booking action is unavailable without mutation (R4, R7)", async ({
     page,
   }) => {
-    // Track if any booking mutation is issued
     let bookingMutationOccurred = false;
     page.on("request", (req) => {
       if (req.url().includes("/api/v1/bookings") && req.method() === "POST") {
@@ -72,23 +71,22 @@ test.describe("Resource Catalog & Availability UI E2E (Spec 1.2, 7.1, 7.2)", () 
     await page.goto("/resources/55555555-5555-4555-8555-555555555555");
     await expect(page.getByRole("heading", { name: "Community Woodshop" })).toBeVisible();
 
-    // Booking entry button must be honestly labeled unavailable and disabled until dialog feature registered (R4)
+    // Booking entry button must be honestly labeled unavailable and disabled (R4)
     const bookEntry = page.getByRole("button", { name: /booking unavailable/i });
     await expect(bookEntry).toBeDisabled();
     await expect(bookEntry).toHaveText("Book Slot (Feature registration pending)");
 
-    // Switch to tomorrow's date to verify future available slot selection
-    const dayButtons = page.locator('button:has-text(",")');
-    if (await dayButtons.count() > 1) {
-      await dayButtons.nth(1).click();
+    // In shipped app without launch handler, per-slot selection controls must be disabled (R7)
+    // Slot buttons are rendered with disabled buttons labeled "Available" or "Occupied"
+    const slotButtons = page.locator(".MuiCard-root button");
+    const count = await slotButtons.count();
+    expect(count).toBeGreaterThan(0);
+    for (let i = 0; i < count; i++) {
+      await expect(slotButtons.nth(i)).toBeDisabled();
     }
 
-    const selectSlotBtn = page.getByRole("button", { name: "Select Slot" }).first();
-    await expect(selectSlotBtn).toBeVisible();
-    await selectSlotBtn.click();
-
-    // Ensure no dev/mock verification dialog is shown
-    await expect(page.getByRole("dialog")).not.toBeVisible();
+    // Ensure no enabled "Select Slot" control exists in shipped app (R7)
+    await expect(page.getByRole("button", { name: "Select Slot" })).not.toBeVisible();
 
     // Ensure no mutation was issued to the backend
     expect(bookingMutationOccurred).toBe(false);

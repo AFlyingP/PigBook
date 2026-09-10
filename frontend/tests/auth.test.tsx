@@ -327,7 +327,7 @@ describe("LoginForm & RegisterForm Component Behavior (Spec 7.1, 7.2, 8.1)", () 
     expect(screen.queryByLabelText(/display name/i)).not.toBeInTheDocument();
   });
 
-  it("distinguishes 422 VALIDATION_ERROR from INVALID_INVITATION in RegisterForm (R6)", async () => {
+  it("distinguishes 422 VALIDATION_ERROR from INVALID_INVITATION and parses real details.errors shape without [object Object] (R6, R9)", async () => {
     window.location.hash = "token=valid-token";
     vi.mocked(fetch).mockResolvedValueOnce({
       ok: false,
@@ -336,8 +336,21 @@ describe("LoginForm & RegisterForm Component Behavior (Spec 7.1, 7.2, 8.1)", () 
       json: async () => ({
         error: {
           code: "VALIDATION_ERROR",
-          message: "Request validation error",
-          details: { display_name: "Display name contains invalid characters" },
+          message: "Request validation failed",
+          details: {
+            errors: [
+              {
+                loc: ["body", "display_name"],
+                msg: "String should have at least 1 character",
+                type: "string_too_short",
+              },
+              {
+                loc: ["body", "email"],
+                msg: "value is not a valid email address",
+                type: "value_error",
+              },
+            ],
+          },
         },
       }),
     } as Response);
@@ -352,7 +365,9 @@ describe("LoginForm & RegisterForm Component Behavior (Spec 7.1, 7.2, 8.1)", () 
 
     await waitFor(() => {
       const alert = screen.getByRole("alert");
-      expect(alert).toHaveTextContent(/display_name: Display name contains invalid characters/i);
+      expect(alert.textContent).not.toContain("[object Object]");
+      expect(alert).toHaveTextContent(/display_name: String should have at least 1 character/i);
+      expect(alert).toHaveTextContent(/email: value is not a valid email address/i);
       expect(alert).not.toHaveTextContent(/invalid or expired invitation token/i);
     });
   });
