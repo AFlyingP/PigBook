@@ -1,0 +1,15 @@
+{
+  "ticket_id": "T-031",
+  "pytest_paths": [],
+  "vitest_paths": [
+    "frontend/tests/adminInventory.test.tsx",
+    "frontend/tests/adminOperations.test.tsx",
+    "frontend/tests/feedback.test.tsx"
+  ],
+  "playwright_paths": [
+    "frontend/e2e/adminInventory.spec.ts",
+    "frontend/e2e/adminOperations.spec.ts",
+    "frontend/e2e/accessibility.spec.ts"
+  ],
+  "document_checks": []
+}

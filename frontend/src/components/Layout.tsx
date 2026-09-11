@@ -23,8 +23,8 @@ export function Layout() {
   return (
     <Box sx={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
       <AppBar position="static" color="default" elevation={1}>
-        <Toolbar sx={{ justifyContent: "space-between" }}>
-          <Box sx={{ display: "flex", alignItems: "center", gap: 3 }}>
+        <Toolbar sx={{ justifyContent: "space-between", flexWrap: "wrap", gap: 1, py: 1 }}>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 2, flexWrap: "wrap" }}>
             <Typography
               variant="h6"
               component={RouterLink}
@@ -41,7 +41,7 @@ export function Layout() {
             </Typography>
 
             {isAuthenticated && (
-              <Box component="nav" sx={{ display: "flex", gap: 1 }}>
+              <Box component="nav" sx={{ display: "flex", gap: 0.5, flexWrap: "wrap" }}>
                 <Button
                   component={RouterLink}
                   to="/resources"
@@ -66,6 +66,25 @@ export function Layout() {
                 >
                   Waitlist
                 </Button>
+                <Button
+                  component={RouterLink}
+                  to="/feedback"
+                  color="inherit"
+                  size="small"
+                >
+                  Feedback
+                </Button>
+                {user?.role === "admin" && (
+                  <Button
+                    component={RouterLink}
+                    to="/admin/resources"
+                    color="inherit"
+                    size="small"
+                    sx={{ fontWeight: "bold" }}
+                  >
+                    Admin
+                  </Button>
+                )}
               </Box>
             )}
           </Box>
