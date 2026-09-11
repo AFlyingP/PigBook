@@ -187,9 +187,9 @@ Unimplemented routes are handled by the accessible `NotFoundPage` catch-all rath
 - **Admin Feedback Viewer (`/admin/feedback`)**: Displays only authorized Spec 4.1 fields (`id`, `user_id`, `rating`, `task_completed`, `difficulty`, `improvement`, `consent_version`, `created_at`). Displays no user identities beyond pseudonymous user IDs. All free text is rendered strictly as text to prevent markup injection.
 
 #### 4.7.7 Accessibility, Responsive Layout & Telemetry Safeguards
-- **WCAG 2.2 AA Baseline**: Visible focus indicators (`:focus-visible` outlines), focus trapping and restoration on modal dialogs, non-colour-only status badges, polite live regions (`aria-live="polite"`), accessible labels on every input, and reduced-motion media query support.
-- **Contrast Compliance**: Theme foreground/background pairs (primary, secondary, error, dark text on white/default background) satisfy WCAG 2.2 AA >= 4.5:1 contrast ratios verified by relative luminance computation.
-- **Mobile Viewport**: Full responsiveness on mobile viewports (~375px wide) with zero horizontal overflow across all member and administrator routes.
+- **WCAG 2.2 AA Baseline**: Visible focus indicators (`:focus-visible` outlines), focus trapping inside modal dialogs and automatic focus restoration to the triggering control upon dismissal (Escape or Cancel button), non-colour-only status badges, polite live regions (`aria-live="polite"`), accessible labels for all enabled interactive controls, and global reduced-motion support via `MuiCssBaseline` (`@media (prefers-reduced-motion: reduce)`) suppressing animation and transition durations.
+- **Contrast Compliance**: Color pairs derived directly from `src/theme.ts` palette tokens and verified against live computed styles satisfy WCAG 2.2 AA >= 4.5:1 contrast ratios (normal text) via relative-luminance calculations.
+- **Mobile Viewport**: Full responsiveness on mobile viewports (~375px wide) achieved through natural flex-wrapping and semantic layouts without relying on global `overflow-x: hidden` clipping on main layout containers. Bounding boxes are verified not to exceed viewport boundaries.
 - **Telemetry Safeguard**: Synthetic user journeys verify that no request is made to Sentry or any third-party telemetry host, and no secrets (tokens, cookie values, invitation links) leak in outbound requests. Full telemetry instrumentation belongs to T-034.
 
 ---

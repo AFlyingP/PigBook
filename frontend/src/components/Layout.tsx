@@ -126,7 +126,7 @@ export function Layout() {
         </Toolbar>
       </AppBar>
 
-      <Box component="main" sx={{ flexGrow: 1, py: 4, overflowX: "hidden" }}>
+      <Box component="main" sx={{ flexGrow: 1, py: 4 }}>
         <Container maxWidth="lg">
           <Outlet />
         </Container>

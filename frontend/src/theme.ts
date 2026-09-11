@@ -1,4 +1,4 @@
-import { createTheme } from "@mui/material/styles";
+import { createTheme } from "@mui/material";
 
 export const theme = createTheme({
   palette: {
@@ -31,6 +31,18 @@ export const theme = createTheme({
     ].join(","),
   },
   components: {
+    MuiCssBaseline: {
+      styleOverrides: {
+        "@media (prefers-reduced-motion: reduce)": {
+          "*, *::before, *::after": {
+            animationDuration: "0.01ms !important",
+            animationIterationCount: "1 !important",
+            transitionDuration: "0.01ms !important",
+            scrollBehavior: "auto !important",
+          },
+        },
+      },
+    },
     MuiButtonBase: {
       styleOverrides: {
         root: {

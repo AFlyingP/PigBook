@@ -23,14 +23,35 @@ test.describe.serial("Administrator Operations, Users & Auditing E2E (Spec 7.1, 
     await adminPage?.close();
   });
 
-  test("administrator filters and cancels a reservation with reason", async () => {
+  test("administrator filters and cancels a reservation with reason (R6)", async () => {
     await adminPage.goto("/admin/bookings");
     await expect(adminPage.getByRole("heading", { name: "Reservations & Bookings" })).toBeVisible();
 
-    // Verify seeded booking exists
+    // 1. Initial state: seeded confirmed booking exists
     await expect(adminPage.locator("tr", { hasText: "confirmed" })).toBeVisible();
 
-    // Open detail dialog
+    // 2. Exercise status filter: select "Cancelled" (initially none exist)
+    const statusSelect = adminPage.locator("#booking-status-filter");
+    await statusSelect.click();
+    await adminPage.getByRole("option", { name: "Cancelled" }).click();
+    await expect(adminPage.getByText(/No bookings found matching the selected filters/i)).toBeVisible();
+
+    // 3. Reset status filter back to "Confirmed"
+    await statusSelect.click();
+    await adminPage.getByRole("option", { name: "Confirmed" }).click();
+    await expect(adminPage.locator("tr", { hasText: "confirmed" })).toBeVisible();
+
+    // 4. Exercise paired date-range filter validation guard (Spec 4.2 E24: must provide pair together)
+    await adminPage.fill("#booking-filter-starts-at", "2026-09-15");
+    await adminPage.click("#apply-booking-filters-btn");
+    await expect(adminPage.getByText(/Both start date and end date must be provided together/i)).toBeVisible();
+
+    // Reset date filter
+    await adminPage.getByRole("button", { name: "Reset" }).click();
+    await expect(adminPage.getByText(/Both start date and end date must be provided together/i)).not.toBeVisible();
+    await expect(adminPage.locator("tr", { hasText: "confirmed" })).toBeVisible();
+
+    // 5. Open detail dialog
     const bookingRow = adminPage.locator("tr", { hasText: "confirmed" }).first();
     await bookingRow.getByRole("button", { name: /View booking|Details/i }).click();
 
@@ -43,7 +64,7 @@ test.describe.serial("Administrator Operations, Users & Auditing E2E (Spec 7.1, 
     await adminPage.keyboard.press("Escape");
     await expect(detailDialog).not.toBeVisible();
 
-    // Cancel the reservation
+    // 6. Cancel the reservation with reason
     await bookingRow.getByRole("button", { name: /Cancel booking|Cancel/i }).click();
     const cancelDialog = adminPage.getByRole("dialog");
     await expect(cancelDialog).toBeVisible();
@@ -54,6 +75,14 @@ test.describe.serial("Administrator Operations, Users & Auditing E2E (Spec 7.1, 
     await expect(cancelDialog).not.toBeVisible();
     // Verify booking row status updated to cancelled
     await expect(adminPage.locator("tr", { hasText: "cancelled" })).toBeVisible();
+
+    // 7. Verify status filter now finds this newly cancelled reservation
+    await statusSelect.click();
+    await adminPage.getByRole("option", { name: "Cancelled" }).click();
+    await expect(adminPage.locator("tr", { hasText: "cancelled" })).toBeVisible();
+
+    // Reset filter for subsequent tests
+    await adminPage.getByRole("button", { name: "Reset" }).click();
   });
 
   test("user management prevents disabling or demoting last active administrator", async () => {

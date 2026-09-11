@@ -105,7 +105,7 @@ export function FeedbackForm() {
 
   if (submitted) {
     return (
-      <Paper variant="outlined" sx={{ p: 4, maxWidth: 650, mx: "auto", textAlign: "center" }}>
+      <Paper variant="outlined" sx={{ p: { xs: 2, sm: 4 }, maxWidth: 650, mx: "auto", textAlign: "center" }}>
         {/* Screen reader live region */}
         <Box role="status" aria-live="polite" sx={{ position: "absolute", width: "1px", height: "1px", overflow: "hidden" }}>
           {announcement}
@@ -125,7 +125,7 @@ export function FeedbackForm() {
   }
 
   return (
-    <Paper variant="outlined" sx={{ p: 4, maxWidth: 650, mx: "auto" }}>
+    <Paper variant="outlined" sx={{ p: { xs: 2, sm: 4 }, maxWidth: 650, mx: "auto" }}>
       {/* Screen reader live region */}
       <Box role="status" aria-live="polite" sx={{ position: "absolute", width: "1px", height: "1px", overflow: "hidden" }}>
         {announcement}
@@ -151,7 +151,7 @@ export function FeedbackForm() {
             <FormLabel component="legend" id="feedback-rating-label" sx={{ fontWeight: "medium", color: "text.primary", mb: 1 }}>
               1. How was your overall experience using CommonsBook? (1 = Poor, 5 = Excellent)
             </FormLabel>
-            <Box sx={{ display: "flex", alignItems: "center", gap: 2 }}>
+            <Box sx={{ display: "flex", alignItems: "center", gap: 2, flexWrap: "wrap" }}>
               <Rating
                 name="experience-rating"
                 id="feedback-rating"
@@ -159,6 +159,7 @@ export function FeedbackForm() {
                 onChange={(_, newValue) => setRating(newValue)}
                 size="large"
                 aria-labelledby="feedback-rating-label"
+                emptyLabelText="No rating selected"
               />
               <Typography variant="body2" color="text.secondary">
                 {rating ? `${rating} of 5 stars` : "Select rating"}
@@ -184,32 +185,40 @@ export function FeedbackForm() {
           </FormControl>
 
           {/* Question 3: Difficulty (0..2000) */}
-          <TextField
-            id="feedback-difficulty"
-            label="3. What, if anything, was difficult or confusing? (Optional)"
-            multiline
-            rows={3}
-            fullWidth
-            value={difficulty}
-            onChange={(e) => setDifficulty(e.target.value)}
-            inputProps={{ maxLength: 2000 }}
-            helperText="Up to 2000 characters"
-            disabled={isSubmitting}
-          />
+          <Box>
+            <Typography component="label" htmlFor="feedback-difficulty" variant="body2" fontWeight="medium" display="block" gutterBottom>
+              3. What, if anything, was difficult or confusing? (Optional)
+            </Typography>
+            <TextField
+              id="feedback-difficulty"
+              multiline
+              rows={3}
+              fullWidth
+              value={difficulty}
+              onChange={(e) => setDifficulty(e.target.value)}
+              inputProps={{ maxLength: 2000 }}
+              helperText="Up to 2000 characters"
+              disabled={isSubmitting}
+            />
+          </Box>
 
           {/* Question 4: Improvement (0..2000) */}
-          <TextField
-            id="feedback-improvement"
-            label="4. What is one improvement or feature you would suggest? (Optional)"
-            multiline
-            rows={3}
-            fullWidth
-            value={improvement}
-            onChange={(e) => setImprovement(e.target.value)}
-            inputProps={{ maxLength: 2000 }}
-            helperText="Up to 2000 characters"
-            disabled={isSubmitting}
-          />
+          <Box>
+            <Typography component="label" htmlFor="feedback-improvement" variant="body2" fontWeight="medium" display="block" gutterBottom>
+              4. What is one improvement or feature you would suggest? (Optional)
+            </Typography>
+            <TextField
+              id="feedback-improvement"
+              multiline
+              rows={3}
+              fullWidth
+              value={improvement}
+              onChange={(e) => setImprovement(e.target.value)}
+              inputProps={{ maxLength: 2000 }}
+              helperText="Up to 2000 characters"
+              disabled={isSubmitting}
+            />
+          </Box>
 
           {/* Consent Checkbox */}
           <Box sx={{ pt: 1, borderTop: "1px solid #e0e0e0" }}>
@@ -220,6 +229,7 @@ export function FeedbackForm() {
             )}
 
             <FormControlLabel
+              sx={{ mr: 0, width: "100%", alignItems: "flex-start" }}
               control={
                 <Checkbox
                   id="feedback-consent"
@@ -236,7 +246,7 @@ export function FeedbackForm() {
                 />
               }
               label={
-                <Typography variant="body2">
+                <Typography variant="body2" sx={{ mt: 1 }}>
                   I consent to having my survey responses recorded for operating and improving CommonsBook ({CONSENT_VERSION}).
                 </Typography>
               }

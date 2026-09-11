@@ -6,7 +6,7 @@ export function LandingPage() {
   const { isAuthenticated } = useAuth();
 
   return (
-    <Box sx={{ py: { xs: 3, md: 6 }, overflowX: "hidden" }}>
+    <Box sx={{ py: { xs: 3, md: 6 } }}>
       <Paper
         elevation={0}
         sx={{

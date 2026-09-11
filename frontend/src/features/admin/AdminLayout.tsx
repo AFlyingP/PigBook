@@ -27,7 +27,7 @@ export function AdminLayout() {
         </Typography>
       </Box>
 
-      <Paper sx={{ mb: 3, maxWidth: "100%", overflowX: "hidden" }} elevation={0} variant="outlined">
+      <Paper sx={{ mb: 3, maxWidth: "100%" }} elevation={0} variant="outlined">
         <Tabs
           value={getActiveTab()}
           indicatorColor="primary"

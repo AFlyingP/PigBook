@@ -38,8 +38,10 @@ async def run_seed_dead_outbox() -> str:
             print(f"Existing dead outbox row found: {dead_row.id}")
             return str(dead_row.id)
 
-        # Check if an existing outbox row can be marked dead
-        any_outbox = await session.execute(select(Outbox).limit(1))
+        # Check if an existing non-delivered outbox row can be marked dead
+        any_outbox = await session.execute(
+            select(Outbox).where(Outbox.status != "delivered").limit(1)
+        )
         row = any_outbox.scalar_one_or_none()
         if row is not None:
             row.status = "dead"
