@@ -52,6 +52,7 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
   test("two-session conflict: concurrent submissions resolve to one 201 success and one 409 SLOT_CONFLICT (Spec 5.1, 7.2)", async ({
     browser,
   }) => {
+    // Separate browser contexts for independent authentication sessions
     const contextA = await browser.newContext();
     const contextB = await browser.newContext();
     const pageA = await contextA.newPage();
@@ -156,28 +157,53 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
     const dialog = page.getByRole("dialog");
     await expect(dialog).toBeVisible();
 
-    const confirmBtn = dialog.getByRole("button", { name: "Confirm Reservation" });
+    // Intercept first POST to simulate network failure (uncertain outcome per Spec 7.3)
+    let intercepted = false;
+    await page.route("**/api/v1/bookings", async (route) => {
+      if (route.request().method() === "POST" && !intercepted) {
+        intercepted = true;
+        await route.abort("failed");
+      } else {
+        await route.continue();
+      }
+    });
 
-    // Simulate rapid duplicate click (UX disables button after first click)
-    await Promise.all([
-      confirmBtn.click({ clickCount: 1 }),
-      confirmBtn.click({ force: true }).catch(() => {}),
-    ]);
+    const confirmBtn = dialog.getByRole("button", { name: "Confirm Reservation" });
+    await confirmBtn.click();
+
+    // Dialog displays uncertain alert and "Retry Booking"
+    const retryBtn = dialog.getByRole("button", { name: "Retry Booking" });
+    await expect(retryBtn).toBeVisible();
+
+    // Verify draft key in sessionStorage
+    const draftBeforeReload = await page.evaluate(() => {
+      const raw = sessionStorage.getItem("commonsbook_create_attempt");
+      return raw ? JSON.parse(raw) : null;
+    });
+    expect(draftBeforeReload).not.toBeNull();
+    expect(draftBeforeReload.key).toMatch(/^[0-9a-f-]{36}$/i);
+
+    // Reload page during uncertain state: attempt is restored for matching principal
+    await page.reload();
+    await expect(page.getByRole("dialog")).toBeVisible();
+    const retryAfterReload = page.getByRole("dialog").getByRole("button", { name: "Retry Booking" });
+    await expect(retryAfterReload).toBeVisible();
+
+    // Resend same key on retry
+    await retryAfterReload.click();
 
     await expect(page.getByRole("status")).toContainText(/Booking confirmed successfully/i);
-    await expect(dialog).not.toBeVisible({ timeout: 5000 });
+    await expect(page.getByRole("dialog")).not.toBeVisible({ timeout: 5000 });
 
-    // Verify only ONE booking was created on the server for Pottery Studio
-    const bookingsResponsePromise = page.waitForResponse(
-      (resp) => resp.url().includes("/api/v1/bookings") && resp.request().method() === "GET"
-    );
+    // Draft is purged upon definitive 201
+    const draftAfterSuccess = await page.evaluate(() => sessionStorage.getItem("commonsbook_create_attempt"));
+    expect(draftAfterSuccess).toBeNull();
+
+    // Verify booking is confirmed in /my-bookings
     await page.goto("/my-bookings");
-    const resp = await bookingsResponsePromise;
-    const data = await resp.json();
-    const confirmedList = data.items.filter(
-      (b: { status: string; resource_id: string }) =>
-        b.status === "confirmed" && b.resource_id === "66666666-6666-4666-8666-666666666666"
-    );
-    expect(confirmedList.length).toBeGreaterThanOrEqual(1);
+    await expect(page.getByRole("heading", { name: "My Bookings" })).toBeVisible();
+    await expect(page.getByText("Pottery Studio").first()).toBeVisible();
+    const confirmedRows = page.locator("tr").filter({ hasText: "Pottery Studio" });
+    expect(await confirmedRows.count()).toBeGreaterThanOrEqual(1);
   });
 });

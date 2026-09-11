@@ -1,8 +1,10 @@
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect, useContext } from "react";
 import { useParams, Link as RouterLink, useNavigate } from "react-router-dom";
 import { BookingDialog } from "../bookings/BookingDialog";
 import { WaitlistDialog } from "../waitlist/WaitlistDialog";
 import { useQuery } from "@tanstack/react-query";
+import { AuthContext } from "../auth/AuthContext";
+import { restoreAttempt } from "../../api/createAttempt";
 import {
   Box,
   Typography,
@@ -62,6 +64,21 @@ export function ResourceDetail({ onLaunchBooking, enableBooking = false }: Resou
   const [bookingDialogOpen, setBookingDialogOpen] = useState(false);
   const [waitlistDialogOpen, setWaitlistDialogOpen] = useState(false);
   const [selectedWindow, setSelectedWindow] = useState<{ starts_at: string; ends_at: string } | null>(null);
+  const auth = useContext(AuthContext);
+  const user = auth?.user;
+
+  // On mount/reload, restore uncertain attempt for matching principal and open dialog (Spec 7.2, 7.3)
+  useEffect(() => {
+    if (!user || !enableBooking) return;
+    const draft = restoreAttempt(user.id);
+    if (draft && draft.kind === "booking" && draft.payload) {
+      const p = draft.payload as { resource_id?: string; starts_at?: string; ends_at?: string };
+      if (p.resource_id === id && p.starts_at && p.ends_at) {
+        setSelectedWindow({ starts_at: p.starts_at, ends_at: p.ends_at });
+        setBookingDialogOpen(true);
+      }
+    }
+  }, [user, id, enableBooking]);
 
   // Timezone display information (Spec 1.2, 7.1: locked to organization)
   const tzOffset = useMemo(() => getNewYorkOffsetString(), []);

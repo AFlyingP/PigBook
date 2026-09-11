@@ -124,11 +124,9 @@ test.describe("Waitlist & Offer Management E2E (Spec 7.1, 7.2, 7.3, 11.5)", () =
     expect(confirmedBooking).toBeDefined();
 
     // Exact booking ID assertion per Spec 5.3, 7.3 and R7:
-    // The newly confirmed booking is the same entity promoted from the cancelled hold
-    if (capturedOfferedBookingId) {
-      expect(confirmedBooking.id).toBe(capturedOfferedBookingId);
-    }
-    expect(confirmedBooking.id).toBe("88888888-8888-4888-8888-888888888888");
+    // The newly confirmed booking is the exact same entity promoted from the hold
+    expect(capturedOfferedBookingId).toBeTruthy();
+    expect(confirmedBooking.id).toBe(capturedOfferedBookingId);
 
     await pageMember2.close();
     await contextMember2.close();
@@ -143,20 +141,20 @@ test.describe("Waitlist & Offer Management E2E (Spec 7.1, 7.2, 7.3, 11.5)", () =
     const pageA = await contextA.newPage();
     const pageB = await contextB.newPage();
 
-    // 1. User A (member@example.com) books an available slot on Pottery Studio (day 3)
+    // 1. User A (admin@example.com) books an available slot on Pottery Studio (day 5)
     await pageA.goto("/login");
-    await pageA.fill("#login-email", "member@example.com");
-    await pageA.fill("#login-password", "MemberPassword123!");
+    await pageA.fill("#login-email", "admin@example.com");
+    await pageA.fill("#login-password", "AdminPassword123!");
     await pageA.click('button[type="submit"]');
     await expect(pageA).toHaveURL(/.*\/resources/);
 
     await pageA.goto("/resources/66666666-6666-4666-8666-666666666666");
     const dayTabsA = pageA.getByRole("button", { name: /\w{3},\s*\d{2}\/\d{2}/ });
-    await expect(dayTabsA.nth(3)).toBeVisible();
-    await dayTabsA.nth(3).click();
+    await expect(dayTabsA.nth(5)).toBeVisible();
+    await dayTabsA.nth(5).click();
 
-    // Select slot index 6
-    const slotBtnA = pageA.getByRole("button", { name: "Select Slot" }).nth(6);
+    // Select slot index 8
+    const slotBtnA = pageA.getByRole("button", { name: "Select Slot" }).nth(8);
     await slotBtnA.click();
     const dialogA = pageA.getByRole("dialog");
     await expect(dialogA).toBeVisible();
@@ -173,8 +171,8 @@ test.describe("Waitlist & Offer Management E2E (Spec 7.1, 7.2, 7.3, 11.5)", () =
 
     await pageB.goto("/resources/66666666-6666-4666-8666-666666666666");
     const dayTabsB = pageB.getByRole("button", { name: /\w{3},\s*\d{2}\/\d{2}/ });
-    await expect(dayTabsB.nth(3)).toBeVisible();
-    await dayTabsB.nth(3).click();
+    await expect(dayTabsB.nth(5)).toBeVisible();
+    await dayTabsB.nth(5).click();
 
     // The slot is now occupied: click "Join Waitlist"
     const joinWaitlistBtn = pageB.getByRole("button", { name: "Join Waitlist" }).first();
