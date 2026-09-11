@@ -167,7 +167,8 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
     await expect(archivedChip).toBeVisible();
   });
 
-  test("proves zero telemetry or Sentry requests and captures journey screenshots into EVIDENCE_DIR", async (_, testInfo) => {
+  test("proves zero telemetry or Sentry requests and captures journey screenshots into EVIDENCE_DIR", async ({ page: _page }, testInfo) => {
+    void _page;
     const outboundRequests: string[] = [];
     const forbiddenPatterns = [
       "sentry",
