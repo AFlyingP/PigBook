@@ -550,6 +550,55 @@ def create_app() -> FastAPI:
     app.include_router(bookings_router, prefix="/api/v1")
     app.include_router(waitlist_router, prefix="/api/v1")
 
+    # Unknown API routes return JSON 404 error envelope, never index.html (Spec 9.1)
+    @app.api_route(
+        "/api/{unmatched_path:path}",
+        methods=["GET", "POST", "PATCH", "DELETE", "PUT", "HEAD", "OPTIONS"],
+    )
+    async def api_catchall(_request: Request, unmatched_path: str) -> JSONResponse:
+        _request.state.error_code = "NOT_FOUND"
+        content = {
+            "error": {
+                "code": "NOT_FOUND",
+                "message": "Not found",
+                "details": {},
+            },
+            "detail": "Not found",
+        }
+        return JSONResponse(status_code=404, content=content)
+
+    # Static compiled frontend serving and client-side deep-link fallback
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    candidates = [
+        Path("/app/frontend/dist"),
+        Path(__file__).resolve().parent.parent.parent / "frontend" / "dist",
+    ]
+    dist_dir = next((p for p in candidates if p.is_dir()), None)
+
+    if dist_dir is not None:
+        assets_dir = dist_dir / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        @app.get("/{full_path:path}", response_model=None)
+        async def frontend_fallback(_request: Request, full_path: str) -> Response:
+            target_file = dist_dir / full_path
+            if full_path and target_file.is_file() and not full_path.endswith(".html"):
+                return FileResponse(target_file)
+            index_file = dist_dir / "index.html"
+            if index_file.is_file():
+                return FileResponse(index_file)
+            return make_error_response(
+                status_code=404,
+                code="NOT_FOUND",
+                message="Not found",
+                request=_request,
+            )
+
     return app
 
 

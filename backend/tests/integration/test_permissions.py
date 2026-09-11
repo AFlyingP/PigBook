@@ -221,14 +221,14 @@ async def test_permission_matrix() -> None:
             assert r.status_code == 200
             assert r.json()["status"] == "ok"
 
-        # E36: GET /readyz (Policy.public) -> Allowed for all personas
+        # 36. E36: GET /readyz (Policy.public) -> Allowed for all personas
         for token_val in [None, member_token, admin_token, disabled_token]:
             headers = {"Authorization": f"Bearer {token_val}"} if token_val else {}
             r = await client.get("/readyz", headers=headers)
             assert r.status_code == 200
             assert r.json()["status"] == "ready"
 
-        # E37: GET /metrics (Policy.metrics) -> Requires valid METRICS_TOKEN
+        # 37. E37: GET /metrics (Policy.metrics) -> Requires valid METRICS_TOKEN
         valid_metrics_token = os.environ.get(
             "METRICS_TOKEN", "test-metrics-token-minimum-32-bytes-long-1234"
         )

@@ -3,7 +3,8 @@
   "pytest_paths": [
     "backend/tests/integration/test_observability.py",
     "backend/tests/integration/test_permissions.py",
-    "backend/tests/integration/test_schema_compatibility.py"
+    "backend/tests/integration/test_schema_compatibility.py",
+    "backend/tests/integration/test_production_image.py"
   ],
   "vitest_paths": [],
   "playwright_paths": [],

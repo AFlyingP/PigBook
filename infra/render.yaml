@@ -1,0 +1,91 @@
+# Render Blueprint Specification for CommonsBook
+# Region: Oregon (us-west)
+# Managed PostgreSQL 16 + Image-Backed Web and Worker Services
+# Note: Actual cloud provisioning remains gated behind standing authorization checkpoints.
+#
+# Quote-Required Services:
+# 1. PostgreSQL 16 Managed Database: Starter / Standard plan with persistence and btree_gist support.
+# 2. Web Service: Docker image-backed service running FastAPI + compiled frontend under single origin.
+# 3. Worker Service: Docker image-backed background worker running worker daemon + Alloy sidecar.
+#
+# Staging Plan:
+# An isolated staging environment mirrors this exact blueprint in Oregon with distinct database,
+# secret placeholders, and service IDs to execute automated rollback probes and load verification
+# before production traffic cutover.
+
+databases:
+  - name: commonsbook-db
+    databaseName: commonsbook
+    user: commonsbook_app
+    region: oregon
+    plan: standard
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: commonsbook-api
+    env: image
+    image:
+      url: ghcr.io/owner/commonsbook:latest
+    region: oregon
+    plan: starter
+    healthCheckPath: /readyz
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_ORIGIN
+        sync: false
+      - key: RELEASE_SHA
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: commonsbook-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: RATE_LIMIT_HMAC_SECRET
+        generateValue: true
+      - key: METRICS_TOKEN
+        generateValue: true
+      - key: PORT
+        value: "10000"
+      - key: SENTRY_DSN
+        sync: false
+      - key: GRAFANA_REMOTE_WRITE_URL
+        sync: false
+      - key: GRAFANA_REMOTE_WRITE_USER
+        sync: false
+      - key: GRAFANA_REMOTE_WRITE_TOKEN
+        sync: false
+      - key: API_INTERNAL_URL
+        value: "http://127.0.0.1:10000"
+
+  - type: worker
+    name: commonsbook-worker
+    env: image
+    image:
+      url: ghcr.io/owner/commonsbook:latest
+    dockerCommand: /app/worker_entrypoint.sh
+    region: oregon
+    plan: starter
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: RELEASE_SHA
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: commonsbook-db
+          property: connectionString
+      - key: METRICS_TOKEN
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
+      - key: GRAFANA_REMOTE_WRITE_URL
+        sync: false
+      - key: GRAFANA_REMOTE_WRITE_USER
+        sync: false
+      - key: GRAFANA_REMOTE_WRITE_TOKEN
+        sync: false
+      - key: API_INTERNAL_URL
+        value: "http://commonsbook-api:10000"
