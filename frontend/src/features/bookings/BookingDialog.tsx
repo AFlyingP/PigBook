@@ -134,7 +134,9 @@ export function BookingDialog({
   };
 
   const handleSubmit = async () => {
-    if (!user || !resource || !bookingWindow) return;
+    const storedPayload = currentAttempt?.payload as BookingCreate | undefined;
+    const windowToUse = (isUncertain || isStaleDraft) && storedPayload ? storedPayload : bookingWindow;
+    if (!user || !resource || !windowToUse) return;
 
     setIsSubmitting(true);
     setErrorMessage(null);
@@ -143,15 +145,15 @@ export function BookingDialog({
 
     let attemptToUse: CreateAttempt;
 
-    if (isUncertain && currentAttempt) {
-      // Replay exact same key and exact same payload (Spec 4.3, 7.3)
+    if ((isUncertain || isStaleDraft) && currentAttempt) {
+      // While an uncertain attempt is active, replay exact same key and stored payload (Spec 4.3, 7.3, R4)
       attemptToUse = currentAttempt;
     } else {
-      // New attempt with fresh UUID v4 Idempotency-Key
+      // New attempt with fresh UUID v4 Idempotency-Key for selected window
       const payload: BookingCreate = {
         resource_id: resource.id,
-        starts_at: bookingWindow.starts_at,
-        ends_at: bookingWindow.ends_at,
+        starts_at: windowToUse.starts_at,
+        ends_at: windowToUse.ends_at,
       };
       attemptToUse = beginAttempt(user.id, "booking", payload);
       setCurrentAttempt(attemptToUse);
@@ -242,7 +244,11 @@ export function BookingDialog({
     handleStartNewAttempt();
   };
 
-  const effectiveWindow = bookingWindow || (currentAttempt?.payload as BookingCreate | undefined);
+  // While an uncertain or stale attempt is active, displayed window matches the stored payload (Spec 7.3, R4).
+  // A newly selected window may only be used after explicit abandonment.
+  const storedDraftPayload = currentAttempt?.payload as BookingCreate | undefined;
+  const effectiveWindow =
+    (isUncertain || isStaleDraft) && storedDraftPayload ? storedDraftPayload : bookingWindow;
 
   return (
     <Dialog

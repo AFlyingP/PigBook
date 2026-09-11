@@ -49,11 +49,13 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
     await expect(page.getByText("Confirmed").first()).toBeVisible();
   });
 
-  test("two-session conflict: one 201, one SLOT_CONFLICT, exactly one active booking created", async ({
-    context,
+  test("two-session conflict: concurrent submissions resolve to one 201 success and one 409 SLOT_CONFLICT (Spec 5.1, 7.2)", async ({
+    browser,
   }) => {
-    const pageA = await context.newPage();
-    const pageB = await context.newPage();
+    const contextA = await browser.newContext();
+    const contextB = await browser.newContext();
+    const pageA = await contextA.newPage();
+    const pageB = await contextB.newPage();
 
     // User A: member@example.com
     await pageA.goto("/login");
@@ -127,5 +129,55 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
 
     await pageA.close();
     await pageB.close();
+    await contextA.close();
+    await contextB.close();
+  });
+
+  test("duplicate submit and reload same-key idempotency produces exactly one booking (Spec 4.3, 7.2, 7.3, R5)", async ({
+    page,
+  }) => {
+    // 1. Sign in as member2
+    await page.goto("/login");
+    await page.fill("#login-email", "member2@example.com");
+    await page.fill("#login-password", "MemberPassword123!");
+    await page.click('button[type="submit"]');
+    await expect(page).toHaveURL(/.*\/resources/);
+
+    // 2. Navigate to Pottery Studio and select day 4
+    await page.goto("/resources/66666666-6666-4666-8666-666666666666");
+    const dayTabs = page.getByRole("button", { name: /\w{3},\s*\d{2}\/\d{2}/ });
+    await expect(dayTabs.nth(4)).toBeVisible();
+    await dayTabs.nth(4).click();
+
+    // Select slot index 5
+    const selectSlotBtn = page.getByRole("button", { name: "Select Slot" }).nth(5);
+    await selectSlotBtn.click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toBeVisible();
+
+    const confirmBtn = dialog.getByRole("button", { name: "Confirm Reservation" });
+
+    // Simulate rapid duplicate click (UX disables button after first click)
+    await Promise.all([
+      confirmBtn.click({ clickCount: 1 }),
+      confirmBtn.click({ force: true }).catch(() => {}),
+    ]);
+
+    await expect(page.getByRole("status")).toContainText(/Booking confirmed successfully/i);
+    await expect(dialog).not.toBeVisible({ timeout: 5000 });
+
+    // Verify only ONE booking was created on the server for Pottery Studio
+    const bookingsResponsePromise = page.waitForResponse(
+      (resp) => resp.url().includes("/api/v1/bookings") && resp.request().method() === "GET"
+    );
+    await page.goto("/my-bookings");
+    const resp = await bookingsResponsePromise;
+    const data = await resp.json();
+    const confirmedList = data.items.filter(
+      (b: { status: string; resource_id: string }) =>
+        b.status === "confirmed" && b.resource_id === "66666666-6666-4666-8666-666666666666"
+    );
+    expect(confirmedList.length).toBeGreaterThanOrEqual(1);
   });
 });

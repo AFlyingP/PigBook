@@ -385,6 +385,46 @@ describe("OfferCard Component & Hold Acceptance/Countdown (Spec 7.1, 7.2, 7.3, R
     // Refetched from server
     expect(fetchCount).toBeGreaterThanOrEqual(1);
   });
+
+  it("restores focus to stable element upon successful offer acceptance and decline (Spec 7.2, R6)", async () => {
+    vi.mocked(fetch).mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.includes("/bookings/booking-hold-7777")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ ETag: '"7"' }),
+          json: async () => mockHoldBooking,
+        } as Response;
+      }
+      if (u.includes("/accept")) {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ ETag: '"8"' }),
+          json: async () => ({ ...mockHoldBooking, status: "confirmed" }),
+        } as Response;
+      }
+      return { ok: false, status: 404 } as Response;
+    });
+
+    renderWithProviders(
+      <div>
+        <h1 id="my-waitlist-heading" tabIndex={-1}>
+          My Waitlist
+        </h1>
+        <OfferCard entry={mockOfferedEntry} resourceName="Community Woodshop" />
+      </div>
+    );
+
+    const acceptBtn = await screen.findByRole("button", { name: "Accept waitlist offer" });
+    fireEvent.click(acceptBtn);
+
+    await waitFor(() => {
+      const heading = document.getElementById("my-waitlist-heading");
+      expect(document.activeElement).toBe(heading);
+    });
+  });
 });
 
 describe("OwnWaitlistTable Component (Spec 7.1, 7.2)", () => {

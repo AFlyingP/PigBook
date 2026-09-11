@@ -170,7 +170,7 @@ npm --prefix frontend test -- --run
 ```
 
 Covers:
-- `tests/auth.test.tsx`: In-memory auth, 401 retry, single-flight refresh, cross-tab BroadcastChannel, CreateAttempt isolation and 24h expiration, LoginForm accessible controls and keyboard operation, RegisterForm fragment erasure, role-guarded layout access control, and exhaustive token persistence checks.
+- `tests/auth.test.tsx`: In-memory auth, 401 retry, single-flight refresh, cross-tab BroadcastChannel, CreateAttempt isolation and draft preservation, LoginForm accessible controls and keyboard operation, RegisterForm fragment erasure, role-guarded layout access control, and exhaustive token persistence checks.
 - `tests/resources.test.tsx`: Timezone offset formatting, DST transition wall-clock to UTC calculations (spring forward, fall back, boundary transitions), 7-day window constraints, 30-minute alignment validation, half-open occupancy checking, ResourceList search filtering, ResourceDetail locked timezone, accessible list view, accessible inline booking error validation, and non-mutating launch contract.
 - `tests/bookings.test.tsx`: Booking creation with UUID v4 idempotency keys, draft persistence, definitive 201/409/422 outcomes, uncertain network failure and 503 same-key retry, reload attempt recovery, Spec 7.3 24-hour gating, cross-account attempt isolation, own bookings listing with status filtering, cancel confirmation with strong ETag `If-Match`, and 412 version mismatch refetch handling.
 - `tests/waitlist.test.tsx`: Waitlist joining outcomes (201, 409 SLOT_AVAILABLE, 409 WAITLIST_FULL capacity message), E11 booking fetch for offer deadline, countdown timer from server deadline, accept with waitlist entry version in `If-Match` (distinct from booking version), expired countdown server refetch without local state assumption, and decline with entry version.
@@ -185,6 +185,6 @@ python scripts/verify.py ticket --ticket T-029 --fresh
 
 Covers:
 - `e2e/auth.spec.ts`: Member sign-in, session restoration on reload, disabled user rejection with 401, single-use invitation fragment registration with URL bar cleanup, logout route protection, multi-tab logout synchronization, and exhaustive storage token absence.
-- `e2e/resources.spec.ts`: Catalog browsing with client-side search, resource detail with organization-locked timezone display, 7-day availability schedule, accessible list schedule alternative, disabled booking entry action, and archived resource access handling.
+- `e2e/resources.spec.ts`: Catalog browsing with client-side search, resource detail with organization-locked timezone display, 7-day availability schedule, accessible list schedule alternative, selecting slot to open booking dialog without premature mutation, and archived resource access handling.
 - `e2e/bookings.spec.ts`: End-to-end booking creation with idempotency key, duplicate click protection, own bookings listing, and two-session concurrent booking conflict (one 201, one SLOT_CONFLICT, exactly one active reservation).
 - `e2e/waitlist.spec.ts`: Two-member book/join/cancel/offer/accept lifecycle verifying the identical booking ID transitions to confirmed for the waiting member, and isolated hold expiry test seam manipulating only the test database.

@@ -173,7 +173,14 @@ export function OwnWaitlistTable() {
         }}
       >
         <Box>
-          <Typography component="h1" variant="h4" fontWeight="bold">
+          <Typography
+            component="h1"
+            variant="h4"
+            fontWeight="bold"
+            id="my-waitlist-heading"
+            tabIndex={-1}
+            sx={{ outline: "none" }}
+          >
             My Waitlist
           </Typography>
           <Typography variant="body2" color="text.secondary">

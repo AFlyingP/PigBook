@@ -418,6 +418,176 @@ describe("BookingDialog Component & Uncertain Request Recovery (Spec 4.3, 7.2, 7
     expect(restored).toBeNull();
     expect(sessionStorage.getItem("commonsbook_create_attempt")).toBeNull();
   });
+
+  it("displays and submits stored uncertain attempt payload even if opened with different window, and uses new window only after explicit abandon (Spec 7.3, R4)", async () => {
+    const windowA = {
+      starts_at: "2026-09-15T14:00:00Z",
+      ends_at: "2026-09-15T16:00:00Z",
+    };
+    const windowB = {
+      starts_at: "2026-09-16T18:00:00Z",
+      ends_at: "2026-09-16T20:00:00Z",
+    };
+
+    // Stored uncertain attempt was created for Window A
+    const storedAttempt: CreateAttempt = {
+      key: "stored-key-aaa",
+      payload: {
+        resource_id: mockResource.id,
+        starts_at: windowA.starts_at,
+        ends_at: windowA.ends_at,
+      },
+      kind: "booking",
+      principalId: mockUser.id,
+      createdAt: new Date().toISOString(),
+    };
+    sessionStorage.setItem("commonsbook_create_attempt", JSON.stringify(storedAttempt));
+
+    let submittedBody: Record<string, unknown> | undefined;
+    let submittedKey: string | null = null;
+
+    vi.mocked(fetch).mockImplementation(async (_url, init) => {
+      submittedKey = new Headers(init?.headers).get("Idempotency-Key");
+      submittedBody = JSON.parse(String(init?.body || "{}"));
+      return {
+        ok: true,
+        status: 201,
+        headers: new Headers({ ETag: '"1"' }),
+        json: async () => ({
+          id: "b-r4",
+          resource_id: mockResource.id,
+          user_id: mockUser.id,
+          kind: "reservation",
+          starts_at: submittedBody?.starts_at,
+          ends_at: submittedBody?.ends_at,
+          status: "confirmed",
+          version: 1,
+          created_at: "2026-09-15T12:00:00Z",
+          updated_at: "2026-09-15T12:00:00Z",
+        }),
+      } as Response;
+    });
+
+    // Dialog opens with windowB selected by user, but uncertain attempt exists for windowA
+    const { unmount } = renderWithProviders(
+      <BookingDialog
+        open={true}
+        onClose={vi.fn()}
+        resource={mockResource}
+        window={windowB}
+      />
+    );
+
+    // Displayed window MUST match the stored attempt (windowA: 10:00 AM EDT / 14:00Z) (R4)
+    expect(screen.getByText(/10:00 AM/)).toBeInTheDocument();
+    expect(screen.getByText(/2026-09-15T14:00:00Z/)).toBeInTheDocument();
+    expect(screen.queryByText(/2026-09-16T18:00:00Z/)).not.toBeInTheDocument();
+
+    // Replay submits stored attempt payload and key (windowA)
+    fireEvent.click(screen.getByRole("button", { name: "Retry Booking" }));
+    await waitFor(() => {
+      expect(submittedKey).toBe("stored-key-aaa");
+      expect(submittedBody).toEqual({
+        resource_id: mockResource.id,
+        starts_at: windowA.starts_at,
+        ends_at: windowA.ends_at,
+      });
+    });
+    unmount();
+
+    // Now test abandonment: restore attempt, abandon it, and verify windowB is used
+    sessionStorage.setItem("commonsbook_create_attempt", JSON.stringify(storedAttempt));
+    renderWithProviders(
+      <BookingDialog
+        open={true}
+        onClose={vi.fn()}
+        resource={mockResource}
+        window={windowB}
+      />
+    );
+
+    // Abandon attempt
+    fireEvent.click(screen.getByRole("button", { name: "Abandon Attempt" }));
+    fireEvent.click(screen.getByRole("button", { name: "Abandon and Start Over" }));
+
+    // Now displayed window is windowB (02:00 PM EDT / 18:00Z)
+    expect(screen.getByText(/2026-09-16T18:00:00Z/)).toBeInTheDocument();
+
+    // Submit creates fresh attempt for windowB
+    fireEvent.click(screen.getByRole("button", { name: "Confirm Reservation" }));
+    await waitFor(() => {
+      expect(submittedKey).not.toBe("stored-key-aaa");
+      expect(submittedBody).toEqual({
+        resource_id: mockResource.id,
+        starts_at: windowB.starts_at,
+        ends_at: windowB.ends_at,
+      });
+    });
+  });
+
+  it("ensures duplicate submission while uncertain attempt exists does not rotate key (Spec 4.3, 7.3, R5)", async () => {
+    let callCount = 0;
+    const sentKeys: string[] = [];
+
+    vi.mocked(fetch).mockImplementation(async (_url, init) => {
+      callCount++;
+      const key = new Headers(init?.headers).get("Idempotency-Key");
+      sentKeys.push(key || "");
+
+      if (callCount === 1) {
+        return {
+          ok: false,
+          status: 503,
+          statusText: "Service Unavailable",
+          headers: new Headers(),
+          json: async () => ({
+            error: { code: "RETRYABLE_UNAVAILABLE", message: "Temporary unavailable" },
+          }),
+        } as Response;
+      }
+
+      return {
+        ok: true,
+        status: 201,
+        headers: new Headers({ ETag: '"1"' }),
+        json: async () => ({
+          id: "b-dup",
+          resource_id: mockResource.id,
+          user_id: mockUser.id,
+          kind: "reservation",
+          starts_at: mockWindow.starts_at,
+          ends_at: mockWindow.ends_at,
+          status: "confirmed",
+          version: 1,
+          created_at: "2026-09-15T12:00:00Z",
+          updated_at: "2026-09-15T12:00:00Z",
+        }),
+      } as Response;
+    });
+
+    renderWithProviders(
+      <BookingDialog
+        open={true}
+        onClose={vi.fn()}
+        resource={mockResource}
+        window={mockWindow}
+      />
+    );
+
+    // Initial click
+    fireEvent.click(screen.getByRole("button", { name: "Confirm Reservation" }));
+    expect(await screen.findByText(/Temporary unavailable/i)).toBeInTheDocument();
+
+    // Duplicate submit
+    fireEvent.click(screen.getByRole("button", { name: "Retry Booking" }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Booking confirmed successfully/i)).toBeInTheDocument();
+    });
+
+    expect(sentKeys).toHaveLength(2);
+    expect(sentKeys[0]).toBe(sentKeys[1]); // Same key preserved, no rotation
+  });
 });
 
 describe("OwnBookingsTable Component & Cancellation (Spec 4.1, 4.2 E10-E12, 7.2)", () => {

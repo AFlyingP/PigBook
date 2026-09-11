@@ -8,7 +8,7 @@ const __dirname = path.dirname(__filename);
 const repoRoot = path.resolve(__dirname, "../..");
 
 test.describe("Waitlist & Offer Management E2E (Spec 7.1, 7.2, 7.3, 11.5)", () => {
-  test("two-member book/join/cancel/offer/accept flow confirms same booking ID (Spec 5.3, 7.3)", async ({
+  test("two-member book/join/cancel/offer/accept flow confirms same booking ID (Spec 5.3, 7.3, R7)", async ({
     browser,
   }) => {
     // Separate browser contexts for independent authentication sessions
@@ -78,7 +78,22 @@ test.describe("Waitlist & Offer Management E2E (Spec 7.1, 7.2, 7.3, 11.5)", () =
     await pageMember1.close();
     await contextMember1.close();
 
-    // 4. Back to member2: reload /waitlist, verify OfferCard is displayed with countdown
+    // 4. Back to member2: intercept waitlist response to capture offered_booking_id (R7)
+    let capturedOfferedBookingId: string | null = null;
+    pageMember2.on("response", async (resp) => {
+      if (resp.url().includes("/api/v1/waitlist") && resp.request().method() === "GET") {
+        try {
+          const json = await resp.json();
+          const offered = json.items?.find((item: { status: string; offered_booking_id?: string }) => item.status === "offered");
+          if (offered?.offered_booking_id) {
+            capturedOfferedBookingId = offered.offered_booking_id;
+          }
+        } catch {
+          // ignore
+        }
+      }
+    });
+
     await pageMember2.reload();
     await expect(pageMember2.getByText(/Offer Available/i).first()).toBeVisible();
     await expect(pageMember2.getByText(/Time Remaining to Claim:/i)).toBeVisible();
@@ -90,46 +105,131 @@ test.describe("Waitlist & Offer Management E2E (Spec 7.1, 7.2, 7.3, 11.5)", () =
 
     await expect(pageMember2.getByRole("status")).toContainText(/Offer accepted! Your reservation is now confirmed/i);
 
-    // 6. Verify same booking ID is confirmed in /my-bookings
+    // 6. Navigate to /my-bookings and verify the confirmed booking ID matches the offer (R7)
+    const bookingsResponsePromise = pageMember2.waitForResponse(
+      (resp) => resp.url().includes("/api/v1/bookings") && resp.request().method() === "GET"
+    );
     await pageMember2.goto("/my-bookings");
+    const bookingsResp = await bookingsResponsePromise;
+    const bookingsData = await bookingsResp.json();
+
     await expect(pageMember2.getByRole("heading", { name: "My Bookings" })).toBeVisible();
     await expect(pageMember2.getByText("Community Woodshop")).toBeVisible();
     await expect(pageMember2.getByText("Confirmed").first()).toBeVisible();
+
+    const confirmedBooking = bookingsData.items?.find(
+      (b: { status: string; resource_id: string; id: string }) =>
+        b.status === "confirmed" && b.resource_id === "55555555-5555-4555-8555-555555555555"
+    );
+    expect(confirmedBooking).toBeDefined();
+
+    // Exact booking ID assertion per Spec 5.3, 7.3 and R7:
+    // The newly confirmed booking is the same entity promoted from the cancelled hold
+    if (capturedOfferedBookingId) {
+      expect(confirmedBooking.id).toBe(capturedOfferedBookingId);
+    }
+    expect(confirmedBooking.id).toBe("88888888-8888-4888-8888-888888888888");
 
     await pageMember2.close();
     await contextMember2.close();
   });
 
-  test("expiry case: hold expiry seam fast-forwards server deadline and UI refetches state (Spec 7.2, 11.5)", async ({
-    page,
+  test("expiry case: hold expiry seam fast-forwards server deadline and UI refetches state (Spec 7.2, 11.5, R2)", async ({
+    browser,
   }) => {
-    // Sign in as member3
-    await page.goto("/login");
-    await page.fill("#login-email", "member3@example.com");
-    await page.fill("#login-password", "MemberPassword123!");
-    await page.click('button[type="submit"]');
-    await expect(page).toHaveURL(/.*\/resources/);
+    // Build real offered-hold scenario through product path (R2)
+    const contextA = await browser.newContext();
+    const contextB = await browser.newContext();
+    const pageA = await contextA.newPage();
+    const pageB = await contextB.newPage();
 
-    // Navigate to /waitlist
-    await page.goto("/waitlist");
-    await expect(page.getByRole("heading", { name: "My Waitlist" })).toBeVisible();
+    // 1. User A (member@example.com) books an available slot on Pottery Studio (day 3)
+    await pageA.goto("/login");
+    await pageA.fill("#login-email", "member@example.com");
+    await pageA.fill("#login-password", "MemberPassword123!");
+    await pageA.click('button[type="submit"]');
+    await expect(pageA).toHaveURL(/.*\/resources/);
 
-    // Invoke isolated fixture seam via Python subprocess against DATABASE_URL from repoRoot
-    if (process.env.DATABASE_URL) {
-      const result = spawnSync(
-        "uv",
-        ["run", "--project", "backend", "python", "scripts/expire_hold.py"],
-        {
-          cwd: repoRoot,
-          stdio: "inherit",
-          env: process.env,
-        }
-      );
-      expect(result.status).toBe(0);
-    }
+    await pageA.goto("/resources/66666666-6666-4666-8666-666666666666");
+    const dayTabsA = pageA.getByRole("button", { name: /\w{3},\s*\d{2}\/\d{2}/ });
+    await expect(dayTabsA.nth(3)).toBeVisible();
+    await dayTabsA.nth(3).click();
 
-    // Refresh waitlist page to assert UI renders clean current server state
-    await page.reload();
-    await expect(page.getByRole("heading", { name: "My Waitlist" })).toBeVisible();
+    // Select slot index 6
+    const slotBtnA = pageA.getByRole("button", { name: "Select Slot" }).nth(6);
+    await slotBtnA.click();
+    const dialogA = pageA.getByRole("dialog");
+    await expect(dialogA).toBeVisible();
+    await dialogA.getByRole("button", { name: "Confirm Reservation" }).click();
+    await expect(pageA.getByRole("status")).toContainText(/Booking confirmed successfully/i);
+    await expect(dialogA).not.toBeVisible({ timeout: 5000 });
+
+    // 2. User B (member3@example.com) joins the waitlist for that exact slot
+    await pageB.goto("/login");
+    await pageB.fill("#login-email", "member3@example.com");
+    await pageB.fill("#login-password", "MemberPassword123!");
+    await pageB.click('button[type="submit"]');
+    await expect(pageB).toHaveURL(/.*\/resources/);
+
+    await pageB.goto("/resources/66666666-6666-4666-8666-666666666666");
+    const dayTabsB = pageB.getByRole("button", { name: /\w{3},\s*\d{2}\/\d{2}/ });
+    await expect(dayTabsB.nth(3)).toBeVisible();
+    await dayTabsB.nth(3).click();
+
+    // The slot is now occupied: click "Join Waitlist"
+    const joinWaitlistBtn = pageB.getByRole("button", { name: "Join Waitlist" }).first();
+    await expect(joinWaitlistBtn).toBeVisible();
+    await joinWaitlistBtn.click();
+
+    const waitlistDialogB = pageB.getByRole("dialog");
+    await expect(waitlistDialogB).toBeVisible();
+    await waitlistDialogB.getByRole("button", { name: "Join Waitlist" }).click();
+    await expect(pageB.getByRole("status")).toContainText(/joined the waitlist/i);
+    await expect(waitlistDialogB).not.toBeVisible({ timeout: 5000 });
+
+    // 3. User A cancels their booking, promoting User B to offered
+    await pageA.goto("/my-bookings");
+    await expect(pageA.getByRole("heading", { name: "My Bookings" })).toBeVisible();
+    const cancelBtn = pageA.getByRole("button", { name: /Cancel reservation for Pottery Studio/i }).first();
+    await cancelBtn.click();
+    const cancelDialogA = pageA.getByRole("dialog");
+    await expect(cancelDialogA).toBeVisible();
+    await cancelDialogA.getByRole("button", { name: "Confirm Cancellation" }).click();
+    await expect(pageA.getByRole("status")).toContainText(/Booking cancelled successfully/i);
+    await pageA.close();
+    await contextA.close();
+
+    // 4. User B navigates to /waitlist: asserts the offer card is visible with countdown (R2.2)
+    await pageB.goto("/waitlist");
+    await expect(pageB.getByRole("heading", { name: "My Waitlist" })).toBeVisible();
+    await expect(pageB.getByText(/Offer Available/i).first()).toBeVisible();
+    await expect(pageB.getByText(/Time Remaining to Claim:/i)).toBeVisible();
+    await expect(pageB.getByRole("button", { name: "Accept waitlist offer" })).toBeEnabled();
+
+    // 5. Run the isolated fixture to expire User B's hold (R2.3, R2.4 - must fail loudly if missing)
+    const result = spawnSync(
+      "uv",
+      ["run", "--project", "backend", "python", "scripts/expire_hold.py"],
+      {
+        cwd: repoRoot,
+        stdio: "inherit",
+        env: process.env,
+      }
+    );
+    expect(result.status).toBe(0);
+
+    // 6. Reload /waitlist: assert UI reflects server state after refetch (R2.3)
+    // The offer is no longer claimable/confirmable and entry shows expired state
+    await pageB.reload();
+    await expect(pageB.getByRole("heading", { name: "My Waitlist" })).toBeVisible();
+
+    // Offer card is gone (no longer claimable)
+    await expect(pageB.getByRole("button", { name: "Accept waitlist offer" })).not.toBeVisible();
+
+    // Entry status in table reflects expired state
+    await expect(pageB.getByText("Expired").first()).toBeVisible();
+
+    await pageB.close();
+    await contextB.close();
   });
 });

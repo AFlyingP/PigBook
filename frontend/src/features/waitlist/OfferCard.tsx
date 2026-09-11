@@ -69,15 +69,28 @@ export function OfferCard({ entry, resourceName, onActionSuccess }: OfferCardPro
       return diffSec;
     };
 
-    setSecondsRemaining(computeRemaining());
+    const initialRemaining = computeRemaining();
+    setSecondsRemaining(initialRemaining);
 
+    if (initialRemaining <= 0) {
+      // Bounded single refetch at initial deadline reached (R3)
+      setActionAnnouncement("Offer deadline reached. Checking current status with server...");
+      queryClient.invalidateQueries({ queryKey: ["waitlist", "mine"] });
+      queryClient.invalidateQueries({ queryKey: ["bookings", entry.offered_booking_id] });
+      queryClient.invalidateQueries({ queryKey: ["resources"] });
+      refetchBooking();
+      return;
+    }
+
+    let deadlineRefetched = false;
     const timer = setInterval(() => {
       const remaining = computeRemaining();
       setSecondsRemaining(remaining);
 
-      if (remaining <= 0) {
-        // At deadline, refetch server state (Spec 7.2, 7.3)
-        // Local countdown NEVER assumes terminal state or success
+      if (remaining <= 0 && !deadlineRefetched) {
+        deadlineRefetched = true;
+        clearInterval(timer);
+        // Bounded single refetch on timer expiration (Spec 7.2, 7.3, R3)
         setActionAnnouncement("Offer deadline reached. Checking current status with server...");
         queryClient.invalidateQueries({ queryKey: ["waitlist", "mine"] });
         queryClient.invalidateQueries({ queryKey: ["bookings", entry.offered_booking_id] });
@@ -110,6 +123,13 @@ export function OfferCard({ entry, resourceName, onActionSuccess }: OfferCardPro
       queryClient.invalidateQueries({ queryKey: ["resources"] });
 
       setActionAnnouncement("Offer accepted! Your reservation is now confirmed.");
+      const stableTarget =
+        document.getElementById("my-waitlist-heading") ||
+        document.querySelector<HTMLElement>("[role='status']") ||
+        document.querySelector<HTMLElement>("h1");
+      if (stableTarget) {
+        stableTarget.focus();
+      }
       if (onActionSuccess) {
         onActionSuccess();
       }
@@ -158,6 +178,13 @@ export function OfferCard({ entry, resourceName, onActionSuccess }: OfferCardPro
       queryClient.invalidateQueries({ queryKey: ["resources"] });
 
       setActionAnnouncement("Offer declined.");
+      const stableTarget =
+        document.getElementById("my-waitlist-heading") ||
+        document.querySelector<HTMLElement>("[role='status']") ||
+        document.querySelector<HTMLElement>("h1");
+      if (stableTarget) {
+        stableTarget.focus();
+      }
       setShowDeclineConfirm(false);
       if (onActionSuccess) {
         onActionSuccess();

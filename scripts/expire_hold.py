@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hold expiry test fixture seam (Spec 11.5, T-030).
+"""Hold expiry test fixture seam (Spec 11.5).
 
 Manipulates only the isolated test database configured by DATABASE_URL.
 Fast-forwards the expires_at deadline for offered bookings and executes
