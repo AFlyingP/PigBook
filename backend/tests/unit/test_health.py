@@ -34,7 +34,7 @@ async def test_health_request_id_header_generated() -> None:
 async def test_health_request_id_header_echoed() -> None:
     app = create_app()
     transport = ASGITransport(app=app)
-    custom_id = "custom-inbound-request-id-12345"
+    custom_id = "12345678-1234-4234-8234-123456789abc"
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.get("/healthz", headers={"X-Request-ID": custom_id})
         assert response.status_code == 200
@@ -64,4 +64,7 @@ async def test_unknown_api_path_returns_json_404() -> None:
         content_type = response.headers.get("content-type", "")
         assert "application/json" in content_type
         data = response.json()
-        assert "detail" in data
+        assert data["error"]["code"] == "NOT_FOUND"
+        assert data["error"]["message"] == "Not found"
+        assert data["error"]["details"] == {}
+        assert "detail" not in data

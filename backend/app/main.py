@@ -1,3 +1,5 @@
+import asyncio
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -47,6 +49,16 @@ from app.bookings.service import (
     NotFoundError as BookingNotFoundError,
 )
 from app.config import get_settings
+from app.db.compatibility import validate_schema_compatibility
+from app.db.session import get_sessionmaker
+from app.observability.logging import (
+    is_valid_uuid,
+)
+from app.observability.logging import (
+    logger as structured_logger,
+)
+from app.observability.metrics import install_metrics
+from app.observability.sentry import init_sentry
 from app.resources.router import router as resources_router
 from app.resources.service import InvalidWindowError, NotFoundError
 from app.waitlist.router import router as waitlist_router
@@ -64,7 +76,10 @@ def make_error_response(
     message: str,
     details: dict[str, Any] | None = None,
     headers: dict[str, str] | None = None,
+    request: Request | None = None,
 ) -> JSONResponse:
+    if request is not None:
+        request.state.error_code = code
     content = {
         "error": {
             "code": code,
@@ -75,18 +90,9 @@ def make_error_response(
     return JSONResponse(status_code=status_code, content=content, headers=headers)
 
 
-def is_valid_uuid(val: str | None) -> bool:
-    if not val or len(val) != 36:
-        return False
-    try:
-        parsed = uuid.UUID(val)
-        return str(parsed) == val.lower()
-    except (ValueError, TypeError, AttributeError):
-        return False
-
-
 def create_app() -> FastAPI:
     settings = get_settings()
+    init_sentry(service="api")
     is_docs_enabled = settings.APP_ENV in ("local", "test")
 
     app = FastAPI(
@@ -96,6 +102,7 @@ def create_app() -> FastAPI:
         docs_url="/docs" if is_docs_enabled else None,
         redoc_url="/redoc" if is_docs_enabled else None,
     )
+    install_metrics(app)
 
     # CORS: exact APP_ORIGIN only, no wildcard
     app.add_middleware(
@@ -120,22 +127,54 @@ def create_app() -> FastAPI:
     )
 
     @app.middleware("http")
-    async def request_id_middleware(
+    async def request_id_and_logging_middleware(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         inbound_id = request.headers.get("X-Request-ID")
-        if request.url.path.startswith("/api/v1"):
-            if inbound_id and is_valid_uuid(inbound_id):
-                request_id = str(uuid.UUID(inbound_id))
-            else:
-                request_id = str(uuid.uuid4())
+        if inbound_id and is_valid_uuid(inbound_id):
+            request_id = str(uuid.UUID(inbound_id))
         else:
-            request_id = inbound_id if inbound_id else str(uuid.uuid4())
+            request_id = str(uuid.uuid4())
         request.state.request_id = request_id
 
-        response = await call_next(request)
-        response.headers["X-Request-ID"] = request_id
-        return response
+        start_time = time.perf_counter()
+        response: Response | None = None
+        error_code: str | None = None
+
+        try:
+            response = await call_next(request)
+            error_code = getattr(request.state, "error_code", None)
+            return response
+        except Exception as exc:
+            error_code = getattr(exc, "code", "INTERNAL_ERROR")
+            raise
+        finally:
+            duration_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+            status_code = response.status_code if response else 500
+
+            route_obj = request.scope.get("route")
+            if route_obj and hasattr(route_obj, "path"):
+                route_template = route_obj.path
+            else:
+                route_template = "unmatched"
+
+            extra = {
+                "service": "api",
+                "event": "http_request",
+                "request_id": request_id,
+                "route": route_template,
+                "method": request.method,
+                "status_code": status_code,
+                "duration_ms": duration_ms,
+                "trace_id": getattr(request.state, "trace_id", None),
+                "error_code": error_code,
+                "outbox_id": None,
+                "attempt": None,
+            }
+            structured_logger.info("http_request", extra=extra)
+
+            if response is not None:
+                response.headers["X-Request-ID"] = request_id
 
     # Exception Handlers mapping to Spec 4.1 Error Envelope
 
@@ -479,12 +518,111 @@ def create_app() -> FastAPI:
         current_settings = get_settings()
         return {"status": "ok", "version": current_settings.RELEASE_SHA}
 
+    # Readiness probe endpoint (E36, public, un-prefixed)
+    @app.get("/readyz", response_model=None)
+    async def readyz() -> Response:
+        current_settings = get_settings()
+        try:
+            sessionmaker = get_sessionmaker()
+
+            async def _check_db() -> None:
+                async with sessionmaker() as session:
+                    await validate_schema_compatibility(session)
+
+            await asyncio.wait_for(_check_db(), timeout=2.0)
+            return JSONResponse(
+                status_code=200,
+                content={"status": "ready", "version": current_settings.RELEASE_SHA},
+            )
+        except Exception as exc:
+            structured_logger.warning("Readiness probe check failed: %s", exc)
+            return make_error_response(
+                status_code=503,
+                code="RETRYABLE_UNAVAILABLE",
+                message="Service unavailable",
+                headers={"Retry-After": "1"},
+            )
+
     # Auth routes under /api/v1
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(admin_router, prefix="/api/v1")
     app.include_router(resources_router, prefix="/api/v1")
     app.include_router(bookings_router, prefix="/api/v1")
     app.include_router(waitlist_router, prefix="/api/v1")
+
+    # Unknown API routes return JSON 404 error envelope, never index.html (Spec 9.1)
+    @app.api_route(
+        "/api/{unmatched_path:path}",
+        methods=["GET", "POST", "PATCH", "DELETE", "PUT", "HEAD", "OPTIONS"],
+    )
+    async def api_catchall(_request: Request, unmatched_path: str) -> JSONResponse:
+        return make_error_response(
+            status_code=404,
+            code="NOT_FOUND",
+            message="Not found",
+            request=_request,
+        )
+
+    # Static compiled frontend serving and client-side deep-link fallback
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+    from fastapi.staticfiles import StaticFiles
+
+    candidates = [
+        Path("/app/frontend/dist"),
+        Path(__file__).resolve().parent.parent.parent / "frontend" / "dist",
+    ]
+    dist_dir = next((p for p in candidates if p.is_dir()), None)
+
+    if dist_dir is not None:
+        resolved_dist = dist_dir.resolve()
+        assets_dir = dist_dir / "assets"
+        if assets_dir.is_dir():
+            app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+        @app.get("/{full_path:path}", response_model=None)
+        async def frontend_fallback(_request: Request, full_path: str) -> Response:
+            # Traversal security check: reject empty components, NUL, '..' segments, and dotfiles
+            segments = full_path.split("/")
+            if (
+                "\x00" in full_path
+                or ".." in segments
+                or any(seg.startswith(".") for seg in segments if seg)
+            ):
+                return make_error_response(
+                    status_code=404,
+                    code="NOT_FOUND",
+                    message="Not found",
+                    request=_request,
+                )
+
+            if full_path:
+                try:
+                    candidate = (dist_dir / full_path).resolve()
+                    if (
+                        candidate.is_file()
+                        and candidate.is_relative_to(resolved_dist)
+                        and not full_path.endswith(".html")
+                    ):
+                        return FileResponse(candidate)
+                except (ValueError, RuntimeError):
+                    return make_error_response(
+                        status_code=404,
+                        code="NOT_FOUND",
+                        message="Not found",
+                        request=_request,
+                    )
+
+            index_file = dist_dir / "index.html"
+            if index_file.is_file():
+                return FileResponse(index_file)
+            return make_error_response(
+                status_code=404,
+                code="NOT_FOUND",
+                message="Not found",
+                request=_request,
+            )
 
     return app
 

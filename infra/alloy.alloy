@@ -1,0 +1,39 @@
+discovery.relabel "api_target" {
+  targets = [
+    {
+      "__address__" = env("API_INTERNAL_URL"),
+    },
+  ]
+
+  rule {
+    source_labels = ["__address__"]
+    regex         = "^https?://([^/]+).*"
+    replacement   = "$1"
+    target_label  = "__address__"
+  }
+
+  rule {
+    source_labels = ["__address__"]
+    regex         = "^$"
+    replacement   = "127.0.0.1:10000"
+    target_label  = "__address__"
+  }
+}
+
+prometheus.scrape "commonsbook_api" {
+  targets         = discovery.relabel.api_target.output
+  metrics_path    = "/metrics"
+  scrape_interval = "15s"
+  bearer_token    = env("METRICS_TOKEN")
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = env("GRAFANA_REMOTE_WRITE_URL")
+    basic_auth {
+      username = env("GRAFANA_REMOTE_WRITE_USER")
+      password = env("GRAFANA_REMOTE_WRITE_TOKEN")
+    }
+  }
+}

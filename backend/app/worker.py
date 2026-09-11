@@ -262,6 +262,14 @@ class OutboxDispatcher:
                     continue
 
                 # 4. Dispatch outside transaction using internal helper
+                from app.observability.logging import log_worker_event
+
+                log_worker_event(
+                    event="outbox_dispatch",
+                    outbox_id=lease.id,
+                    attempt=lease.attempts,
+                    service="worker",
+                )
                 await _dispatch_event(
                     lease,
                     adapter,
@@ -280,6 +288,9 @@ class OutboxDispatcher:
 
 def main() -> None:
     """Entry point for the background worker daemon (Spec 3.4)."""
+    from app.observability.sentry import init_sentry
+
+    init_sentry(service="worker")
     supervisor = WorkerSupervisor()
     settings = get_settings()
     dispatcher = OutboxDispatcher(supervisor.sessionmaker, settings=settings)

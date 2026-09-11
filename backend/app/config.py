@@ -26,6 +26,13 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     EMAIL_FROM: str = ""
 
+    METRICS_TOKEN: str = ""
+    SENTRY_DSN: str = ""
+    GRAFANA_REMOTE_WRITE_URL: str = ""
+    GRAFANA_REMOTE_WRITE_USER: str = ""
+    GRAFANA_REMOTE_WRITE_TOKEN: str = ""
+    API_INTERNAL_URL: str = ""
+
     # Strict rejection of unknown application settings arrives with configuration tests.
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -46,6 +53,14 @@ class Settings(BaseSettings):
                 or len(self.RATE_LIMIT_HMAC_SECRET.encode("utf-8")) < 32
             ):
                 raise ValueError("RATE_LIMIT_HMAC_SECRET must be at least 32 bytes in production")
+            if not self.METRICS_TOKEN or len(self.METRICS_TOKEN.encode("utf-8")) < 32:
+                raise ValueError("METRICS_TOKEN must be at least 32 bytes in production")
+            if not self.SENTRY_DSN or not self.SENTRY_DSN.strip():
+                raise ValueError("SENTRY_DSN is required in production")
+            if self.GRAFANA_REMOTE_WRITE_URL and not self.GRAFANA_REMOTE_WRITE_URL.startswith(
+                "https://"
+            ):
+                raise ValueError("GRAFANA_REMOTE_WRITE_URL must be an HTTPS URL")
         else:
             if self.JWT_SECRET and len(self.JWT_SECRET.encode("utf-8")) < 32:
                 raise ValueError("JWT_SECRET must be at least 32 bytes when set")
@@ -54,6 +69,12 @@ class Settings(BaseSettings):
                 and len(self.RATE_LIMIT_HMAC_SECRET.encode("utf-8")) < 32
             ):
                 raise ValueError("RATE_LIMIT_HMAC_SECRET must be at least 32 bytes when set")
+            if self.METRICS_TOKEN and len(self.METRICS_TOKEN.encode("utf-8")) < 32:
+                raise ValueError("METRICS_TOKEN must be at least 32 bytes when set")
+            if self.GRAFANA_REMOTE_WRITE_URL and not self.GRAFANA_REMOTE_WRITE_URL.startswith(
+                "https://"
+            ):
+                raise ValueError("GRAFANA_REMOTE_WRITE_URL must be an HTTPS URL")
         return self
 
 
