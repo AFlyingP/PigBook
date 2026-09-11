@@ -1,4 +1,4 @@
-import { createBrowserRouter, RouteObject } from "react-router-dom";
+import { createBrowserRouter, Navigate, RouteObject } from "react-router-dom";
 import { Layout } from "./components/Layout";
 import { RequireAuth } from "./components/RequireAuth";
 import { LandingPage } from "./components/LandingPage";
@@ -10,6 +10,15 @@ import { ResourceList } from "./features/resources/ResourceList";
 import { ResourceDetail } from "./features/resources/ResourceDetail";
 import { MyBookingsPage } from "./features/bookings/MyBookingsPage";
 import { WaitlistPage } from "./features/waitlist/WaitlistPage";
+import { FeedbackPage } from "./features/feedback/FeedbackPage";
+import { AdminLayout } from "./features/admin/AdminLayout";
+import { AdminResourcesPage } from "./features/admin/inventory/AdminResourcesPage";
+import { AdminBlackoutsPage } from "./features/admin/inventory/AdminBlackoutsPage";
+import { AdminBookingsPage } from "./features/admin/operations/AdminBookingsPage";
+import { AdminUsersPage } from "./features/admin/operations/AdminUsersPage";
+import { AdminAuditPage } from "./features/admin/operations/AdminAuditPage";
+import { AdminOutboxPage } from "./features/admin/operations/AdminOutboxPage";
+import { AdminFeedbackPage } from "./features/feedback/AdminFeedbackPage";
 
 export const routes: RouteObject[] = [
   {
@@ -51,6 +60,54 @@ export const routes: RouteObject[] = [
           {
             path: "waitlist",
             element: <WaitlistPage />,
+          },
+          {
+            path: "feedback",
+            element: <FeedbackPage />,
+          },
+        ],
+      },
+      // Administrator routes (Spec 7.1, 7.2, 8.3)
+      {
+        path: "admin",
+        element: <RequireAuth adminOnly />,
+        children: [
+          {
+            element: <AdminLayout />,
+            children: [
+              {
+                index: true,
+                element: <Navigate to="resources" replace />,
+              },
+              {
+                path: "resources",
+                element: <AdminResourcesPage />,
+              },
+              {
+                path: "resources/:id/blackouts",
+                element: <AdminBlackoutsPage />,
+              },
+              {
+                path: "bookings",
+                element: <AdminBookingsPage />,
+              },
+              {
+                path: "users",
+                element: <AdminUsersPage />,
+              },
+              {
+                path: "audit",
+                element: <AdminAuditPage />,
+              },
+              {
+                path: "outbox",
+                element: <AdminOutboxPage />,
+              },
+              {
+                path: "feedback",
+                element: <AdminFeedbackPage />,
+              },
+            ],
           },
         ],
       },
