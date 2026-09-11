@@ -10,7 +10,7 @@ import {
 } from "../../api/client";
 import { clearAttempt } from "../../api/createAttempt";
 
-interface AuthContextType {
+export interface AuthContextType {
   user: User | null;
   isLoading: boolean;
   isAuthenticated: boolean;
@@ -26,7 +26,8 @@ interface AuthContextType {
   refetchMe: () => Promise<void>;
 }
 
-const AuthContext = createContext<AuthContextType | undefined>(undefined);
+// eslint-disable-next-line react-refresh/only-export-components
+export const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);

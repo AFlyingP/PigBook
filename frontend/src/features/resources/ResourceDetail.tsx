@@ -1,6 +1,10 @@
-import { useState, useMemo } from "react";
-import { useParams, Link as RouterLink } from "react-router-dom";
+import { useState, useMemo, useEffect, useContext } from "react";
+import { useParams, Link as RouterLink, useNavigate } from "react-router-dom";
+import { BookingDialog } from "../bookings/BookingDialog";
+import { WaitlistDialog } from "../waitlist/WaitlistDialog";
 import { useQuery } from "@tanstack/react-query";
+import { AuthContext } from "../auth/AuthContext";
+import { restoreAttempt } from "../../api/createAttempt";
 import {
   Box,
   Typography,
@@ -47,14 +51,34 @@ export interface BookingLaunchContract {
 
 export interface ResourceDetailProps {
   onLaunchBooking?: (contract: BookingLaunchContract) => void;
+  enableBooking?: boolean;
 }
 
-export function ResourceDetail({ onLaunchBooking }: ResourceDetailProps = {}) {
+export function ResourceDetail({ onLaunchBooking, enableBooking = false }: ResourceDetailProps = {}) {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [viewMode, setViewMode] = useState<"grid" | "list">("grid");
   const [selectedDayOffset, setSelectedDayOffset] = useState<number>(0);
   const [startDateStr, setStartDateStr] = useState<string>(() => getTodayNewYorkString());
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [bookingDialogOpen, setBookingDialogOpen] = useState(false);
+  const [waitlistDialogOpen, setWaitlistDialogOpen] = useState(false);
+  const [selectedWindow, setSelectedWindow] = useState<{ starts_at: string; ends_at: string } | null>(null);
+  const auth = useContext(AuthContext);
+  const user = auth?.user;
+
+  // On mount/reload, restore uncertain attempt for matching principal and open dialog (Spec 7.2, 7.3)
+  useEffect(() => {
+    if (!user || !enableBooking) return;
+    const draft = restoreAttempt(user.id);
+    if (draft && draft.kind === "booking" && draft.payload) {
+      const p = draft.payload as { resource_id?: string; starts_at?: string; ends_at?: string };
+      if (p.resource_id === id && p.starts_at && p.ends_at) {
+        setSelectedWindow({ starts_at: p.starts_at, ends_at: p.ends_at });
+        setBookingDialogOpen(true);
+      }
+    }
+  }, [user, id, enableBooking]);
 
   // Timezone display information (Spec 1.2, 7.1: locked to organization)
   const tzOffset = useMemo(() => getNewYorkOffsetString(), []);
@@ -120,7 +144,18 @@ export function ResourceDetail({ onLaunchBooking }: ResourceDetailProps = {}) {
 
     if (onLaunchBooking) {
       onLaunchBooking(contract);
+    } else if (enableBooking) {
+      setSelectedWindow(contract.window);
+      setBookingDialogOpen(true);
     }
+  };
+
+  const handleLaunchWaitlist = (startIso: string, endIso: string) => {
+    if (!resource || !resource.active) return;
+    setValidationError(null);
+
+    setSelectedWindow({ starts_at: startIso, ends_at: endIso });
+    setWaitlistDialogOpen(true);
   };
 
   if (isResourceError) {
@@ -416,13 +451,24 @@ export function ResourceDetail({ onLaunchBooking }: ResourceDetailProps = {}) {
                             size="small"
                             variant="outlined"
                             fullWidth
-                            disabled={s.isOccupied || !resource?.active || !onLaunchBooking}
-                            onClick={() => handleLaunchBooking(s.startIso, s.endIso)}
+                            disabled={
+                              !resource?.active ||
+                              (s.isOccupied ? !enableBooking : !onLaunchBooking && !enableBooking)
+                            }
+                            onClick={() => {
+                              if (s.isOccupied) {
+                                handleLaunchWaitlist(s.startIso, s.endIso);
+                              } else {
+                                handleLaunchBooking(s.startIso, s.endIso);
+                              }
+                            }}
                             sx={{ fontSize: "0.7rem", py: 0.25 }}
                           >
                             {s.isOccupied
-                              ? "Occupied"
-                              : onLaunchBooking
+                              ? enableBooking
+                                ? "Join Waitlist"
+                                : "Occupied"
+                              : onLaunchBooking || enableBooking
                               ? "Select Slot"
                               : "Available"}
                           </Button>
@@ -499,27 +545,86 @@ export function ResourceDetail({ onLaunchBooking }: ResourceDetailProps = {}) {
           </Box>
         ) : null}
 
-        {/* Booking Launch Contract Section (Spec 7.1: labeled unavailable until dialog feature registered) */}
-        <Box sx={{ mt: 5, p: 3, backgroundColor: "#f0f4f8", borderRadius: 2 }}>
-          <Typography variant="h6" fontWeight="bold" gutterBottom>
-            Reserve this Resource
-          </Typography>
-          <Typography variant="body2" color="text.secondary" paragraph>
-            Select an available time slot above to initialize a booking request.
-          </Typography>
+        {/* Booking Launch Contract Section */}
+        {enableBooking ? (
+          <Box sx={{ mt: 5, p: 3, backgroundColor: "#f0f4f8", borderRadius: 2 }}>
+            <Typography variant="h6" fontWeight="bold" gutterBottom>
+              Reserve this Resource
+            </Typography>
+            <Typography variant="body2" color="text.secondary" paragraph>
+              Select an available time slot above to book, or an occupied slot to join the waitlist.
+            </Typography>
+            {selectedWindow ? (
+              <Button
+                variant="contained"
+                color="primary"
+                onClick={() => setBookingDialogOpen(true)}
+              >
+                Book Selected Slot
+              </Button>
+            ) : (
+              <Typography variant="caption" color="text.secondary" display="block">
+                Click any available slot in the schedule above to begin your reservation.
+              </Typography>
+            )}
+          </Box>
+        ) : (
+          <Box sx={{ mt: 5, p: 3, backgroundColor: "#f0f4f8", borderRadius: 2 }}>
+            <Typography variant="h6" fontWeight="bold" gutterBottom>
+              Reserve this Resource
+            </Typography>
+            <Typography variant="body2" color="text.secondary" paragraph>
+              Select an available time slot above to initialize a booking request.
+            </Typography>
 
-          <Button
-            variant="contained"
-            color="primary"
-            disabled
-            aria-label="Booking unavailable"
-          >
-            Book Slot (Feature registration pending)
-          </Button>
-          <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
-            Reservation booking dialog will be available in an upcoming release.
-          </Typography>
-        </Box>
+            <Button
+              variant="contained"
+              color="primary"
+              disabled
+              aria-label="Booking unavailable"
+            >
+              Book Slot (Feature registration pending)
+            </Button>
+            <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 1 }}>
+              Reservation booking dialog will be available in an upcoming release.
+            </Typography>
+          </Box>
+        )}
+
+        {/* Booking Dialog (Spec 7.1, 7.2) */}
+        {enableBooking && resource && (
+          <BookingDialog
+            open={bookingDialogOpen}
+            onClose={() => setBookingDialogOpen(false)}
+            resource={resource}
+            window={selectedWindow}
+            onBookingSuccess={() => {
+              refetchAvail();
+            }}
+            onShowWaitlist={(w) => {
+              setSelectedWindow(w);
+              setWaitlistDialogOpen(true);
+            }}
+            onNavigateMyBookings={() => navigate("/my-bookings")}
+          />
+        )}
+
+        {/* Waitlist Dialog (Spec 7.1, 7.2) */}
+        {enableBooking && resource && (
+          <WaitlistDialog
+            open={waitlistDialogOpen}
+            onClose={() => setWaitlistDialogOpen(false)}
+            resource={resource}
+            window={selectedWindow}
+            onJoinSuccess={() => {
+              refetchAvail();
+            }}
+            onShowBooking={(w) => {
+              setSelectedWindow(w);
+              setBookingDialogOpen(true);
+            }}
+          />
+        )}
       </Paper>
     </Box>
   );

@@ -7,7 +7,6 @@ export interface CreateAttempt {
 }
 
 const STORAGE_KEY = "commonsbook_create_attempt";
-const MAX_ATTEMPT_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 function generateUuid(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -65,13 +64,9 @@ export function restoreAttempt(principalId: string): CreateAttempt | null {
       return null;
     }
 
-    // Stop automatic replay after 24 hours
-    const createdTime = new Date(attempt.createdAt).getTime();
-    if (isNaN(createdTime) || Date.now() - createdTime > MAX_ATTEMPT_AGE_MS) {
-      clearAttempt();
-      return null;
-    }
-
+    // Return attempt with createdAt intact regardless of age.
+    // Dialog enforces Spec 7.3 24-hour rule: under 24h same-key retry;
+    // at/over 24h automatic replay stops and user is prompted to check bookings before new attempt.
     return attempt;
   } catch {
     clearAttempt();

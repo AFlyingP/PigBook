@@ -67,7 +67,7 @@ describe("CreateAttempt Recovery & Isolation (Spec 3.4, 7.3)", () => {
     expect(sessionStorage.getItem("commonsbook_create_attempt")).toBeNull();
   });
 
-  it("clears attempt and expires attempts older than 24 hours", () => {
+  it("preserves attempt for matching principal regardless of age so UI enforces 24-hour rule (Spec 7.3)", () => {
     const user = "principal-user-c";
     const oldDate = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
     const staleAttempt: CreateAttempt = {
@@ -80,8 +80,9 @@ describe("CreateAttempt Recovery & Isolation (Spec 3.4, 7.3)", () => {
     sessionStorage.setItem("commonsbook_create_attempt", JSON.stringify(staleAttempt));
 
     const restored = restoreAttempt(user);
-    expect(restored).toBeNull();
-    expect(sessionStorage.getItem("commonsbook_create_attempt")).toBeNull();
+    expect(restored).not.toBeNull();
+    expect(restored?.key).toBe("stale-key-1");
+    expect(restored?.createdAt).toBe(oldDate);
 
     // clearAttempt works directly
     beginAttempt(user, "blackout", {});

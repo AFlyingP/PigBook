@@ -58,7 +58,7 @@ test.describe("Resource Catalog & Availability UI E2E (Spec 1.2, 7.1, 7.2)", () 
     await expect(page.getByText(/member2@example.com/i)).not.toBeVisible();
   });
 
-  test("validates availability view is read-only and booking action is unavailable without mutation (R4, R7)", async ({
+  test("validates selecting slot opens booking dialog and no mutation is issued before confirmation (R4, R7)", async ({
     page,
   }) => {
     let bookingMutationOccurred = false;
@@ -71,24 +71,31 @@ test.describe("Resource Catalog & Availability UI E2E (Spec 1.2, 7.1, 7.2)", () 
     await page.goto("/resources/55555555-5555-4555-8555-555555555555");
     await expect(page.getByRole("heading", { name: "Community Woodshop" })).toBeVisible();
 
-    // Booking entry button must be honestly labeled unavailable and disabled (R4)
-    const bookEntry = page.getByRole("button", { name: /booking unavailable/i });
-    await expect(bookEntry).toBeDisabled();
-    await expect(bookEntry).toHaveText("Book Slot (Feature registration pending)");
+    // Switch to tomorrow (day offset 1) to find available future slots
+    const dayTabs = page.getByRole("button", { name: /\w{3},\s*\d{2}\/\d{2}/ });
+    await expect(dayTabs.nth(1)).toBeVisible();
+    await dayTabs.nth(1).click();
 
-    // In shipped app without launch handler, per-slot selection controls must be disabled (R7)
-    // Slot buttons are rendered with disabled buttons labeled "Available" or "Occupied"
-    const slotButtons = page.locator(".MuiCard-root button");
-    const count = await slotButtons.count();
-    expect(count).toBeGreaterThan(0);
-    for (let i = 0; i < count; i++) {
-      await expect(slotButtons.nth(i)).toBeDisabled();
-    }
+    // Shipped app exposes real slot selection controls
+    const selectSlotBtn = page.getByRole("button", { name: "Select Slot" }).first();
+    await expect(selectSlotBtn).toBeVisible();
+    await expect(selectSlotBtn).toBeEnabled();
 
-    // Ensure no enabled "Select Slot" control exists in shipped app (R7)
-    await expect(page.getByRole("button", { name: "Select Slot" })).not.toBeVisible();
+    // Clicking slot opens the booking dialog without issuing a mutation
+    await selectSlotBtn.click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByRole("heading", { name: "Confirm Reservation" })).toBeVisible();
 
-    // Ensure no mutation was issued to the backend
+    // Ensure opening the dialog did NOT issue any booking mutation to the backend
+    expect(bookingMutationOccurred).toBe(false);
+
+    // Cancel / close the dialog without confirming
+    const cancelBtn = dialog.getByRole("button", { name: "Cancel" });
+    await cancelBtn.click();
+    await expect(dialog).not.toBeVisible();
+
+    // Ensure no mutation was issued upon cancellation
     expect(bookingMutationOccurred).toBe(false);
   });
 

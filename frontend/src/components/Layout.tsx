@@ -50,6 +50,22 @@ export function Layout() {
                 >
                   Resources
                 </Button>
+                <Button
+                  component={RouterLink}
+                  to="/my-bookings"
+                  color="inherit"
+                  size="small"
+                >
+                  My Bookings
+                </Button>
+                <Button
+                  component={RouterLink}
+                  to="/waitlist"
+                  color="inherit"
+                  size="small"
+                >
+                  Waitlist
+                </Button>
               </Box>
             )}
           </Box>

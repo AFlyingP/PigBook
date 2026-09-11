@@ -8,6 +8,8 @@ import { LoginPage } from "./features/auth/LoginPage";
 import { RegisterPage } from "./features/auth/RegisterPage";
 import { ResourceList } from "./features/resources/ResourceList";
 import { ResourceDetail } from "./features/resources/ResourceDetail";
+import { MyBookingsPage } from "./features/bookings/MyBookingsPage";
+import { WaitlistPage } from "./features/waitlist/WaitlistPage";
 
 export const routes: RouteObject[] = [
   {
@@ -30,7 +32,7 @@ export const routes: RouteObject[] = [
         path: "privacy",
         element: <PrivacyPage />,
       },
-      // Authenticated resource routes
+      // Authenticated member routes (Spec 7.1)
       {
         element: <RequireAuth />,
         children: [
@@ -40,7 +42,15 @@ export const routes: RouteObject[] = [
           },
           {
             path: "resources/:id",
-            element: <ResourceDetail />,
+            element: <ResourceDetail enableBooking />,
+          },
+          {
+            path: "my-bookings",
+            element: <MyBookingsPage />,
+          },
+          {
+            path: "waitlist",
+            element: <WaitlistPage />,
           },
         ],
       },
