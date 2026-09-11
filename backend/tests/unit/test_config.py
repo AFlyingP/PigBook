@@ -70,6 +70,53 @@ def test_settings_production_requires_both_secrets_and_min_length() -> None:
         )
 
 
+def test_settings_production_requires_metrics_token_and_sentry_dsn() -> None:
+    """Production settings must reject missing METRICS_TOKEN and missing SENTRY_DSN."""
+    valid_key = "valid-secret-minimum-32-bytes-long-12345"
+
+    with pytest.raises(ValueError, match="METRICS_TOKEN must be at least 32 bytes in production"):
+        Settings(
+            APP_ENV="production",
+            JWT_SECRET=valid_key,
+            RATE_LIMIT_HMAC_SECRET=valid_key,
+            METRICS_TOKEN="",
+            SENTRY_DSN="https://example@sentry.invalid/1",
+            _env_file=None,
+        )
+
+    with pytest.raises(ValueError, match="METRICS_TOKEN must be at least 32 bytes in production"):
+        Settings(
+            APP_ENV="production",
+            JWT_SECRET=valid_key,
+            RATE_LIMIT_HMAC_SECRET=valid_key,
+            METRICS_TOKEN="too-short",
+            SENTRY_DSN="https://example@sentry.invalid/1",
+            _env_file=None,
+        )
+
+    with pytest.raises(ValueError, match="SENTRY_DSN is required in production"):
+        Settings(
+            APP_ENV="production",
+            JWT_SECRET=valid_key,
+            RATE_LIMIT_HMAC_SECRET=valid_key,
+            METRICS_TOKEN=valid_key,
+            SENTRY_DSN="",
+            _env_file=None,
+        )
+
+    # Valid production settings instantiate without error
+    prod = Settings(
+        APP_ENV="production",
+        JWT_SECRET=valid_key,
+        RATE_LIMIT_HMAC_SECRET=valid_key,
+        METRICS_TOKEN=valid_key,
+        SENTRY_DSN="https://example@sentry.invalid/1",
+        _env_file=None,
+    )
+    assert prod.APP_ENV == "production"
+    assert prod.SENTRY_DSN == "https://example@sentry.invalid/1"
+
+
 def test_rate_limit_fails_closed_when_secret_unset_in_local(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

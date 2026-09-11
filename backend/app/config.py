@@ -55,6 +55,8 @@ class Settings(BaseSettings):
                 raise ValueError("RATE_LIMIT_HMAC_SECRET must be at least 32 bytes in production")
             if not self.METRICS_TOKEN or len(self.METRICS_TOKEN.encode("utf-8")) < 32:
                 raise ValueError("METRICS_TOKEN must be at least 32 bytes in production")
+            if not self.SENTRY_DSN or not self.SENTRY_DSN.strip():
+                raise ValueError("SENTRY_DSN is required in production")
             if self.GRAFANA_REMOTE_WRITE_URL and not self.GRAFANA_REMOTE_WRITE_URL.startswith(
                 "https://"
             ):

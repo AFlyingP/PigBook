@@ -1,0 +1,210 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: commonsbook-alerts
+    folder: CommonsBook
+    interval: 10s
+    rules:
+      - uid: high-error-rate-5xx
+        title: HighErrorRate5xx
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: (sum(rate(commonsbook_http_requests_total{status_class="5xx"}[5m])) / sum(rate(commonsbook_http_requests_total[5m]))) > 0.02 and sum(increase(commonsbook_http_requests_total[5m])) >= 100
+              instant: true
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              conditions:
+                - eval:
+                    params: [0]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+              datasource:
+                type: __expr__
+                uid: __expr__
+              expression: A
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "5xx > 2% for 5m with >= 100 requests"
+        labels:
+          severity: critical
+
+      - uid: high-latency-p95
+        title: HighLatencyP95
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: histogram_quantile(0.95, sum(rate(commonsbook_http_request_duration_seconds_bucket[10m])) by (le)) > 1.0 and sum(increase(commonsbook_http_requests_total[10m])) >= 100
+              instant: true
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              expression: A
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 10m
+        annotations:
+          description: "p95 > 1s for 10m with >= 100 requests"
+        labels:
+          severity: warning
+
+      - uid: outbox-lag-high
+        title: OutboxLagHigh
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: commonsbook_outbox_lag_seconds > 120
+              instant: true
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              expression: A
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "outbox lag > 120s for 5m"
+        labels:
+          severity: warning
+
+      - uid: outbox-dead-events
+        title: OutboxDeadEvents
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: commonsbook_outbox_dead > 0
+              instant: true
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              expression: A
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 5m
+        annotations:
+          description: "dead > 0 for 5m"
+        labels:
+          severity: critical
+
+      - uid: worker-heartbeat-stale
+        title: WorkerHeartbeatStale
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 120
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: commonsbook_worker_heartbeat_age_seconds > 90
+              instant: true
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              expression: A
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: "heartbeat age > 90s for 2m"
+        labels:
+          severity: critical
+
+      - uid: expired-holds-pending-overdue
+        title: ExpiredHoldsPendingOverdue
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 120
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: commonsbook_expired_holds_pending > 0
+              instant: true
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              expression: A
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: "expired holds pending > 0 for 2m"
+        labels:
+          severity: warning
+
+      - uid: metrics-collection-stale
+        title: MetricsCollectionStale
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 120
+              to: 0
+            datasourceUid: prometheus
+            model:
+              expr: commonsbook_metrics_collection_age_seconds > 60
+              instant: true
+              refId: A
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              expression: A
+              refId: C
+              type: threshold
+        noDataState: OK
+        execErrState: Error
+        for: 2m
+        annotations:
+          description: "metrics collection age > 60s for 2m"
+        labels:
+          severity: warning

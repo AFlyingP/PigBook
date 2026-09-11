@@ -64,4 +64,7 @@ async def test_unknown_api_path_returns_json_404() -> None:
         content_type = response.headers.get("content-type", "")
         assert "application/json" in content_type
         data = response.json()
-        assert "detail" in data
+        assert data["error"]["code"] == "NOT_FOUND"
+        assert data["error"]["message"] == "Not found"
+        assert data["error"]["details"] == {}
+        assert "detail" not in data

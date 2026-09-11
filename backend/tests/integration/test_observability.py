@@ -24,7 +24,6 @@ from app.observability.logging import (
     redact_sensitive_text,
 )
 from app.observability.metrics import (
-    DURATION_BUCKETS,
     refresh_operational_metrics,
 )
 
@@ -66,7 +65,14 @@ async def test_metrics_auth_absent_wrong_and_correct_token() -> None:
         assert r_wrong.status_code == 401
         assert r_wrong.json()["error"]["code"] == "INVALID_TOKEN"
 
-        # 3. Correct token -> 200 Prometheus text
+        # 3. Non-ASCII token -> 401 INVALID_TOKEN, not 500 (R2)
+        r_non_ascii = await client.get(
+            "/metrics", headers=[(b"authorization", b"Bearer \xff\xfe-invalid-token")]
+        )
+        assert r_non_ascii.status_code == 401
+        assert r_non_ascii.json()["error"]["code"] == "INVALID_TOKEN"
+
+        # 4. Correct token -> 200 Prometheus text
         r_correct = await client.get("/metrics", headers={"Authorization": f"Bearer {valid_token}"})
         assert r_correct.status_code == 200
         assert "text/plain" in r_correct.headers.get("content-type", "")
@@ -78,31 +84,75 @@ async def test_exact_metric_names_labels_and_histogram_buckets() -> None:
     """Exact Spec 10.1 metric names, types, labels and duration buckets are registered."""
     metrics_text = generate_latest(REGISTRY).decode("utf-8")
 
-    expected_metrics = [
-        "commonsbook_http_requests_total",
-        "commonsbook_http_request_duration_seconds",
-        "commonsbook_booking_conflicts_total",
-        "commonsbook_idempotency_total",
-        "commonsbook_outbox_pending",
-        "commonsbook_outbox_lag_seconds",
-        "commonsbook_outbox_dead",
-        "commonsbook_outbox_deliveries_total",
-        "commonsbook_expired_holds_pending",
-        "commonsbook_worker_heartbeat_age_seconds",
-        "commonsbook_db_pool_checked_out",
-        "commonsbook_metrics_collection_age_seconds",
-    ]
+    import re
 
-    for name in expected_metrics:
-        assert (
-            f"# TYPE {name}" in metrics_text
-            or f"# HELP {name}" in metrics_text
-            or f"{name}" in metrics_text
-        ), f"Missing required metric: {name}"
+    from app.observability.metrics import HTTP_REQUEST_DURATION_SECONDS
 
-    # Check that sample buckets match Spec 10.1
-    expected_buckets = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
-    assert DURATION_BUCKETS == expected_buckets
+    # 1. Assert exact metric family and exact # TYPE from Prometheus exposition
+    expected_types = {
+        "commonsbook_http_requests_total": "counter",
+        "commonsbook_http_request_duration_seconds": "histogram",
+        "commonsbook_booking_conflicts_total": "counter",
+        "commonsbook_idempotency_total": "counter",
+        "commonsbook_outbox_pending": "gauge",
+        "commonsbook_outbox_lag_seconds": "gauge",
+        "commonsbook_outbox_dead": "gauge",
+        "commonsbook_outbox_deliveries_total": "counter",
+        "commonsbook_expired_holds_pending": "gauge",
+        "commonsbook_worker_heartbeat_age_seconds": "gauge",
+        "commonsbook_db_pool_checked_out": "gauge",
+        "commonsbook_metrics_collection_age_seconds": "gauge",
+    }
+
+    for name, mtype in expected_types.items():
+        assert f"# TYPE {name} {mtype}" in metrics_text, f"Missing or incorrect # TYPE for {name}"
+
+    # 2. Assert exact label-name set for every labeled metric
+    expected_labels = {
+        "commonsbook_http_requests_total": {"method", "route", "status_class"},
+        "commonsbook_http_request_duration_seconds": {"method", "route"},
+        "commonsbook_booking_conflicts_total": {"operation"},
+        "commonsbook_idempotency_total": {"outcome"},
+        "commonsbook_outbox_deliveries_total": {"outcome"},
+    }
+    collector_map = REGISTRY._names_to_collectors
+    for name, expected_lbls in expected_labels.items():
+        collector_key = (
+            name[:-6] if (name.endswith("_total") and name not in collector_map) else name
+        )
+        assert collector_key in collector_map, f"Collector not registered for {name}"
+        actual_lbls = set(collector_map[collector_key]._labelnames)
+        assert actual_lbls == expected_lbls, (
+            f"Label set mismatch for {name}: {actual_lbls} != {expected_lbls}"
+        )
+
+    # 3. Assert exact commonsbook_http_request_duration_seconds_bucket le boundaries including +Inf
+    HTTP_REQUEST_DURATION_SECONDS.labels(method="GET", route="/healthz").observe(0.01)
+    updated_text = generate_latest(REGISTRY).decode("utf-8")
+    bucket_le_values = set(
+        re.findall(
+            r'commonsbook_http_request_duration_seconds_bucket\{[^}]*le="([^"]+)"[^}]*\}',
+            updated_text,
+        )
+    )
+    expected_le_boundaries = {
+        "0.005",
+        "0.01",
+        "0.025",
+        "0.05",
+        "0.1",
+        "0.25",
+        "0.5",
+        "1.0",
+        "2.5",
+        "5.0",
+        "10.0",
+        "30.0",
+        "+Inf",
+    }
+    assert bucket_le_values == expected_le_boundaries, (
+        f"Duration bucket boundaries mismatch: {bucket_le_values}"
+    )
 
 
 @pytest.mark.asyncio
@@ -355,4 +405,158 @@ async def test_dead_worker_and_outbox_synthetic_alert_conditions() -> None:
                 )
                 await cleanup_session.execute(
                     text("DELETE FROM users WHERE id = :uid"), {"uid": test_user.id}
+                )
+
+
+@pytest.mark.asyncio
+async def test_outbox_delivery_counter_restart_safety() -> None:
+    """First collection establishes baseline without incrementing; subsequent deliveries do."""
+    from sqlalchemy.dialects.postgresql import Range
+
+    import app.observability.metrics as metrics_mod
+    from app.auth.models import User
+    from app.auth.passwords import hash_password
+    from app.bookings.models import Booking
+    from app.notifications.models import NotificationDelivery, Outbox
+    from app.observability.metrics import OUTBOX_DELIVERIES_TOTAL, refresh_operational_metrics
+    from app.resources.models import Resource
+
+    # Reset module-level baseline state to simulate a fresh process start
+    metrics_mod._delivery_baseline_established = False
+    metrics_mod._last_delivery_counts = {"sent": 0, "skipped": 0}
+
+    sessionmaker = get_sessionmaker()
+    async with sessionmaker() as session:
+        async with session.begin():
+            await session.execute(text("DELETE FROM notification_deliveries"))
+            await session.execute(text("DELETE FROM outbox"))
+
+            u = User(
+                id=uuid.uuid4(),
+                email=f"u_{uuid.uuid4().hex[:8]}@example.com",
+                password_hash=hash_password("Pass12345678!"),
+                display_name="U",
+                role="member",
+                enabled=True,
+                version=1,
+            )
+            session.add(u)
+            r = Resource(
+                id=uuid.uuid4(),
+                name=f"R_{uuid.uuid4().hex[:6]}",
+                description="",
+                location="L",
+                active=True,
+                version=1,
+            )
+            session.add(r)
+            await session.flush()
+
+            b = Booking(
+                id=uuid.uuid4(),
+                resource_id=r.id,
+                user_id=u.id,
+                created_by=u.id,
+                kind="reservation",
+                time_range=Range(
+                    datetime.now(timezone.utc),
+                    datetime.now(timezone.utc) + timedelta(hours=1),
+                    bounds="[)",
+                ),
+                status="confirmed",
+                version=1,
+            )
+            session.add(b)
+            await session.flush()
+
+            e1 = Outbox(
+                id=uuid.uuid4(),
+                event_type="booking_confirmed",
+                aggregate_id=b.id,
+                aggregate_version=1,
+                payload={},
+                status="delivered",
+            )
+            e2 = Outbox(
+                id=uuid.uuid4(),
+                event_type="booking_cancelled",
+                aggregate_id=b.id,
+                aggregate_version=2,
+                payload={},
+                status="delivered",
+            )
+            session.add_all([e1, e2])
+            await session.flush()
+
+            d1 = NotificationDelivery(
+                id=uuid.uuid4(),
+                event_id=e1.id,
+                recipient_id=u.id,
+                channel="email",
+                state="sent",
+            )
+            d2 = NotificationDelivery(
+                id=uuid.uuid4(),
+                event_id=e2.id,
+                recipient_id=u.id,
+                channel="email",
+                state="skipped",
+            )
+            session.add_all([d1, d2])
+
+        def get_counter_value(state: str) -> float:
+            for sample in OUTBOX_DELIVERIES_TOTAL.collect()[0].samples:
+                if sample.labels.get("outcome") == state and sample.name.endswith("_total"):
+                    return sample.value
+            return 0.0
+
+        initial_sent = get_counter_value("sent")
+        initial_skipped = get_counter_value("skipped")
+
+        # 1. First collection after restart -> must establish baseline without incrementing
+        await refresh_operational_metrics(session)
+        assert get_counter_value("sent") == initial_sent
+        assert get_counter_value("skipped") == initial_skipped
+
+        # 2. Add one new delivery in fresh transaction
+        async with sessionmaker() as step2_session:
+            async with step2_session.begin():
+                e3 = Outbox(
+                    id=uuid.uuid4(),
+                    event_type="waitlist_offered",
+                    aggregate_id=b.id,
+                    aggregate_version=3,
+                    payload={},
+                    status="delivered",
+                )
+                step2_session.add(e3)
+                await step2_session.flush()
+
+                d3 = NotificationDelivery(
+                    id=uuid.uuid4(),
+                    event_id=e3.id,
+                    recipient_id=u.id,
+                    channel="email",
+                    state="sent",
+                )
+                step2_session.add(d3)
+
+            # Second collection -> must increment by exactly 1
+            await refresh_operational_metrics(step2_session)
+        assert get_counter_value("sent") == initial_sent + 1.0
+        assert get_counter_value("skipped") == initial_skipped
+
+        # Cleanup
+        async with sessionmaker() as cleanup_session:
+            async with cleanup_session.begin():
+                await cleanup_session.execute(text("DELETE FROM notification_deliveries"))
+                await cleanup_session.execute(text("DELETE FROM outbox"))
+                await cleanup_session.execute(
+                    text("DELETE FROM bookings WHERE id = :bid"), {"bid": b.id}
+                )
+                await cleanup_session.execute(
+                    text("DELETE FROM resources WHERE id = :rid"), {"rid": r.id}
+                )
+                await cleanup_session.execute(
+                    text("DELETE FROM users WHERE id = :uid"), {"uid": u.id}
                 )

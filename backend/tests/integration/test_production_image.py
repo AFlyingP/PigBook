@@ -71,7 +71,8 @@ def test_production_image_build_and_behavior() -> None:
         assert uid != "0", f"Container must run as nonroot user, got UID={uid}"
         assert uid == "10001"
 
-        # 3. Assert production rejection of insecure configuration
+        # 3. Assert production rejection of insecure configuration (R5)
+        valid_key = "a" * 32
         insecure_res = subprocess.run(
             [
                 "docker",
@@ -92,6 +93,61 @@ def test_production_image_build_and_behavior() -> None:
         )
         assert insecure_res.returncode != 0
         assert "JWT_SECRET must be at least 32 bytes in production" in insecure_res.stderr
+
+        # Missing SENTRY_DSN in production must fail
+        insecure_sentry = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-e",
+                "APP_ENV=production",
+                "-e",
+                f"JWT_SECRET={valid_key}",
+                "-e",
+                f"RATE_LIMIT_HMAC_SECRET={valid_key}",
+                "-e",
+                f"METRICS_TOKEN={valid_key}",
+                "-e",
+                "SENTRY_DSN=",
+                image_tag,
+                "python",
+                "-c",
+                "from app.config import get_settings; get_settings()",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert insecure_sentry.returncode != 0
+        assert "SENTRY_DSN is required in production" in insecure_sentry.stderr
+
+        # Valid production configuration passes startup validation
+        valid_prod = subprocess.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "-e",
+                "APP_ENV=production",
+                "-e",
+                f"JWT_SECRET={valid_key}",
+                "-e",
+                f"RATE_LIMIT_HMAC_SECRET={valid_key}",
+                "-e",
+                f"METRICS_TOKEN={valid_key}",
+                "-e",
+                "SENTRY_DSN=https://example@sentry.invalid/1",
+                image_tag,
+                "python",
+                "-c",
+                "import app.config; assert app.config.get_settings().APP_ENV == 'production'",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert valid_prod.returncode == 0, f"Valid production config failed: {valid_prod.stderr}"
 
         # 4. Run container and assert HTTP endpoints, static serving, and fallbacks
         port = find_free_port()
@@ -171,6 +227,25 @@ def test_production_image_build_and_behavior() -> None:
                 err_data = json.loads(err.read().decode("utf-8"))
                 assert err_data["error"]["code"] == "NOT_FOUND"
                 assert err_data["error"]["message"] == "Not found"
+
+            # 4f. Path traversal regression: must never serve files outside dist_dir (R1)
+            for traversal_path in [
+                "/../../backend/pyproject.toml",
+                "/..%2F..%2Fbackend%2Fpyproject.toml",
+                "/assets/../../backend/pyproject.toml",
+                "/../../../etc/passwd",
+                "/.env",
+            ]:
+                try:
+                    with urllib.request.urlopen(f"{base_url}{traversal_path}") as resp:
+                        content = resp.read().decode("utf-8", errors="ignore")
+                        assert "tool.poetry" not in content
+                        assert "project.dependencies" not in content
+                        assert "root:" not in content
+                except urllib.error.HTTPError as err:
+                    assert err.code == 404
+                    err_content = err.read().decode("utf-8", errors="ignore")
+                    assert "pyproject.toml" not in err_content
 
         finally:
             subprocess.run(

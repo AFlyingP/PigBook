@@ -32,6 +32,9 @@ services:
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
       - GF_AUTH_DISABLE_LOGIN_FORM=true
     volumes:
-      - ./grafana:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./grafana/datasources.yaml:/etc/grafana/provisioning/datasources/datasources.yaml:ro
+      - ./grafana/alerts.yaml:/etc/grafana/provisioning/alerting/alerts.yaml:ro
+      - ./grafana/commonsbook.json:/var/lib/grafana/dashboards/commonsbook.json:ro
     depends_on:
       - prometheus

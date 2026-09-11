@@ -556,16 +556,12 @@ def create_app() -> FastAPI:
         methods=["GET", "POST", "PATCH", "DELETE", "PUT", "HEAD", "OPTIONS"],
     )
     async def api_catchall(_request: Request, unmatched_path: str) -> JSONResponse:
-        _request.state.error_code = "NOT_FOUND"
-        content = {
-            "error": {
-                "code": "NOT_FOUND",
-                "message": "Not found",
-                "details": {},
-            },
-            "detail": "Not found",
-        }
-        return JSONResponse(status_code=404, content=content)
+        return make_error_response(
+            status_code=404,
+            code="NOT_FOUND",
+            message="Not found",
+            request=_request,
+        )
 
     # Static compiled frontend serving and client-side deep-link fallback
     from pathlib import Path
@@ -580,15 +576,44 @@ def create_app() -> FastAPI:
     dist_dir = next((p for p in candidates if p.is_dir()), None)
 
     if dist_dir is not None:
+        resolved_dist = dist_dir.resolve()
         assets_dir = dist_dir / "assets"
         if assets_dir.is_dir():
             app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
         @app.get("/{full_path:path}", response_model=None)
         async def frontend_fallback(_request: Request, full_path: str) -> Response:
-            target_file = dist_dir / full_path
-            if full_path and target_file.is_file() and not full_path.endswith(".html"):
-                return FileResponse(target_file)
+            # Traversal security check: reject empty components, NUL, '..' segments, and dotfiles
+            segments = full_path.split("/")
+            if (
+                "\x00" in full_path
+                or ".." in segments
+                or any(seg.startswith(".") for seg in segments if seg)
+            ):
+                return make_error_response(
+                    status_code=404,
+                    code="NOT_FOUND",
+                    message="Not found",
+                    request=_request,
+                )
+
+            if full_path:
+                try:
+                    candidate = (dist_dir / full_path).resolve()
+                    if (
+                        candidate.is_file()
+                        and candidate.is_relative_to(resolved_dist)
+                        and not full_path.endswith(".html")
+                    ):
+                        return FileResponse(candidate)
+                except (ValueError, RuntimeError):
+                    return make_error_response(
+                        status_code=404,
+                        code="NOT_FOUND",
+                        message="Not found",
+                        request=_request,
+                    )
+
             index_file = dist_dir / "index.html"
             if index_file.is_file():
                 return FileResponse(index_file)

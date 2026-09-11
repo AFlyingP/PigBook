@@ -126,6 +126,7 @@ METRICS_COLLECTION_AGE_SECONDS = _get_or_create_gauge(
 _last_collection_mono: float = -100.0
 _last_collection_wall: float = 0.0
 _last_delivery_counts: dict[str, int] = {"sent": 0, "skipped": 0}
+_delivery_baseline_established: bool = False
 
 
 def record_booking_conflict(operation: str) -> None:
@@ -151,7 +152,11 @@ async def refresh_operational_metrics(session: AsyncSession) -> None:
 
     Fixed public interface (Spec 3.4).
     """
-    global _last_collection_mono, _last_collection_wall, _last_delivery_counts
+    global \
+        _last_collection_mono, \
+        _last_collection_wall, \
+        _last_delivery_counts, \
+        _delivery_baseline_established
 
     # 1. Outbox pending count
     q_pending = select(func.count()).select_from(Outbox).where(Outbox.status == "pending")
@@ -182,12 +187,16 @@ async def refresh_operational_metrics(session: AsyncSession) -> None:
         if state in current_counts:
             current_counts[state] = int(cnt)
 
-    for state, current_cnt in current_counts.items():
-        prev_cnt = _last_delivery_counts.get(state, 0)
-        diff = current_cnt - prev_cnt
-        if diff > 0:
-            OUTBOX_DELIVERIES_TOTAL.labels(outcome=state).inc(diff)
-    _last_delivery_counts = current_counts
+    if not _delivery_baseline_established:
+        _last_delivery_counts = dict(current_counts)
+        _delivery_baseline_established = True
+    else:
+        for state, current_cnt in current_counts.items():
+            prev_cnt = _last_delivery_counts.get(state, 0)
+            diff = current_cnt - prev_cnt
+            if diff > 0:
+                OUTBOX_DELIVERIES_TOTAL.labels(outcome=state).inc(diff)
+        _last_delivery_counts = dict(current_counts)
 
     # 5. Expired holds pending
     q_holds = (

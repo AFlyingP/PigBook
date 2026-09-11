@@ -562,7 +562,9 @@ def authorize(
         if policy == Policy.metrics:
             settings = get_settings()
             metrics_token = settings.METRICS_TOKEN
-            if not metrics_token or not secrets.compare_digest(token, metrics_token):
+            if not metrics_token or not secrets.compare_digest(
+                token.encode("utf-8"), metrics_token.encode("utf-8")
+            ):
                 raise InvalidTokenError("Invalid metrics token")
             return AuthorizedScope(principal_id=None, policy=policy)
 

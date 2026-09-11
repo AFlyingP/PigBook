@@ -92,15 +92,27 @@ docker compose -f compose.yaml -f infra/compose.observability.yaml --profile obs
 ```
 
 - **Prometheus**: Accessible at `http://127.0.0.1:9090` scraping the API `/metrics` endpoint every 15 seconds.
-- **Grafana**: Accessible at `http://127.0.0.1:3000` with pre-provisioned dashboard `infra/grafana/commonsbook.json`.
+- **Grafana**: Accessible at `http://127.0.0.1:3000` with pre-provisioned datasource, dashboard, and alerts:
+  - **Datasource**: Configured via `infra/grafana/datasources.yaml` pointing to the local Prometheus instance at `http://prometheus:9090` (uid: `prometheus`).
+  - **Dashboard**: Configured via `infra/grafana/dashboards.yaml` loading the versioned dashboard from `infra/grafana/commonsbook.json` (uid: `commonsbook-main`). Verify via HTTP: `curl http://127.0.0.1:3000/api/search` lists the `CommonsBook Observability` dashboard.
+  - **Alert Rules**: Configured via `infra/grafana/alerts.yaml` under the `commonsbook-alerts` group in the `CommonsBook` folder. Verify via HTTP: `curl http://127.0.0.1:3000/api/v1/provisioning/alert-rules` lists all seven provisioned alert rules.
+  - **Deployment Annotations**: Configured using Grafana-native tag-based annotations (`tags: ["deployment"]`). Deployments push an event with the `deployment` tag and `release_sha` text to `/api/annotations`, which Grafana plots natively across time-series panels without requiring metric labels.
 
 ### 5.1 Alert Rules
 
-The versioned dashboard defines the following alert conditions:
-1. **HighErrorRate5xx**: 5xx HTTP response rate > 2% for 5m with at least 100 requests.
-2. **HighLatencyP95**: p95 request latency > 1s for 10m with at least 100 requests.
-3. **OutboxLagHigh**: Oldest pending/processing outbox event lag > 120s for 5m.
-4. **OutboxDeadEvents**: Dead outbox event count > 0 for 5m.
-5. **WorkerHeartbeatStale**: Background worker heartbeat age > 90s for 2m.
-6. **ExpiredHoldsPendingOverdue**: Overdue hold bookings pending cleanup > 0 for 2m.
-7. **MetricsCollectionStale**: Operational metric collector staleness > 60s for 2m.
+The provisioned alert configuration (`infra/grafana/alerts.yaml`) defines all seven required alert conditions with exact thresholds and evaluation durations:
+1. **HighErrorRate5xx**: 5xx HTTP response rate > 2% for 5m with at least 100 requests (`for: 5m`, severity: critical).
+2. **HighLatencyP95**: p95 request latency > 1s for 10m with at least 100 requests (`for: 10m`, severity: warning).
+3. **OutboxLagHigh**: Oldest pending/processing outbox event lag > 120s for 5m (`for: 5m`, severity: warning).
+4. **OutboxDeadEvents**: Dead outbox event count > 0 for 5m (`for: 5m`, severity: critical).
+5. **WorkerHeartbeatStale**: Background worker heartbeat age > 90s for 2m (`for: 2m`, severity: critical).
+6. **ExpiredHoldsPendingOverdue**: Overdue hold bookings pending cleanup > 0 for 2m (`for: 2m`, severity: warning).
+7. **MetricsCollectionStale**: Operational metric collector staleness > 60s for 2m (`for: 2m`, severity: warning).
+
+## 6. Alloy Telemetry Sidecar Configuration
+
+Grafana Alloy runs inside the worker container and scrapes the API `/metrics` endpoint before forwarding via Prometheus remote-write:
+- **Target Configuration**: `API_INTERNAL_URL` defines the internal endpoint URL (e.g. `http://commonsbook-api:10000` on Render or `http://127.0.0.1:10000` locally).
+- **Target Normalization**: Alloy uses `discovery.relabel` with regular expressions to strip any URL scheme prefix (`http://` or `https://`) and paths, producing a valid `host:port` scrape target. If `API_INTERNAL_URL` is empty or unset, it safely falls back to `127.0.0.1:10000`.
+- **Scrape Interval**: Scrapes every 15 seconds using `Authorization: Bearer <METRICS_TOKEN>`.
+- **Remote-Write**: Forwards to `GRAFANA_REMOTE_WRITE_URL` authenticated via `GRAFANA_REMOTE_WRITE_USER` and `GRAFANA_REMOTE_WRITE_TOKEN`.

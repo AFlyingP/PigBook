@@ -46,18 +46,20 @@ The worker container uses `scripts/worker_entrypoint.sh` to supervise both the P
 
 Production configurations are validated on startup and fail closed:
 
-| Setting | Requirement | Description |
+| Setting | Validation Rule | Description |
 |---|---|---|
-| `APP_ENV` | `production` | Enforces production security checks. |
-| `APP_ORIGIN` | Exact HTTPS URL | CORS origin enforcement for cookies and CSRF protection. |
-| `DATABASE_URL` | PostgreSQL URL | Application database connection string with TLS. |
-| `JWT_SECRET` | >= 32 bytes | Secret for signing HS256 access tokens. |
-| `RATE_LIMIT_HMAC_SECRET` | >= 32 bytes | Secret for hashing IP and email in rate-limiting buckets. |
-| `METRICS_TOKEN` | >= 32 bytes | Operational token required to scrape `/metrics`. |
-| `PORT` | Integer (default 10000) | Port bound by Uvicorn in production. |
-| `SENTRY_DSN` | Valid DSN URL | Backend Sentry reporting endpoint. |
+| `APP_ENV` | Enforced enum: `local`, `test`, `production` | Enforces production startup validation when set to `production`. |
+| `JWT_SECRET` | Enforced >= 32 bytes in production | Secret for signing HS256 access tokens. |
+| `RATE_LIMIT_HMAC_SECRET` | Enforced >= 32 bytes in production | Secret for hashing IP and email in rate-limiting buckets. |
+| `METRICS_TOKEN` | Enforced >= 32 bytes in production | Operational bearer token required to scrape `/metrics`. |
+| `SENTRY_DSN` | Enforced nonempty in production | Backend Sentry DSN for API and worker error reporting. |
+| `TEST_PROFILE` | Enforced not `race` in production | Rejects race test harness configuration in production. |
+| `GRAFANA_REMOTE_WRITE_URL` | Enforced HTTPS URL when configured | Target URL for Alloy Prometheus remote-write. |
+| `APP_ORIGIN` | URL (default `http://localhost:5173`) | CORS origin enforcement for cookies; set to deployment HTTPS domain in production. |
+| `DATABASE_URL` | SQLAlchemy URL | Application PostgreSQL connection URL; required for runtime database operations. |
+| `PORT` | Integer (default 10000) | Port bound by Uvicorn process in production. |
 
-Attempting to run with missing or short secrets in production raises a startup validation error and halts process execution.
+Startup validation strictly enforces that `JWT_SECRET`, `RATE_LIMIT_HMAC_SECRET`, `METRICS_TOKEN`, and `SENTRY_DSN` are present and valid in production; missing or invalid values immediately abort process initialization.
 
 ## 4. Schema Compatibility and Zero-Downtime Releases
 
