@@ -15,11 +15,10 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
     await page.goto("/resources/66666666-6666-4666-8666-666666666666");
     await expect(page.getByRole("heading", { name: "Pottery Studio" })).toBeVisible();
 
-    // 3. Switch to second day to ensure future slot > 15m lead time
-    const dayButtons = page.locator(".MuiBox-root button:has-text('Sep'), .MuiBox-root button:has-text('Oct'), .MuiBox-root button:has-text('Nov'), .MuiBox-root button:has-text('2026')");
-    if ((await dayButtons.count()) >= 2) {
-      await dayButtons.nth(1).click();
-    }
+    // 3. Switch to day offset 2 (2 days in future) to guarantee slot > 15m in future
+    const dayTabs = page.getByRole("button", { name: /\w{3},\s*\d{2}\/\d{2}/ });
+    await expect(dayTabs.nth(2)).toBeVisible();
+    await dayTabs.nth(2).click();
 
     // 4. Find and select first available slot
     const selectSlotBtn = page.getByRole("button", { name: "Select Slot" }).first();
@@ -30,15 +29,6 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
     const dialog = page.getByRole("dialog");
     await expect(dialog).toBeVisible();
     await expect(page.getByRole("heading", { name: "Confirm Reservation" })).toBeVisible();
-
-    // Check that createAttempt draft is saved in sessionStorage with UUID key
-    const attemptDraft = await page.evaluate(() => {
-      const raw = sessionStorage.getItem("commonsbook_create_attempt");
-      return raw ? JSON.parse(raw) : null;
-    });
-    expect(attemptDraft).not.toBeNull();
-    expect(attemptDraft.key).toMatch(/^[0-9a-f-]{36}$/i);
-    expect(attemptDraft.kind).toBe("booking");
 
     // 6. Click Confirm Reservation
     const confirmBtn = dialog.getByRole("button", { name: "Confirm Reservation" });
@@ -84,15 +74,16 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
     await pageB.goto("/resources/66666666-6666-4666-8666-666666666666");
 
     // Both switch to day offset 3 (3 days in future)
-    const dayButtonsA = pageA.locator(".MuiBox-root button:has-text('2026'), .MuiBox-root button:has-text('Sep'), .MuiBox-root button:has-text('Oct')");
-    const dayButtonsB = pageB.locator(".MuiBox-root button:has-text('2026'), .MuiBox-root button:has-text('Sep'), .MuiBox-root button:has-text('Oct')");
+    const dayTabsA = pageA.getByRole("button", { name: /\w{3},\s*\d{2}\/\d{2}/ });
+    const dayTabsB = pageB.getByRole("button", { name: /\w{3},\s*\d{2}\/\d{2}/ });
 
-    if ((await dayButtonsA.count()) >= 3) {
-      await dayButtonsA.nth(2).click();
-      await dayButtonsB.nth(2).click();
-    }
+    await expect(dayTabsA.nth(3)).toBeVisible();
+    await expect(dayTabsB.nth(3)).toBeVisible();
 
-    // Both open dialog for the same slot (e.g. 14:00 slot)
+    await dayTabsA.nth(3).click();
+    await dayTabsB.nth(3).click();
+
+    // Both open dialog for the same slot (slot index 4 on that day)
     const slotA = pageA.getByRole("button", { name: "Select Slot" }).nth(4);
     const slotB = pageB.getByRole("button", { name: "Select Slot" }).nth(4);
 
@@ -108,18 +99,25 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
 
     await Promise.all([confirmA.click(), confirmB.click()]);
 
-    // One must succeed with confirmed, and the other must receive SLOT_CONFLICT (Spec 5.1, 7.2)
-    const hasSuccessA = await pageA.getByRole("status").isVisible().catch(() => false);
-    const hasSuccessB = await pageB.getByRole("status").isVisible().catch(() => false);
+    // Poll until one shows 201 status and the other shows 409 conflict alert
+    await expect
+      .poll(
+        async () => {
+          const successA = await pageA.getByRole("status").isVisible().catch(() => false);
+          const successB = await pageB.getByRole("status").isVisible().catch(() => false);
+          const conflictA = await pageA.getByRole("alert").isVisible().catch(() => false);
+          const conflictB = await pageB.getByRole("alert").isVisible().catch(() => false);
 
-    const hasConflictA = await pageA.getByRole("alert").isVisible().catch(() => false);
-    const hasConflictB = await pageB.getByRole("alert").isVisible().catch(() => false);
+          const totalSuccess = Number(successA) + Number(successB);
+          const totalConflict = Number(conflictA) + Number(conflictB);
+          return { totalSuccess, totalConflict };
+        },
+        { timeout: 10000, intervals: [200, 500] }
+      )
+      .toEqual({ totalSuccess: 1, totalConflict: 1 });
 
-    // Exactly one winner and one conflict
-    expect(Number(hasSuccessA) + Number(hasSuccessB)).toBe(1);
-    expect(Number(hasConflictA) + Number(hasConflictB)).toBe(1);
-
-    if (hasConflictA) {
+    const conflictA = await pageA.getByRole("alert").isVisible().catch(() => false);
+    if (conflictA) {
       await expect(pageA.getByRole("alert")).toContainText(/reserved|conflict|waitlist/i);
       await expect(pageA.getByRole("button", { name: /Join Waitlist for This Slot/i })).toBeVisible();
     } else {

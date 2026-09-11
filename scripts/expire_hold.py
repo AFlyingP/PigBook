@@ -46,7 +46,8 @@ async def run_expire_holds(
             await session.execute(
                 text(
                     "UPDATE bookings "
-                    "SET expires_at = clock_timestamp() - interval '5 seconds' "
+                    "SET expires_at = clock_timestamp() - interval '5 seconds', "
+                    "version = version + 1 "
                     "WHERE id = :bid AND status = 'offered'"
                 ),
                 {"bid": booking_id},
@@ -56,7 +57,8 @@ async def run_expire_holds(
             await session.execute(
                 text(
                     "UPDATE bookings "
-                    "SET expires_at = clock_timestamp() - interval '5 seconds' "
+                    "SET expires_at = clock_timestamp() - interval '5 seconds', "
+                    "version = version + 1 "
                     "WHERE resource_id = :rid AND status = 'offered'"
                 ),
                 {"rid": resource_id},
@@ -72,7 +74,8 @@ async def run_expire_holds(
             await session.execute(
                 text(
                     "UPDATE bookings "
-                    "SET expires_at = clock_timestamp() - interval '5 seconds' "
+                    "SET expires_at = clock_timestamp() - interval '5 seconds', "
+                    "version = version + 1 "
                     "WHERE status = 'offered'"
                 )
             )
