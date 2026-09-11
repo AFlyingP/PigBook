@@ -24,7 +24,8 @@ test.describe.serial("Administrator Operations, Users & Auditing E2E (Spec 7.1, 
   });
 
   test("administrator filters and cancels a reservation with reason (R6)", async () => {
-    await adminPage.goto("/admin/bookings");
+    await adminPage.locator('a[href="/admin/resources"]').first().click();
+    await adminPage.locator('a[href="/admin/bookings"]').first().click();
     await expect(adminPage.getByRole("heading", { name: "Reservations & Bookings" })).toBeVisible();
 
     // 1. Initial state: seeded confirmed booking exists
@@ -86,7 +87,7 @@ test.describe.serial("Administrator Operations, Users & Auditing E2E (Spec 7.1, 
   });
 
   test("user management prevents disabling or demoting last active administrator", async () => {
-    await adminPage.goto("/admin/users");
+    await adminPage.locator('a[href="/admin/users"]').first().click();
     await expect(adminPage.getByRole("heading", { name: "User Accounts & Roles" })).toBeVisible();
 
     // Verify admin user is in table
@@ -126,7 +127,7 @@ test.describe.serial("Administrator Operations, Users & Auditing E2E (Spec 7.1, 
   });
 
   test("invitation dialog displays link once, allows copy, and clears link on close without persistence", async () => {
-    await adminPage.goto("/admin/users");
+    await adminPage.locator('a[href="/admin/users"]').first().click();
     await adminPage.click("#invite-user-button");
 
     const dialog = adminPage.getByRole("dialog");
@@ -170,7 +171,7 @@ test.describe.serial("Administrator Operations, Users & Auditing E2E (Spec 7.1, 
 
   test("reviews audit log and exercises dead outbox retry with confirmation", async () => {
     // 1. Check audit log view
-    await adminPage.goto("/admin/audit");
+    await adminPage.locator('a[href="/admin/audit"]').first().click();
     await expect(adminPage.getByRole("heading", { name: "System Audit Log" })).toBeVisible();
     await expect(adminPage.locator("table[aria-label='Audit log table']")).toBeVisible();
 
@@ -187,7 +188,7 @@ test.describe.serial("Administrator Operations, Users & Auditing E2E (Spec 7.1, 
     expect(seedResult.status).toBe(0);
 
     // 3. Navigate to outbox view
-    await adminPage.goto("/admin/outbox");
+    await adminPage.locator('a[href="/admin/outbox"]').first().click();
     await expect(adminPage.getByRole("heading", { name: "Transactional Outbox Queue" })).toBeVisible();
 
     // Filter by dead events

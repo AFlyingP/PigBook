@@ -69,7 +69,7 @@ test.describe.serial("Administrator Inventory & Blackout E2E Flow (Spec 7.1, 7.2
 
   test("administrator creates and cancels a blackout window for a resource", async () => {
     // Go to admin resources
-    await adminPage.goto("/admin/resources");
+    await adminPage.locator('a[href="/admin/resources"]').first().click();
     await expect(adminPage.getByText("Pottery Studio")).toBeVisible();
 
     // Navigate to Pottery Studio blackouts
@@ -115,7 +115,7 @@ test.describe.serial("Administrator Inventory & Blackout E2E Flow (Spec 7.1, 7.2
   test("concurrent-edit displays 412 VERSION_MISMATCH refresh prompt without silent overwrite", async ({
     request: apiRequest,
   }) => {
-    await adminPage.goto("/admin/resources");
+    await adminPage.locator('a[href="/admin/resources"]').first().click();
     await expect(adminPage.getByText("Community Woodshop")).toBeVisible();
 
     // Open edit dialog for Community Woodshop

@@ -52,6 +52,69 @@ function getContrastRatio(fgStr: string, bgStr: string): number {
   return (lighter + 0.05) / (darker + 0.05);
 }
 
+/**
+ * Pure accessible name computation adhering strictly to R8:
+ * Accepts:
+ *  - non-empty aria-label
+ *  - aria-labelledby resolving to non-empty text from referenced element IDs
+ *  - text content (or child img[alt]) for buttons, links, summaries
+ *  - explicit <label for="id"> or wrapping <label> with non-empty text for form controls
+ * Strictly rejects placeholder and input values as accessible names.
+ */
+function findUnnamedInteractiveControls(): string[] {
+  const controls = Array.from(
+    document.querySelectorAll<HTMLElement>(
+      'button:not([disabled]):not([aria-hidden="true"]), a[href]:not([aria-hidden="true"]), input:not([type="hidden"]):not([disabled]):not([aria-hidden="true"]), select:not([disabled]):not([aria-hidden="true"]), textarea:not([disabled]):not([aria-hidden="true"])'
+    )
+  );
+
+  const missing: string[] = [];
+
+  for (const el of controls) {
+    // 1. Check aria-label
+    const ariaLabel = el.getAttribute("aria-label")?.trim();
+    if (ariaLabel) continue;
+
+    // 2. Check aria-labelledby resolving referenced IDs to non-empty text
+    const ariaLabelledBy = el.getAttribute("aria-labelledby")?.trim();
+    if (ariaLabelledBy) {
+      const ids = ariaLabelledBy.split(/\s+/);
+      const resolvedText = ids
+        .map((id) => document.getElementById(id)?.textContent?.trim() || "")
+        .filter(Boolean)
+        .join(" ");
+      if (resolvedText) continue;
+    }
+
+    // 3. For buttons, links, and summaries: text content
+    const tag = el.tagName.toLowerCase();
+    if (tag === "button" || tag === "a" || tag === "summary") {
+      const text = el.textContent?.trim();
+      if (text) continue;
+      const imgAlt = el.querySelector("img[alt]")?.getAttribute("alt")?.trim();
+      if (imgAlt) continue;
+    }
+
+    // 4. For form controls (input, select, textarea): explicit <label for> or wrapping <label>
+    if (el.id) {
+      const explicitLabel = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      const labelText = explicitLabel?.textContent?.trim();
+      if (labelText) continue;
+    }
+
+    const wrappingLabel = el.closest("label");
+    if (wrappingLabel) {
+      const labelText = wrappingLabel.textContent?.trim();
+      if (labelText) continue;
+    }
+
+    // Notice: placeholder and value are strictly NOT accepted as accessible names (R8)
+    missing.push(`${el.tagName.toLowerCase()}${el.id ? "#" + el.id : ""}`);
+  }
+
+  return missing;
+}
+
 test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification (Spec 7.2, 12.2)", () => {
   let sharedPage: Page;
 
@@ -146,25 +209,52 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
     await standardContext.close();
   });
 
-  // R2: Focus visible indicator and focus restoration to opener on Escape and Cancel
-  test("verifies visible focus indicator and focus restoration to opener on dialog close (R2)", async () => {
+  // R2 & R7: Visible focus indicator proven by difference and focus restoration on Escape and Cancel
+  test("verifies visible focus indicator by difference and focus restoration to opener on dialog close (R2, R7)", async () => {
     await sharedPage.goto("/admin/resources");
     await sharedPage.waitForLoadState("networkidle");
 
     const addBtn = sharedPage.locator("#add-resource-button");
-    await addBtn.focus();
 
-    // 1. Assert visible focus indicator is active on the opener
-    const isFocusVisible = await addBtn.evaluate((el) => {
+    // 1. Capture unfocused style of the opener button
+    await sharedPage.evaluate(() => (document.activeElement as HTMLElement)?.blur?.());
+    const unfocusedOpenerStyle = await addBtn.evaluate((el) => {
       const cs = window.getComputedStyle(el);
-      return (
-        (cs.outlineStyle !== "none" && cs.outlineWidth !== "0px") ||
-        (cs.boxShadow && cs.boxShadow !== "none")
-      );
+      return {
+        outlineStyle: cs.outlineStyle,
+        outlineWidth: cs.outlineWidth,
+        outlineColor: cs.outlineColor,
+      };
     });
-    expect(isFocusVisible).toBe(true);
 
-    // 2. Open dialog with Enter
+    // Unfocused button carries no focus outline
+    expect(
+      unfocusedOpenerStyle.outlineStyle === "none" || parseFloat(unfocusedOpenerStyle.outlineWidth) === 0
+    ).toBe(true);
+
+    // 2. Focus the opener with keyboard Tab traversal to trigger :focus-visible
+    const filterSelect = sharedPage.locator("#resource-active-filter");
+    await filterSelect.focus();
+    await sharedPage.keyboard.press("Tab");
+    await expect(addBtn).toBeFocused();
+
+    // 3. Capture keyboard-focused style: prove focus difference and active focus-visible outline
+    const focusedOpenerStyle = await addBtn.evaluate((el) => {
+      const cs = window.getComputedStyle(el);
+      return {
+        outlineStyle: cs.outlineStyle,
+        outlineWidth: cs.outlineWidth,
+        outlineColor: cs.outlineColor,
+      };
+    });
+
+    // R7: Prove focus styling by difference (fails if :focus-visible is removed)
+    expect(focusedOpenerStyle.outlineStyle).not.toBe(unfocusedOpenerStyle.outlineStyle);
+    expect(focusedOpenerStyle.outlineStyle).toBe("solid");
+    expect(parseFloat(focusedOpenerStyle.outlineWidth)).toBeGreaterThanOrEqual(2);
+    expect(focusedOpenerStyle.outlineColor).toContain("25, 118, 210");
+
+    // 4. Open dialog with Enter
     await sharedPage.keyboard.press("Enter");
     const dialog = sharedPage.getByRole("dialog");
     await expect(dialog).toBeVisible();
@@ -179,12 +269,12 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
       expect(isInside).toBe(true);
     }
 
-    // 3. Close with Escape: assert focus is restored to #add-resource-button
+    // 5. Close with Escape: assert focus is restored to #add-resource-button (R2)
     await sharedPage.keyboard.press("Escape");
     await expect(dialog).not.toBeVisible();
     await expect(addBtn).toBeFocused();
 
-    // 4. Open again and close via Cancel button: assert focus is restored to #add-resource-button
+    // 6. Open again and close via Cancel button: assert focus is restored to #add-resource-button (R2)
     await sharedPage.keyboard.press("Enter");
     await expect(dialog).toBeVisible();
     await dialog.getByRole("button", { name: "Cancel" }).click();
@@ -192,10 +282,53 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
     await expect(addBtn).toBeFocused();
   });
 
-  // R3: Complete critical-route sweep for keyboard traversal, accessible names, and live regions
-  test("exercises keyboard traversal, accessible control names, and live regions across all critical routes (R3)", async () => {
-    const criticalRoutes = [
-      { path: "/login", requiresLive: false },
+  // R3, R7, R8, R9: Sweep all critical routes with real accessible names, visible focus by difference, and unauth /login
+  test("exercises keyboard traversal, visible focus by difference, accessible names, and live regions across all critical routes (R3, R7, R8, R9)", async ({
+    browser,
+  }) => {
+    // 1. R9: Sweep /login in a fresh unauthenticated context to guarantee the real login screen is tested
+    const unauthContext = await browser.newContext();
+    const unauthPage = await unauthContext.newPage();
+    await unauthPage.goto("/login");
+    await unauthPage.waitForLoadState("domcontentloaded");
+    await expect(unauthPage).toHaveURL(/.*\/login/);
+    await expect(unauthPage.getByRole("heading", { name: "Sign In to CommonsBook" })).toBeVisible();
+
+    // R7 on /login: Keyboard Tab traversal reaches interactive element with visible focus difference
+    await unauthPage.evaluate(() => (document.activeElement as HTMLElement)?.blur?.());
+    await unauthPage.keyboard.press("Tab");
+    const loginFocusDifference = await unauthPage.evaluate(() => {
+      const el = document.activeElement as HTMLElement;
+      if (!el || el === document.body) return false;
+      const focusedCs = window.getComputedStyle(el);
+      const fStyle = {
+        outlineStyle: focusedCs.outlineStyle,
+        outlineWidth: focusedCs.outlineWidth,
+        boxShadow: focusedCs.boxShadow,
+      };
+      el.blur();
+      const unfocusedCs = window.getComputedStyle(el);
+      const uStyle = {
+        outlineStyle: unfocusedCs.outlineStyle,
+        outlineWidth: unfocusedCs.outlineWidth,
+        boxShadow: unfocusedCs.boxShadow,
+      };
+      el.focus();
+      return (
+        fStyle.outlineStyle !== uStyle.outlineStyle ||
+        fStyle.outlineWidth !== uStyle.outlineWidth ||
+        fStyle.boxShadow !== uStyle.boxShadow
+      );
+    });
+    expect(loginFocusDifference, "Keyboard focus on /login must produce visible style difference (R7)").toBe(true);
+
+    // R8 on /login: Every enabled control must expose a real accessible name
+    const loginMissingNames = await unauthPage.evaluate(findUnnamedInteractiveControls);
+    expect(loginMissingNames, "Controls missing accessible names on /login (R8)").toEqual([]);
+    await unauthContext.close();
+
+    // 2. Sweep authenticated routes on sharedPage
+    const authenticatedRoutes = [
       { path: "/resources", requiresLive: true },
       { path: "/resources/55555555-5555-4555-8555-555555555555", requiresLive: false },
       { path: "/my-bookings", requiresLive: false },
@@ -209,56 +342,64 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
       { path: "/admin/feedback", requiresLive: false },
     ];
 
-    for (const route of criticalRoutes) {
-      await sharedPage.goto(route.path);
-      await sharedPage.waitForLoadState("networkidle");
-
-      // 1. Keyboard Tab traversal reaches an interactive element
-      await sharedPage.keyboard.press("Tab");
-      const hasFocusedEl = await sharedPage.evaluate(() => {
-        const el = document.activeElement;
-        return el !== null && el !== document.body;
-      });
-      expect(hasFocusedEl, `Keyboard tab from start reached no element on ${route.path}`).toBe(true);
-
-      // 2. Every enabled interactive control exposes an accessible name
-      const unnamedControls = await sharedPage.evaluate(() => {
-        const controls = Array.from(
-          document.querySelectorAll<HTMLElement>(
-            'button:not([disabled]):not([aria-hidden="true"]), a[href]:not([aria-hidden="true"]), input:not([type="hidden"]):not([disabled]):not([aria-hidden="true"]), select:not([disabled]):not([aria-hidden="true"]), textarea:not([disabled]):not([aria-hidden="true"])'
-          )
-        );
-        const missing: string[] = [];
-        for (const el of controls) {
-          const ariaLabel = el.getAttribute("aria-label")?.trim();
-          const ariaLabelledBy = el.getAttribute("aria-labelledby");
-          const title = el.getAttribute("title")?.trim();
-          const placeholder = el.getAttribute("placeholder")?.trim();
-          const text = el.innerText?.trim();
-          const id = el.id;
-          const label = id ? document.querySelector(`label[for="${id}"]`)?.textContent?.trim() : null;
-          const parentLabel = el.closest("label")?.textContent?.trim();
-          const val = (el as HTMLInputElement).value?.trim();
-
-          const name =
-            ariaLabel ||
-            text ||
-            label ||
-            parentLabel ||
-            title ||
-            placeholder ||
-            (el.tagName === "INPUT" && val) ||
-            (ariaLabelledBy ? "has-labelledby" : null);
-
-          if (!name) {
-            missing.push(`${el.tagName.toLowerCase()}${id ? "#" + id : ""}`);
-          }
+    for (const route of authenticatedRoutes) {
+      if (route.path.startsWith("/admin/") && !sharedPage.url().includes("/admin")) {
+        const adminLink = sharedPage.locator('a[href="/admin/resources"]').first();
+        if (await adminLink.isVisible()) {
+          await adminLink.click();
         }
-        return missing;
-      });
-      expect(unnamedControls, `Interactive controls missing accessible names on ${route.path}`).toEqual([]);
+      }
 
-      // 3. Live region check on announcing routes
+      const link = sharedPage.locator(`a[href="${route.path}"]`).first();
+      if ((await link.count()) > 0 && (await link.isVisible())) {
+        await link.click();
+      } else {
+        await sharedPage.goto(route.path);
+      }
+      // Assert URL matches route path to ensure no redirect took place and page is rendered
+      await expect(sharedPage).toHaveURL(new RegExp(route.path));
+      await expect(sharedPage.locator("main")).toBeVisible();
+
+      // R7 per-route check: Tab from start reaches interactive element with visible focus difference
+      await sharedPage.evaluate(() => (document.activeElement as HTMLElement)?.blur?.());
+      await sharedPage.keyboard.press("Tab");
+
+      const perRouteFocusDiff = await sharedPage.evaluate(() => {
+        const el = document.activeElement as HTMLElement;
+        if (!el || el === document.body) return false;
+        const focusedCs = window.getComputedStyle(el);
+        const fStyle = {
+          outlineStyle: focusedCs.outlineStyle,
+          outlineWidth: focusedCs.outlineWidth,
+          boxShadow: focusedCs.boxShadow,
+        };
+        el.blur();
+        const unfocusedCs = window.getComputedStyle(el);
+        const uStyle = {
+          outlineStyle: unfocusedCs.outlineStyle,
+          outlineWidth: unfocusedCs.outlineWidth,
+          boxShadow: unfocusedCs.boxShadow,
+        };
+        el.focus();
+        return (
+          fStyle.outlineStyle !== uStyle.outlineStyle ||
+          fStyle.outlineWidth !== uStyle.outlineWidth ||
+          fStyle.boxShadow !== uStyle.boxShadow
+        );
+      });
+      expect(
+        perRouteFocusDiff,
+        `Keyboard focus on ${route.path} must produce visible style difference (R7)`
+      ).toBe(true);
+
+      // R8 per-route check: Every enabled interactive control exposes a real accessible name
+      const unnamedControls = await sharedPage.evaluate(findUnnamedInteractiveControls);
+      expect(
+        unnamedControls,
+        `Interactive controls missing real accessible names on ${route.path} (R8)`
+      ).toEqual([]);
+
+      // Live region check on announcing routes
       if (route.requiresLive) {
         const liveRegionCount = await sharedPage.locator('[aria-live="polite"], [role="status"]').count();
         expect(
@@ -268,9 +409,9 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
       }
     }
 
-    // 4. Non-colour-only status check: verify self-contained pre-seeded "Old Darkroom" is Archived
-    await sharedPage.goto("/admin/resources");
-    await sharedPage.waitForLoadState("networkidle");
+    // 3. Non-colour-only status check: verify self-contained pre-seeded "Old Darkroom" is Archived
+    await sharedPage.locator('a[href="/admin/resources"]').first().click();
+    await expect(sharedPage).toHaveURL(/.*\/admin\/resources/);
     const darkroomRow = sharedPage.locator("tr", { hasText: "Old Darkroom" });
     await expect(darkroomRow).toBeVisible();
     await expect(darkroomRow.getByText("Archived")).toBeVisible();
@@ -280,16 +421,29 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
   test("proves mobile viewport (375px) has no bounding box overflow without relying on global clipping (R5)", async ({
     browser,
   }) => {
-    const mobileContext = await browser.newContext({ viewport: { width: 375, height: 667 } });
-    const mobilePage = await mobileContext.newPage();
+    // 1. Check unauthenticated public routes on independent mobile context
+    const anonContext = await browser.newContext({ viewport: { width: 375, height: 667 } });
+    const anonPage = await anonContext.newPage();
+    for (const r of ["/", "/login"]) {
+      await anonPage.goto(r);
+      await anonPage.waitForLoadState("domcontentloaded");
+      const overflowing = await anonPage.evaluate((maxRight) => {
+        return Array.from(document.querySelectorAll<HTMLElement>("*"))
+          .filter((el) => {
+            const cs = window.getComputedStyle(el);
+            if (cs.overflowX === "auto" || cs.overflowX === "scroll") return false;
+            return el.getBoundingClientRect().right > maxRight + 1;
+          })
+          .map((el) => `${el.tagName.toLowerCase()}: right=${Math.round(el.getBoundingClientRect().right)}px`);
+      }, 375);
+      expect(overflowing, `Public route ${r} has overflowing elements on mobile`).toEqual([]);
+    }
+    await anonContext.close();
 
-    // Check login route unauthenticated
-    await mobilePage.goto("/login");
-    await mobilePage.waitForLoadState("domcontentloaded");
+    // 2. Check authenticated routes on sharedPage by setting mobile viewport and client navigating
+    await sharedPage.setViewportSize({ width: 375, height: 667 });
 
     const routesToCheck = [
-      "/",
-      "/login",
       "/resources",
       "/resources/55555555-5555-4555-8555-555555555555",
       "/my-bookings",
@@ -303,19 +457,17 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
       "/admin/feedback",
     ];
 
-    // Log in on mobile page to sweep all routes
-    await mobilePage.fill("#login-email", "admin@example.com");
-    await mobilePage.fill("#login-password", "AdminPassword123!");
-    await mobilePage.click('button[type="submit"]');
-    await expect(mobilePage).toHaveURL(/.*\/resources/);
-    await mobilePage.waitForLoadState("networkidle");
-
     for (const r of routesToCheck) {
-      await mobilePage.goto(r);
-      await mobilePage.waitForLoadState("networkidle");
+      const link = sharedPage.locator(`a[href="${r}"]`).first();
+      if ((await link.count()) > 0 && (await link.isVisible())) {
+        await link.click();
+      } else {
+        await sharedPage.goto(r);
+      }
+      await sharedPage.waitForLoadState("domcontentloaded");
 
       // Assert no element bounding box exceeds 375px + 1px tolerance (excluding internal scroll containers)
-      const overflowingElements = await mobilePage.evaluate((maxRight) => {
+      const overflowingElements = await sharedPage.evaluate((maxRight) => {
         const elements = Array.from(document.querySelectorAll<HTMLElement>("*"));
         const offenders: string[] = [];
         for (const el of elements) {
@@ -350,7 +502,8 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
       ).toEqual([]);
     }
 
-    await mobileContext.close();
+    // Reset viewport size
+    await sharedPage.setViewportSize({ width: 1280, height: 720 });
   });
 
   test("proves zero telemetry or Sentry requests and captures journey screenshots into EVIDENCE_DIR", async ({ page: _page }, testInfo) => {
@@ -386,30 +539,32 @@ test.describe.serial("Accessibility, Viewport, Contrast & Telemetry Verification
       fs.mkdirSync(evidenceDir, { recursive: true });
     }
 
-    // 1. Landing screenshot
-    await sharedPage.goto("/");
-    await sharedPage.waitForLoadState("networkidle");
-    await expect(sharedPage.getByRole("heading", { name: "CommonsBook", level: 1 })).toBeVisible();
-    await sharedPage.screenshot({ path: path.join(evidenceDir, "screenshot-01-landing.png") });
+    // 1. Landing screenshot on unauthenticated page
+    const unauthLanding = await sharedPage.context().browser()!.newPage();
+    await unauthLanding.goto("/");
+    await unauthLanding.waitForLoadState("domcontentloaded");
+    await expect(unauthLanding.getByRole("heading", { name: "CommonsBook", level: 1 })).toBeVisible();
+    await unauthLanding.screenshot({ path: path.join(evidenceDir, "screenshot-01-landing.png") });
+    await unauthLanding.close();
 
     // 2. Resources screenshot
     await sharedPage.goto("/resources");
-    await sharedPage.waitForLoadState("networkidle");
+    await sharedPage.waitForLoadState("domcontentloaded");
     await sharedPage.screenshot({ path: path.join(evidenceDir, "screenshot-02-resources.png") });
 
     // 3. Admin Resources screenshot
     await sharedPage.goto("/admin/resources");
-    await sharedPage.waitForLoadState("networkidle");
+    await sharedPage.waitForLoadState("domcontentloaded");
     await sharedPage.screenshot({ path: path.join(evidenceDir, "screenshot-03-admin-resources.png") });
 
     // 4. Admin Bookings screenshot
     await sharedPage.goto("/admin/bookings");
-    await sharedPage.waitForLoadState("networkidle");
+    await sharedPage.waitForLoadState("domcontentloaded");
     await sharedPage.screenshot({ path: path.join(evidenceDir, "screenshot-04-admin-bookings.png") });
 
     // 5. Feedback screenshot
     await sharedPage.goto("/feedback");
-    await sharedPage.waitForLoadState("networkidle");
+    await sharedPage.waitForLoadState("domcontentloaded");
     await sharedPage.screenshot({ path: path.join(evidenceDir, "screenshot-05-feedback.png") });
 
     // Assert that no request matched telemetry hosts
