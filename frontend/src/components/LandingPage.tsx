@@ -6,11 +6,11 @@ export function LandingPage() {
   const { isAuthenticated } = useAuth();
 
   return (
-    <Box sx={{ py: 6 }}>
+    <Box sx={{ py: { xs: 3, md: 6 }, overflowX: "hidden" }}>
       <Paper
         elevation={0}
         sx={{
-          p: { xs: 4, md: 8 },
+          p: { xs: 2, md: 8 },
           backgroundColor: "#f0f4f8",
           borderRadius: 3,
           mb: 6,
