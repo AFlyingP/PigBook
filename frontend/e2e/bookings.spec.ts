@@ -158,11 +158,21 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
     await expect(dialog).toBeVisible();
 
     // Intercept first POST to simulate network failure (uncertain outcome per Spec 7.3)
+    // Capture the Idempotency-Key header of the retried request (Spec 4.3, R8)
     let intercepted = false;
+    let retriedIdempotencyKey: string | null = null;
+
     await page.route("**/api/v1/bookings", async (route) => {
-      if (route.request().method() === "POST" && !intercepted) {
-        intercepted = true;
-        await route.abort("failed");
+      if (route.request().method() === "POST") {
+        const headers = route.request().headers();
+        const key = headers["idempotency-key"] || null;
+        if (!intercepted) {
+          intercepted = true;
+          await route.abort("failed");
+        } else {
+          retriedIdempotencyKey = key;
+          await route.continue();
+        }
       } else {
         await route.continue();
       }
@@ -175,7 +185,7 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
     const retryBtn = dialog.getByRole("button", { name: "Retry Booking" });
     await expect(retryBtn).toBeVisible();
 
-    // Verify draft key in sessionStorage
+    // Verify draft key in sessionStorage before reload
     const draftBeforeReload = await page.evaluate(() => {
       const raw = sessionStorage.getItem("commonsbook_create_attempt");
       return raw ? JSON.parse(raw) : null;
@@ -195,15 +205,33 @@ test.describe("Booking Creation & Idempotency E2E (Spec 4.3, 7.2, 7.3)", () => {
     await expect(page.getByRole("status")).toContainText(/Booking confirmed successfully/i);
     await expect(page.getByRole("dialog")).not.toBeVisible({ timeout: 5000 });
 
+    // Assert that the retried POST used the EXACT SAME idempotency key from draftBeforeReload (R8)
+    expect(retriedIdempotencyKey).toBe(draftBeforeReload.key);
+
     // Draft is purged upon definitive 201
     const draftAfterSuccess = await page.evaluate(() => sessionStorage.getItem("commonsbook_create_attempt"));
     expect(draftAfterSuccess).toBeNull();
 
-    // Verify booking is confirmed in /my-bookings
+    // Verify exactly ONE booking exists for this slot in /my-bookings (Spec 4.3, R8)
+    const bookingsResponsePromise = page.waitForResponse(
+      (resp) => resp.url().includes("/api/v1/bookings") && resp.request().method() === "GET"
+    );
     await page.goto("/my-bookings");
     await expect(page.getByRole("heading", { name: "My Bookings" })).toBeVisible();
     await expect(page.getByText("Pottery Studio").first()).toBeVisible();
-    const confirmedRows = page.locator("tr").filter({ hasText: "Pottery Studio" });
-    expect(await confirmedRows.count()).toBeGreaterThanOrEqual(1);
+
+    const bookingsResp = await bookingsResponsePromise;
+    const bookingsData = await bookingsResp.json();
+    const expectedStartMs = new Date(
+      (draftBeforeReload.payload as { starts_at: string }).starts_at
+    ).getTime();
+
+    const matchingBookings = bookingsData.items.filter(
+      (b: { resource_id: string; starts_at: string; status: string }) =>
+        b.resource_id === "66666666-6666-4666-8666-666666666666" &&
+        new Date(b.starts_at).getTime() === expectedStartMs &&
+        b.status === "confirmed"
+    );
+    expect(matchingBookings.length).toBe(1);
   });
 });

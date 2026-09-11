@@ -78,23 +78,19 @@ test.describe("Waitlist & Offer Management E2E (Spec 7.1, 7.2, 7.3, 11.5)", () =
     await pageMember1.close();
     await contextMember1.close();
 
-    // 4. Back to member2: intercept waitlist response to capture offered_booking_id (R7)
-    let capturedOfferedBookingId: string | null = null;
-    pageMember2.on("response", async (resp) => {
-      if (resp.url().includes("/api/v1/waitlist") && resp.request().method() === "GET") {
-        try {
-          const json = await resp.json();
-          const offered = json.items?.find((item: { status: string; offered_booking_id?: string }) => item.status === "offered");
-          if (offered?.offered_booking_id) {
-            capturedOfferedBookingId = offered.offered_booking_id;
-          }
-        } catch {
-          // ignore
-        }
-      }
-    });
-
+    // 4. Back to member2: capture offered_booking_id with waitForResponse (R7)
+    const waitlistResponsePromise = pageMember2.waitForResponse(
+      (resp) => resp.url().includes("/api/v1/waitlist") && resp.request().method() === "GET"
+    );
     await pageMember2.reload();
+    const waitlistResp = await waitlistResponsePromise;
+    const waitlistData = await waitlistResp.json();
+    const offered = waitlistData.items?.find(
+      (item: { status: string; offered_booking_id?: string }) => item.status === "offered"
+    );
+    const capturedOfferedBookingId = offered?.offered_booking_id;
+    expect(capturedOfferedBookingId).toBeTruthy();
+
     await expect(pageMember2.getByText(/Offer Available/i).first()).toBeVisible();
     await expect(pageMember2.getByText(/Time Remaining to Claim:/i)).toBeVisible();
 
