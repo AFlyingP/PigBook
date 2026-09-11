@@ -137,6 +137,9 @@ async def execute_create(
 
         if acquired is not None:
             # Key acquired: execute fresh operation
+            from app.observability.metrics import record_idempotency_outcome
+
+            record_idempotency_outcome("new")
             stored = await operation()
 
             persisted_headers = {
@@ -191,12 +194,18 @@ async def execute_create(
 
         # Check hash match
         if existing_key.request_hash != req_hash:
+            from app.observability.metrics import record_idempotency_outcome
+
+            record_idempotency_outcome("mismatch")
             raise IdempotencyKeyMismatch("Idempotency key payload mismatch")
 
         # Invariant check: response_status IS NULL on a committed visible row
         if existing_key.response_status is None:
             raise IncompleteIdempotencyRecord("Incomplete idempotency record")
 
+        from app.observability.metrics import record_idempotency_outcome
+
+        record_idempotency_outcome("replay")
         stored_headers = (
             dict(existing_key.response_headers) if existing_key.response_headers is not None else {}
         )

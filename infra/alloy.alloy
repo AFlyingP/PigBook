@@ -1,0 +1,21 @@
+prometheus.scrape "commonsbook_api" {
+  targets = [
+    {
+      "__address__" = coalesce(sys.env("API_INTERNAL_URL"), "127.0.0.1:10000"),
+    },
+  ]
+  metrics_path = "/metrics"
+  scrape_interval = "15s"
+  bearer_token = sys.env("METRICS_TOKEN")
+  forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = sys.env("GRAFANA_REMOTE_WRITE_URL")
+    basic_auth {
+      username = sys.env("GRAFANA_REMOTE_WRITE_USER")
+      password = sys.env("GRAFANA_REMOTE_WRITE_TOKEN")
+    }
+  }
+}

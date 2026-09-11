@@ -1,0 +1,37 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    profiles: ["observability"]
+    ports:
+      - "127.0.0.1:9090:9090"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        cat <<EOF > /tmp/prometheus.yml
+        global:
+          scrape_interval: 15s
+        scrape_configs:
+          - job_name: 'commonsbook'
+            metrics_path: '/metrics'
+            bearer_token: '${METRICS_TOKEN}'
+            static_configs:
+              - targets: ['host.docker.internal:8000']
+        EOF
+        exec /bin/prometheus --config.file=/tmp/prometheus.yml
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    profiles: ["observability"]
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./grafana:/etc/grafana/provisioning/dashboards:ro
+    depends_on:
+      - prometheus

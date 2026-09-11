@@ -359,6 +359,9 @@ async def promote_waiters(
                         orig, "constraint_name", None
                     )
                     if sqlstate == "23P01" and constraint_name == "bookings_no_overlap":
+                        from app.observability.metrics import record_booking_conflict
+
+                        record_booking_conflict("promote")
                         conflict = True
                     else:
                         raise

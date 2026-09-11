@@ -1,4 +1,5 @@
 import re
+import secrets
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
@@ -187,6 +188,8 @@ policy_registry: dict[str, Policy] = {
     "E33": Policy.authenticated,
     "E34": Policy.admin,
     "E35": Policy.public,
+    "E36": Policy.public,
+    "E37": Policy.metrics,
 }
 
 
@@ -555,6 +558,13 @@ def authorize(
         token = auth_header[7:].strip()
         if not token:
             raise AuthRequiredError("Authentication required")
+
+        if policy == Policy.metrics:
+            settings = get_settings()
+            metrics_token = settings.METRICS_TOKEN
+            if not metrics_token or not secrets.compare_digest(token, metrics_token):
+                raise InvalidTokenError("Invalid metrics token")
+            return AuthorizedScope(principal_id=None, policy=policy)
 
         settings = get_settings()
         jwt_secret = settings.JWT_SECRET

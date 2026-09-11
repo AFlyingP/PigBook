@@ -163,6 +163,9 @@ async def insert_confirmed(
             orig, "constraint_name", None
         )
         if sqlstate == "23P01" and constraint_name == "bookings_no_overlap":
+            from app.observability.metrics import record_booking_conflict
+
+            record_booking_conflict("create")
             raise SlotConflict("Slot conflict: requested time interval is not available") from exc
         raise
 

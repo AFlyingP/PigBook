@@ -1,0 +1,212 @@
+{
+  "title": "CommonsBook Observability",
+  "uid": "commonsbook-main",
+  "version": 1,
+  "editable": true,
+  "schemaVersion": 39,
+  "timezone": "utc",
+  "refresh": "10s",
+  "annotations": {
+    "list": [
+      {
+        "name": "Deployments",
+        "enable": true,
+        "iconColor": "blue",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "expr": "changes(commonsbook_http_requests_total[5m])",
+        "titleFormat": "Deployment {{release_sha}}",
+        "textFormat": "SHA: {{release_sha}}"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "HTTP Request Rate & 5xx Error Rate",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(commonsbook_http_requests_total[1m])) by (method, route, status_class)",
+          "legendFormat": "{{method}} {{route}} ({{status_class}})"
+        },
+        {
+          "expr": "sum(rate(commonsbook_http_requests_total{status_class=\"5xx\"}[5m])) / sum(rate(commonsbook_http_requests_total[5m])) * 100",
+          "legendFormat": "5xx Error Rate %"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Request Latency Percentiles (p50, p95, p99)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(commonsbook_http_request_duration_seconds_bucket[5m])) by (le, route))",
+          "legendFormat": "p50 {{route}}"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(commonsbook_http_request_duration_seconds_bucket[5m])) by (le, route))",
+          "legendFormat": "p95 {{route}}"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(commonsbook_http_request_duration_seconds_bucket[5m])) by (le, route))",
+          "legendFormat": "p99 {{route}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Booking Conflicts by Operation",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(commonsbook_booking_conflicts_total[5m])) by (operation)",
+          "legendFormat": "Conflict: {{operation}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Idempotency Outcomes (New, Replay, Mismatch)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "expr": "sum(increase(commonsbook_idempotency_total[5m])) by (outcome)",
+          "legendFormat": "Idempotency: {{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Outbox Queue Health (Lag, Pending, Dead)",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "commonsbook_outbox_lag_seconds",
+          "legendFormat": "Oldest Pending/Processing Lag (seconds)"
+        },
+        {
+          "expr": "commonsbook_outbox_pending",
+          "legendFormat": "Pending Events Count"
+        },
+        {
+          "expr": "commonsbook_outbox_dead",
+          "legendFormat": "Dead Events Count"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Worker & Connection Health",
+      "type": "timeseries",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "expr": "commonsbook_worker_heartbeat_age_seconds",
+          "legendFormat": "Worker Heartbeat Age (s)"
+        },
+        {
+          "expr": "commonsbook_db_pool_checked_out",
+          "legendFormat": "DB Connections Checked Out"
+        },
+        {
+          "expr": "commonsbook_expired_holds_pending",
+          "legendFormat": "Expired Holds Pending Cleanup"
+        },
+        {
+          "expr": "commonsbook_metrics_collection_age_seconds",
+          "legendFormat": "Operational Metrics Collection Age (s)"
+        }
+      ]
+    }
+  ],
+  "alerts": [
+    {
+      "name": "HighErrorRate5xx",
+      "description": "5xx > 2% for 5m with >= 100 requests",
+      "expr": "(sum(rate(commonsbook_http_requests_total{status_class=\"5xx\"}[5m])) / sum(rate(commonsbook_http_requests_total[5m]))) > 0.02 and sum(increase(commonsbook_http_requests_total[5m])) >= 100",
+      "for": "5m",
+      "severity": "critical"
+    },
+    {
+      "name": "HighLatencyP95",
+      "description": "p95 > 1s for 10m with >= 100 requests",
+      "expr": "histogram_quantile(0.95, sum(rate(commonsbook_http_request_duration_seconds_bucket[10m])) by (le)) > 1.0 and sum(increase(commonsbook_http_requests_total[10m])) >= 100",
+      "for": "10m",
+      "severity": "warning"
+    },
+    {
+      "name": "OutboxLagHigh",
+      "description": "outbox lag > 120s for 5m",
+      "expr": "commonsbook_outbox_lag_seconds > 120",
+      "for": "5m",
+      "severity": "warning"
+    },
+    {
+      "name": "OutboxDeadEvents",
+      "description": "dead > 0 for 5m",
+      "expr": "commonsbook_outbox_dead > 0",
+      "for": "5m",
+      "severity": "critical"
+    },
+    {
+      "name": "WorkerHeartbeatStale",
+      "description": "heartbeat age > 90s for 2m",
+      "expr": "commonsbook_worker_heartbeat_age_seconds > 90",
+      "for": "2m",
+      "severity": "critical"
+    },
+    {
+      "name": "ExpiredHoldsPendingOverdue",
+      "description": "expired holds pending > 0 for 2m",
+      "expr": "commonsbook_expired_holds_pending > 0",
+      "for": "2m",
+      "severity": "warning"
+    },
+    {
+      "name": "MetricsCollectionStale",
+      "description": "metrics collection age > 60s for 2m",
+      "expr": "commonsbook_metrics_collection_age_seconds > 60",
+      "for": "2m",
+      "severity": "warning"
+    }
+  ]
+}

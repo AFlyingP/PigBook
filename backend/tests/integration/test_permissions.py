@@ -10,6 +10,7 @@ import pytest
 
 os.environ.setdefault("JWT_SECRET", "test-jwt-secret-minimum-32-bytes-long-12345678")
 os.environ.setdefault("RATE_LIMIT_HMAC_SECRET", "test-hmac-secret-minimum-32-bytes-long-1234")
+os.environ.setdefault("METRICS_TOKEN", "test-metrics-token-minimum-32-bytes-long-1234")
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import Range
@@ -152,6 +153,8 @@ def test_policy_metadata_coverage() -> None:
         "E33",
         "E34",
         "E35",
+        "E36",
+        "E37",
     }
     assert policy_registry["E01"] == Policy.public
     assert policy_registry["E02"] == Policy.public
@@ -188,6 +191,8 @@ def test_policy_metadata_coverage() -> None:
     assert policy_registry["E33"] == Policy.authenticated
     assert policy_registry["E34"] == Policy.admin
     assert policy_registry["E35"] == Policy.public
+    assert policy_registry["E36"] == Policy.public
+    assert policy_registry["E37"] == Policy.metrics
 
 
 @pytest.mark.asyncio
@@ -215,6 +220,54 @@ async def test_permission_matrix() -> None:
             r = await client.get("/healthz", headers=headers)
             assert r.status_code == 200
             assert r.json()["status"] == "ok"
+
+        # E36: GET /readyz (Policy.public) -> Allowed for all personas
+        for token_val in [None, member_token, admin_token, disabled_token]:
+            headers = {"Authorization": f"Bearer {token_val}"} if token_val else {}
+            r = await client.get("/readyz", headers=headers)
+            assert r.status_code == 200
+            assert r.json()["status"] == "ready"
+
+        # E37: GET /metrics (Policy.metrics) -> Requires valid METRICS_TOKEN
+        valid_metrics_token = os.environ.get(
+            "METRICS_TOKEN", "test-metrics-token-minimum-32-bytes-long-1234"
+        )
+
+        # Anonymous caller without token -> 401
+        r_m_anon = await client.get("/metrics")
+        assert r_m_anon.status_code == 401
+        assert r_m_anon.json()["error"]["code"] == "AUTH_REQUIRED"
+
+        # Member caller with user JWT -> 401
+        r_m_mem = await client.get("/metrics", headers={"Authorization": f"Bearer {member_token}"})
+        assert r_m_mem.status_code == 401
+        assert r_m_mem.json()["error"]["code"] == "INVALID_TOKEN"
+
+        # Admin caller with user JWT -> 401
+        r_m_adm = await client.get("/metrics", headers={"Authorization": f"Bearer {admin_token}"})
+        assert r_m_adm.status_code == 401
+        assert r_m_adm.json()["error"]["code"] == "INVALID_TOKEN"
+
+        # Disabled caller with user JWT -> 401
+        r_m_dis = await client.get(
+            "/metrics", headers={"Authorization": f"Bearer {disabled_token}"}
+        )
+        assert r_m_dis.status_code == 401
+        assert r_m_dis.json()["error"]["code"] == "INVALID_TOKEN"
+
+        # Caller with wrong metrics token -> 401
+        r_m_wrong = await client.get(
+            "/metrics", headers={"Authorization": "Bearer wrong-token-not-matching-at-all"}
+        )
+        assert r_m_wrong.status_code == 401
+        assert r_m_wrong.json()["error"]["code"] == "INVALID_TOKEN"
+
+        # Caller with valid metrics token -> 200 Prometheus text
+        r_m_ok = await client.get(
+            "/metrics", headers={"Authorization": f"Bearer {valid_metrics_token}"}
+        )
+        assert r_m_ok.status_code == 200
+        assert "commonsbook_http_requests_total" in r_m_ok.text
 
         # 2. E02: POST /api/v1/auth/login (Policy.public) -> Accessible to all personas
         # Otherwise-valid request body:

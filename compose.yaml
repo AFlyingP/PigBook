@@ -26,6 +26,11 @@ services:
       DATABASE_URL: ${DATABASE_URL:?required}
     ports:
       - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     depends_on:
       db:
         condition: service_healthy
@@ -53,7 +58,7 @@ services:
       - "localhost:host-gateway"
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   db_data:
