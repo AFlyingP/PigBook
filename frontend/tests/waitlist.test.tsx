@@ -1,5 +1,5 @@
 import React from "react";
-import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -50,12 +50,13 @@ function renderWithProviders(
 ) {
   const authValue: AuthContextType = {
     user,
-    token: user ? "mock-token" : null,
     isAuthenticated: Boolean(user),
     isLoading: false,
     login: vi.fn(),
+    register: vi.fn(),
     logout: vi.fn(),
-    refreshUser: vi.fn(),
+    checkSession: vi.fn(),
+    refetchMe: vi.fn(),
   };
 
   return render(
@@ -77,9 +78,9 @@ describe("WaitlistDialog Component (Spec 7.1, 7.2, 7.3)", () => {
   });
 
   it("joins waitlist via POST /api/v1/waitlist and invalidates waitlist and resource queries on 201", async () => {
-    let capturedBody: any;
+    let capturedBody: Record<string, unknown> | undefined;
 
-    vi.mocked(fetch).mockImplementation(async (url, init) => {
+    vi.mocked(fetch).mockImplementation(async (_url, init) => {
       capturedBody = JSON.parse(String(init?.body || "{}"));
       return {
         ok: true,
@@ -275,7 +276,7 @@ describe("OfferCard Component & Hold Acceptance/Countdown (Spec 7.1, 7.2, 7.3, R
 
   it("accepts offer using waitlist-entry version in If-Match (NOT booking version) (Spec 4.2 E16, 7.3)", async () => {
     let capturedIfMatch: string | null = null;
-    let acceptBody: any;
+    let acceptBody: Record<string, unknown> | undefined;
 
     vi.mocked(fetch).mockImplementation(async (url, init) => {
       const u = String(url);

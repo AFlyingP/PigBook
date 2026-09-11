@@ -1,0 +1,13 @@
+{
+  "ticket_id": "T-029",
+  "pytest_paths": [],
+  "vitest_paths": [
+    "frontend/tests/bookings.test.tsx",
+    "frontend/tests/waitlist.test.tsx"
+  ],
+  "playwright_paths": [
+    "frontend/e2e/bookings.spec.ts",
+    "frontend/e2e/waitlist.spec.ts"
+  ],
+  "document_checks": []
+}

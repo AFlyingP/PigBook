@@ -1,24 +1,20 @@
 import React from "react";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
-import { BookingDialog, type BookingDialogProps } from "../src/features/bookings/BookingDialog";
+import { BookingDialog } from "../src/features/bookings/BookingDialog";
 import { OwnBookingsTable } from "../src/features/bookings/OwnBookingsTable";
 import {
   beginAttempt,
   restoreAttempt,
-  clearAttempt,
   type CreateAttempt,
 } from "../src/api/createAttempt";
-import { ApiError } from "../src/api/client";
 import { AuthContext, type AuthContextType } from "../src/features/auth/AuthContext";
 import type { components } from "../src/api/schema";
 
 type User = components["schemas"]["User"];
 type Resource = components["schemas"]["Resource"];
-type Booking = components["schemas"]["Booking"];
 
 const mockUser: User = {
   id: "user-1111-1111-1111",
@@ -56,12 +52,13 @@ function renderWithProviders(
 ) {
   const authValue: AuthContextType = {
     user,
-    token: user ? "mock-token" : null,
     isAuthenticated: Boolean(user),
     isLoading: false,
     login: vi.fn(),
+    register: vi.fn(),
     logout: vi.fn(),
-    refreshUser: vi.fn(),
+    checkSession: vi.fn(),
+    refetchMe: vi.fn(),
   };
 
   return render(
@@ -88,9 +85,9 @@ describe("BookingDialog Component & Uncertain Request Recovery (Spec 4.3, 7.2, 7
 
   it("submits booking with UUID v4 Idempotency-Key and persists draft during attempt", async () => {
     let capturedHeaders: Headers | undefined;
-    let capturedBody: any;
+    let capturedBody: Record<string, unknown> | undefined;
 
-    vi.mocked(fetch).mockImplementation(async (url, init) => {
+    vi.mocked(fetch).mockImplementation(async (_url, init) => {
       capturedHeaders = new Headers(init?.headers);
       capturedBody = JSON.parse(String(init?.body || "{}"));
       return {
@@ -155,7 +152,7 @@ describe("BookingDialog Component & Uncertain Request Recovery (Spec 4.3, 7.2, 7
     let callCount = 0;
     const sentKeys: string[] = [];
 
-    vi.mocked(fetch).mockImplementation(async (url, init) => {
+    vi.mocked(fetch).mockImplementation(async (_url, init) => {
       callCount++;
       const headers = new Headers(init?.headers);
       sentKeys.push(headers.get("Idempotency-Key") || "");
@@ -237,7 +234,7 @@ describe("BookingDialog Component & Uncertain Request Recovery (Spec 4.3, 7.2, 7
   it("handles definitive 409 SLOT_CONFLICT: clears attempt, refreshes availability, offers waitlist, and requires new key", async () => {
     let sentKey: string | null = null;
 
-    vi.mocked(fetch).mockImplementation(async (url, init) => {
+    vi.mocked(fetch).mockImplementation(async (_url, init) => {
       const headers = new Headers(init?.headers);
       sentKey = headers.get("Idempotency-Key");
       return {
@@ -280,6 +277,7 @@ describe("BookingDialog Component & Uncertain Request Recovery (Spec 4.3, 7.2, 7
     fireEvent.click(waitlistBtn);
     expect(onShowWaitlist).toHaveBeenCalledWith(mockWindow);
 
+    expect(sentKey).toMatch(/^[0-9a-f-]{36}$/i);
     // Definitive 409 clears the attempt
     expect(sessionStorage.getItem("commonsbook_create_attempt")).toBeNull();
 
@@ -329,7 +327,6 @@ describe("BookingDialog Component & Uncertain Request Recovery (Spec 4.3, 7.2, 7
     ).toBeInTheDocument();
 
     // Must never render raw [object Object]
-    expect(screen.queryByText("\[object Object\]")).not.toBeInTheDocument();
     expect(screen.queryByText("[object Object]")).not.toBeInTheDocument();
 
     // Definitive 422 clears the attempt
@@ -454,7 +451,7 @@ describe("OwnBookingsTable Component & Cancellation (Spec 4.1, 4.2 E10-E12, 7.2)
 
   it("lists bookings, confirms cancellation, and sends If-Match ETag from GET booking detail", async () => {
     let capturedIfMatch: string | null = null;
-    let cancelBody: any;
+    let cancelBody: Record<string, unknown> | undefined;
 
     vi.mocked(fetch).mockImplementation(async (url, init) => {
       const u = String(url);

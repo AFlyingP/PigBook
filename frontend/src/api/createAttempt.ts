@@ -7,7 +7,6 @@ export interface CreateAttempt {
 }
 
 const STORAGE_KEY = "commonsbook_create_attempt";
-const MAX_ATTEMPT_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 function generateUuid(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
